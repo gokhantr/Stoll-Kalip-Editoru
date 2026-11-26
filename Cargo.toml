@@ -1,0 +1,32 @@
+[package]
+name = "stoll_kalip_editoru"
+version = "1.0.0"
+edition = "2021"
+authors = ["Gökhan Yücel"]
+license = "MIT"
+description = "Stoll M1plus VecFormEditor (.shp / .shv) uyumlu açık kaynaklı kalıp editörü"
+repository = "https://github.com/gokhantr/Stoll-Kalip-Editoru"
+
+[lib]
+name = "stoll_kalip_editoru"
+path = "src/lib.rs"
+
+[[bin]]
+name = "Stoll_Kalip_Editoru"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = true }
+egui = "0.31"
+rfd = "0.15"
+cfb = "0.7"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
