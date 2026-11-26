@@ -30,15 +30,19 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc --bin Stoll_Kalip_Editoru
 
+      - name: Package ZIP archive
+        shell: pwsh
+        run: Compress-Archive -Path "target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.exe" -DestinationPath "target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.zip" -Force
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: Stoll_Kalip_Editoru-windows-x64
-          path: target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.exe
+          path: target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.zip
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.exe
+          files: target/x86_64-pc-windows-msvc/release/Stoll_Kalip_Editoru.zip
           generate_release_notes: true
