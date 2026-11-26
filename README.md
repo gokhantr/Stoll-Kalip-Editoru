@@ -50,6 +50,12 @@ Derlenen çalıştırılabilir dosya `target\release\Stoll_Kalip_Editoru.exe` ko
 
 ---
 
-## Lisans
+## Gizlilik ve Veri Güvenliği
+
+Bu uygulama tamamen çevrimdışı çalışır ve hiçbir kullanıcı verisi toplamaz, saklamaz veya üçüncü taraflara göndermez (yalnızca sürüm güncelleme denetimi için GitHub Releases API'sine okuma isteği yapar).
+
+## Lisans ve Kod İmzalama
 
 Bu proje [MIT Lisansı](LICENSE) altında açık kaynaklı olarak sunulmuştur.
+
+Free code signing provided by [SignPath.io](https://signpath.io), certificate by [SignPath Foundation](https://signpath.org).
