@@ -274,18 +274,39 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
         if pairs[idx].0 == 0 && pairs[idx].1.eq_ignore_ascii_case("LWPOLYLINE") {
             let mut poly: Vec<(f64, f64)> = Vec::new();
             let mut cur_x: Option<f64> = None;
+            let mut closed_poly = false;
             idx += 1;
             while idx < pairs.len() && pairs[idx].0 != 0 {
                 match pairs[idx].0 {
-                    10 => cur_x = pairs[idx].1.parse::<f64>().ok(),
+                    70 => {
+                        if let Ok(flags) = pairs[idx].1.parse::<i32>() {
+                            closed_poly = (flags & 1) != 0;
+                        }
+                    }
+                    10 => {
+                        cur_x = pairs[idx]
+                            .1
+                            .parse::<f64>()
+                            .ok()
+                            .filter(|v| v.is_finite());
+                    }
                     20 => {
                         if let (Some(x), Ok(y)) = (cur_x.take(), pairs[idx].1.parse::<f64>()) {
-                            poly.push((x, y));
+                            if y.is_finite() {
+                                poly.push((x, y));
+                            }
                         }
                     }
                     _ => {}
                 }
                 idx += 1;
+            }
+            if closed_poly && poly.len() >= 3 {
+                let first = poly[0];
+                let last = *poly.last().unwrap();
+                if (first.0 - last.0).abs() > 1e-4 || (first.1 - last.1).abs() > 1e-4 {
+                    poly.push(first);
+                }
             }
             if poly.len() > vertices.len() {
                 vertices = poly;
@@ -295,9 +316,9 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
         idx += 1;
     }
 
-    // Fallback: collect LINE entities if no LWPOLYLINE was found
+    // Fallback: collect and chain matching LINE entities if no LWPOLYLINE was found
     if vertices.len() < 2 {
-        let mut line_pts: Vec<(f64, f64)> = Vec::new();
+        let mut segs: Vec<((f64, f64), (f64, f64))> = Vec::new();
         idx = 0;
         while idx < pairs.len() {
             if pairs[idx].0 == 0 && pairs[idx].1.eq_ignore_ascii_case("LINE") {
@@ -305,25 +326,58 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
                 idx += 1;
                 while idx < pairs.len() && pairs[idx].0 != 0 {
                     match pairs[idx].0 {
-                        10 => x0 = pairs[idx].1.parse::<f64>().ok(),
-                        20 => y0 = pairs[idx].1.parse::<f64>().ok(),
-                        11 => x1 = pairs[idx].1.parse::<f64>().ok(),
-                        21 => y1 = pairs[idx].1.parse::<f64>().ok(),
+                        10 => x0 = pairs[idx].1.parse::<f64>().ok().filter(|v| v.is_finite()),
+                        20 => y0 = pairs[idx].1.parse::<f64>().ok().filter(|v| v.is_finite()),
+                        11 => x1 = pairs[idx].1.parse::<f64>().ok().filter(|v| v.is_finite()),
+                        21 => y1 = pairs[idx].1.parse::<f64>().ok().filter(|v| v.is_finite()),
                         _ => {}
                     }
                     idx += 1;
                 }
                 if let (Some(ax), Some(ay), Some(bx), Some(by)) = (x0, y0, x1, y1) {
-                    if line_pts.is_empty() {
-                        line_pts.push((ax, ay));
+                    if (bx - ax).abs() >= 1e-4 || (by - ay).abs() >= 1e-4 {
+                        segs.push(((ax, ay), (bx, by)));
                     }
-                    line_pts.push((bx, by));
                 }
                 continue;
             }
             idx += 1;
         }
-        vertices = line_pts;
+        if !segs.is_empty() {
+            let mut used = vec![false; segs.len()];
+            let start_i = segs
+                .iter()
+                .position(|&(a, _)| a.0.abs() < 1e-2 && a.1.abs() < 1e-2)
+                .unwrap_or(0);
+            used[start_i] = true;
+            let (a0, mut cur_end) = segs[start_i];
+            let mut line_pts = vec![a0, cur_end];
+            loop {
+                let mut found = None;
+                for (si, &(sa, sb)) in segs.iter().enumerate() {
+                    if used[si] {
+                        continue;
+                    }
+                    if (sa.0 - cur_end.0).abs() < 1e-2 && (sa.1 - cur_end.1).abs() < 1e-2 {
+                        found = Some((si, sb));
+                        break;
+                    }
+                    if (sb.0 - cur_end.0).abs() < 1e-2 && (sb.1 - cur_end.1).abs() < 1e-2 {
+                        found = Some((si, sa));
+                        break;
+                    }
+                }
+                match found {
+                    Some((si, next_pt)) => {
+                        used[si] = true;
+                        cur_end = next_pt;
+                        line_pts.push(next_pt);
+                    }
+                    None => break,
+                }
+            }
+            vertices = line_pts;
+        }
     }
 
     if vertices.len() < 2 {
@@ -339,12 +393,13 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
 
     let hdr = doc.header.clone();
     let mut kantes = Vec::new();
-    for (k_i, w) in vertices.windows(2).enumerate() {
+    for w in vertices.windows(2) {
         let dx = w[1].0 - w[0].0;
         let dy = w[1].1 - w[0].1;
         if dx.abs() < 1e-4 && dy.abs() < 1e-4 {
             continue;
         }
+        let is_first_seg = kantes.is_empty();
         let tag_id = doc.next_line_tag_id();
         let mut seg = crate::model::LineSegment {
             index: (kantes.len() + 1) as i32,
@@ -354,7 +409,7 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
             ..Default::default()
         };
         crate::math::units::recalc_line_from_mm(&mut seg, &hdr);
-        crate::math::units::auto_detect_line_function(&mut seg, k_i == 0, true);
+        crate::math::units::auto_detect_line_function(&mut seg, is_first_seg, true);
         kantes.push(seg);
     }
 

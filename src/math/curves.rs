@@ -70,10 +70,10 @@ pub fn extract_curve_module_widths(line: &LineSegment) -> (i32, i32, i32) {
     (nw, ww, fw)
 }
 
-/// Compute exact `(sum_dx, sum_dy)` of a `[Kurve]` accounting for `Faktor`, `GruppenTagId`, and `GruppenFaktor`.
-pub fn curve_steps_sum(curve: &CurveData) -> (i32, i32) {
+/// Compute exact `(sum_dx, sum_dy)` of a `[Kurve]` step slice accounting for `Faktor`, `GruppenTagId`, and `GruppenFaktor`.
+pub fn curve_steps_sum_slice(steps: &[CurveStep]) -> (i32, i32) {
     let mut group_factors: HashMap<i32, i32> = HashMap::new();
-    for s in &curve.steps {
+    for s in steps {
         if s.group_tag_id > 0 && s.group_factor > 0 {
             group_factors.insert(s.group_tag_id, s.group_factor);
         }
@@ -81,7 +81,7 @@ pub fn curve_steps_sum(curve: &CurveData) -> (i32, i32) {
 
     let mut tot_dx = 0i32;
     let mut tot_dy = 0i32;
-    for s in &curve.steps {
+    for s in steps {
         let mut mult = s.factor.max(0);
         if s.group_tag_id > 0 {
             mult *= *group_factors.get(&s.group_tag_id).unwrap_or(&1);
@@ -90,6 +90,11 @@ pub fn curve_steps_sum(curve: &CurveData) -> (i32, i32) {
         tot_dy += s.step_height * mult;
     }
     (tot_dx, tot_dy)
+}
+
+/// Compute exact `(sum_dx, sum_dy)` of a `[Kurve]` accounting for `Faktor`, `GruppenTagId`, and `GruppenFaktor`.
+pub fn curve_steps_sum(curve: &CurveData) -> (i32, i32) {
+    curve_steps_sum_slice(&curve.steps)
 }
 
 /// Generate `[KurvenLinie]` steps using exact disassembled `formaccess.dll` formulas:

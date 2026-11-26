@@ -1,27 +1,30 @@
 ﻿use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use egui::{vec2, Color32, CornerRadius, Frame, Key, Margin, Modifiers, Stroke};
+use egui::{vec2, Color32, CornerRadius, Frame, Margin, Key, Modifiers, Stroke};
 
 use stoll_kalip_editoru::catalog::{
-    export_settings_bundle, import_settings_bundle, StollCatalog, UserSettings,
+    export_settings_bundle, import_settings_bundle, monitor_work_area_for_rect,
+    relocate_rect_into_work_area, StollCatalog, UserSettings, WindowPlacementPx,
 };
 use stoll_kalip_editoru::io::{import_dxf_file, load_file, save_file};
 use stoll_kalip_editoru::math::{
     add_element, append_line, apply_directives_to_lines, apply_standard_preset_to_line,
     convert_input_format, copy_line, copy_markers, delete_element, delete_line,
-    evaluate_document_geometry, import_external_table_lines, insert_line_before, paste_insert_markers,
-    paste_line, paste_replace_markers, recalc_document_for_density_change,
+    evaluate_document_geometry, import_external_table_lines, insert_line_before, paste_insert_line,
+    paste_insert_markers, paste_line, paste_replace_markers, recalc_document_for_density_change,
     recalc_line_from_stitches_and_rows, renumber_points, snapshot_endline_distances,
     swap_left_right, sync_all_endline_elements, sync_all_mirrored_elements,
     sync_mirrored_right_lines, update_or_append_closing_line, validate_document, DocumentGeometry,
 };
 use stoll_kalip_editoru::model::{
-    ElementType, FormDocument, InputFormat, LineFunction, LineSide, PointEntry, PointOffset,
-    ShapeCutType, UndoStack,
+    ElementType, FormDocument, FormHeader, InputFormat, LineFunction, LineSide, PointEntry,
+    PointOffset, ShapeCutType, ShapeElement, UndoStack,
 };
 use stoll_kalip_editoru::updater::{
-    open_url_in_browser, spawn_update_check, UpdateStatus, CURRENT_VERSION, GITHUB_REPO_URL,
+    format_release_notes_summary, open_url_in_browser, spawn_update_check, UpdateStatus,
+    CURRENT_VERSION, GITHUB_REPO_URL,
 };
 
 use crate::ui::icons::load_app_icon_64;
@@ -30,7 +33,7 @@ use crate::ui::cad_canvas::CadCanvasState;
 use crate::ui::curve_editor_dialog::CurveEditorDialogState;
 use crate::ui::format_convert_dialog::FormatConvertDialogState;
 use crate::ui::graphics_window::GraphicsWindowState;
-use crate::ui::grid_table::show_grid_area;
+use crate::ui::grid_table::{flush_active_grid_edit, show_grid_area};
 use crate::ui::left_panel::show_elements_strip;
 use crate::ui::line_props_dialog::{
     LinePropsDialogState, NecklinePropsDialogState, RefLineSelectDialogState,
@@ -87,19 +90,28 @@ pub struct KalipEditorApp {
     pub point_multiply_dlg: PointMultiplyDialogState,
     pub format_convert_dlg: FormatConvertDialogState,
     pub update_status: Arc<Mutex<UpdateStatus>>,
+    cached_geom: Option<(FormHeader, Vec<ShapeElement>, Arc<DocumentGeometry>)>,
     capture: Option<CaptureSequence>,
     last_title: String,
     allow_close: bool,
+    pending_startup_placement: Option<WindowPlacementPx>,
+    startup_settle_frames: u8,
+    last_normal_window_rect: Option<(i32, i32, i32, i32)>,
+    window_save_deadline: Option<Instant>,
 }
 
 impl KalipEditorApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        initial_path: Option<PathBuf>,
+        startup_placement: Option<WindowPlacementPx>,
+    ) -> Self {
         configure_fonts(&cc.egui_ctx);
         apply_win32_theme(&cc.egui_ctx);
 
         let settings = UserSettings::load();
         let mut catalog = StollCatalog::load_with_autodetect();
-        if settings.custom_stoll_defaultform_path.is_some() {
+        if settings.custom_stoll_defaultform_path != catalog.custom_stoll_defaultform_path {
             catalog.custom_stoll_defaultform_path = settings.custom_stoll_defaultform_path.clone();
             catalog.reload_for_cut_type(ShapeCutType::Standard);
         }
@@ -124,7 +136,10 @@ impl KalipEditorApp {
             match load_file(&path) {
                 Ok(loaded) => {
                     push_mru_file(&mut state.recent_files, path.clone());
-                    catalog.reload_for_cut_type(ShapeCutType::from_id(loaded.header.cut_type));
+                    let cut_type = ShapeCutType::from_id(loaded.header.cut_type);
+                    if cut_type != catalog.active_cut_type {
+                        catalog.reload_for_cut_type(cut_type);
+                    }
                     state.set_status(format!("Yüklendi: {}", path.display()), false);
                     loaded
                 }
@@ -153,6 +168,17 @@ impl KalipEditorApp {
             ctx_upd.request_repaint();
         });
 
+        let last_normal_window_rect = startup_placement
+            .map(|p| (p.x, p.y, p.w, p.h))
+            .or_else(|| {
+                Some((
+                    settings.window_x?,
+                    settings.window_y?,
+                    settings.window_w?,
+                    settings.window_h?,
+                ))
+            });
+
         Self {
             doc,
             undo: UndoStack::default(),
@@ -167,10 +193,27 @@ impl KalipEditorApp {
             point_multiply_dlg: PointMultiplyDialogState::default(),
             format_convert_dlg: FormatConvertDialogState::default(),
             update_status,
+            cached_geom: None,
             capture: CaptureSequence::from_env(),
             last_title: String::new(),
             allow_close: false,
+            pending_startup_placement: startup_placement,
+            startup_settle_frames: 0,
+            last_normal_window_rect,
+            window_save_deadline: None,
         }
+    }
+
+    fn eval_cached_geometry(&mut self) -> Arc<DocumentGeometry> {
+        let hit = self
+            .cached_geom
+            .as_ref()
+            .is_some_and(|(ch, ce, _)| *ch == self.doc.header && *ce == self.doc.elements);
+        if !hit {
+            let eval = Arc::new(evaluate_document_geometry(&self.doc));
+            self.cached_geom = Some((self.doc.header.clone(), self.doc.elements.clone(), eval));
+        }
+        Arc::clone(&self.cached_geom.as_ref().expect("cached_geom populated").2)
     }
 
     fn compute_window_title(&self) -> String {
@@ -230,6 +273,7 @@ impl KalipEditorApp {
                     .reload_for_cut_type(ShapeCutType::from_id(loaded.header.cut_type));
                 self.doc = loaded;
                 self.undo.clear();
+                self.cad_canvas.clear_drag();
                 self.reset_document_ui_state();
                 push_mru_file(&mut self.state.recent_files, path.clone());
                 self.state
@@ -251,6 +295,7 @@ impl KalipEditorApp {
     }
 
     fn do_save(&mut self, force_save_as: bool) -> bool {
+        flush_active_grid_edit(&mut self.doc, &mut self.undo, &mut self.state);
         let save_as = force_save_as || self.doc.header.write_protected;
         if !force_save_as && self.doc.header.write_protected {
             self.state
@@ -285,7 +330,7 @@ impl KalipEditorApp {
             }
         };
 
-        if self.doc.header.name.trim().is_empty() {
+        if force_save_as || self.doc.header.name.trim().is_empty() {
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                 if !stem.is_empty() {
                     self.doc.header.name = stem.to_string();
@@ -324,7 +369,14 @@ impl KalipEditorApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context, actions: &mut Vec<AppAction>) {
+        if self.state.any_modal_open() {
+            if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::F1)) {
+                actions.push(AppAction::ShowHelp);
+            }
+            return;
+        }
         let typing = ctx.wants_keyboard_input();
+        let mut switch_table_mode: Option<TableMode> = None;
 
         ctx.input(|i| {
             let ctrl = i.modifiers.ctrl;
@@ -345,28 +397,16 @@ impl KalipEditorApp {
             } else if ctrl && i.key_pressed(Key::Y) && !typing {
                 actions.push(AppAction::Redo);
             } else if i.key_pressed(Key::F7) {
-                self.state.table_mode = TableMode::LeftLines;
-                self.state.active_table_side = LineSide::Left;
-                self.state.editing_cell = None;
-                self.state.select_single_row(0);
+                switch_table_mode = Some(TableMode::LeftLines);
             } else if i.key_pressed(Key::F8) {
                 if !self.current_elem_mirrored() {
-                    self.state.table_mode = TableMode::RightLines;
-                    self.state.active_table_side = LineSide::Right;
-                    self.state.editing_cell = None;
-                    self.state.select_single_row(0);
+                    switch_table_mode = Some(TableMode::RightLines);
                 }
             } else if i.key_pressed(Key::F9) {
-                self.state.table_mode = TableMode::LeftMarkers;
-                self.state.active_table_side = LineSide::Left;
-                self.state.editing_cell = None;
-                self.state.select_single_row(0);
+                switch_table_mode = Some(TableMode::LeftMarkers);
             } else if i.key_pressed(Key::F10) {
                 if !self.current_elem_mirrored() {
-                    self.state.table_mode = TableMode::RightMarkers;
-                    self.state.active_table_side = LineSide::Right;
-                    self.state.editing_cell = None;
-                    self.state.select_single_row(0);
+                    switch_table_mode = Some(TableMode::RightMarkers);
                 }
             } else if i.key_pressed(Key::F1) {
                 actions.push(AppAction::ShowHelp);
@@ -406,6 +446,14 @@ impl KalipEditorApp {
                 }
             }
         });
+
+        if let Some(tm) = switch_table_mode {
+            flush_active_grid_edit(&mut self.doc, &mut self.undo, &mut self.state);
+            self.state.table_mode = tm;
+            self.state.active_table_side = tm.side();
+            self.state.editing_cell = None;
+            self.state.select_single_row(0);
+        }
     }
 
     fn current_elem_mirrored(&self) -> bool {
@@ -537,6 +585,7 @@ impl KalipEditorApp {
                 }
                 AppAction::Undo => {
                     self.state.editing_cell = None;
+                    self.cad_canvas.clear_drag();
                     if self.undo.undo(&mut self.doc) {
                         self.clamp_selection_after_doc_change();
                         self.state.set_status("Geri alındı", false);
@@ -544,6 +593,7 @@ impl KalipEditorApp {
                 }
                 AppAction::Redo => {
                     self.state.editing_cell = None;
+                    self.cad_canvas.clear_drag();
                     if self.undo.redo(&mut self.doc) {
                         self.clamp_selection_after_doc_change();
                         self.state.set_status("İleri alındı", false);
@@ -872,7 +922,7 @@ impl KalipEditorApp {
                     if !self.state.copied_lines.is_empty() {
                         self.state.editing_cell = None;
                         let side = self.state.table_mode.side();
-                        let start_r = self
+                        let min_sel = self
                             .state
                             .selected_rows
                             .iter()
@@ -881,7 +931,20 @@ impl KalipEditorApp {
                             .or_else(|| self.state.primary_row())
                             .unwrap_or(0);
                         let src = self.state.copied_lines.clone();
-                        self.push_undo("Çizgi üzerine yapıştır");
+                        let base_protected = self
+                            .doc
+                            .elements
+                            .get(self.state.selected_elem)
+                            .map(|el| {
+                                el.is_base_line_row(side, min_sel)
+                                    && src
+                                        .first()
+                                        .map(|l| l.function != LineFunction::BaseLine)
+                                        .unwrap_or(true)
+                            })
+                            .unwrap_or(false);
+                        let start_r = if base_protected { min_sel.max(1) } else { min_sel };
+                        let snapshot = self.doc.clone();
                         let mut pasted = 0usize;
                         for (i, line) in src.iter().enumerate() {
                             if paste_line(
@@ -894,8 +957,9 @@ impl KalipEditorApp {
                                 pasted += 1;
                             }
                         }
-                        self.sync_current_if_mirrored();
                         if pasted > 0 {
+                            self.undo.push("Çizgi üzerine yapıştır", &snapshot);
+                            self.sync_current_if_mirrored();
                             self.state.selected_rows = (start_r..start_r + pasted).collect();
                             self.state.row_select_anchor = Some(start_r);
                             self.state.focused_cell = Some((start_r, 2));
@@ -929,19 +993,15 @@ impl KalipEditorApp {
                         self.push_undo("Çizgi ekle ve yapıştır");
                         let mut inserted = 0usize;
                         for (i, line) in src.iter().enumerate() {
-                            if let Some(pos) = insert_line_before(
+                            if paste_insert_line(
                                 &mut self.doc,
                                 self.state.selected_elem,
                                 side,
                                 row + i,
-                            ) {
-                                paste_line(
-                                    &mut self.doc,
-                                    self.state.selected_elem,
-                                    side,
-                                    pos,
-                                    line,
-                                );
+                                line,
+                            )
+                            .is_some()
+                            {
                                 inserted += 1;
                             }
                         }
@@ -1021,8 +1081,10 @@ impl KalipEditorApp {
                 }
                 AppAction::AppendMarker | AppAction::InsertMarkerBefore => {
                     let side = self.state.table_mode.side();
-                    self.push_undo("İşaret ekle");
-                    if let Some(el) = self.doc.elements.get_mut(self.state.selected_elem) {
+                    if self.state.selected_elem < self.doc.elements.len() {
+                        self.push_undo("İşaret ekle");
+                        let pt_tag_id = self.doc.next_point_tag_id();
+                        let el = &mut self.doc.elements[self.state.selected_elem];
                         let pts = match side {
                             LineSide::Left => {
                                 el.has_left_points_section = true;
@@ -1035,6 +1097,7 @@ impl KalipEditorApp {
                         };
                         let new_pt = PointEntry {
                             index: (pts.len() + 1) as i32,
+                            punkt_tag_id: pt_tag_id,
                             punkt_art_tag_id: 0,
                             ..PointEntry::default()
                         };
@@ -1048,8 +1111,8 @@ impl KalipEditorApp {
                         self.state.select_single_row(pos);
                         self.state.focused_cell = Some((pos, 1));
                         self.doc.dirty = true;
+                        self.sync_current_if_mirrored();
                     }
-                    self.sync_current_if_mirrored();
                 }
                 AppAction::OpenMultiplyMarkers => {
                     self.state.point_multiply_req = Some(PointMultiplyRequest {
@@ -1241,7 +1304,13 @@ impl KalipEditorApp {
                 AppAction::CutTypeChanged => {
                     self.catalog
                         .reload_for_cut_type(ShapeCutType::from_id(self.doc.header.cut_type));
-                    self.state.selected_preset_idx = 0;
+                    let max_p = self.catalog.presets(self.state.preset_is_user).len();
+                    if max_p == 0 {
+                        self.state.preset_is_user = false;
+                    }
+                    let cur_len = self.catalog.presets(self.state.preset_is_user).len();
+                    self.state.selected_preset_idx =
+                        self.state.selected_preset_idx.min(cur_len.saturating_sub(1));
                 }
                 AppAction::ShowPrintPreview => {
                     self.state.print_preview_open = true;
@@ -1512,6 +1581,7 @@ impl KalipEditorApp {
         self.catalog
             .reload_for_cut_type(ShapeCutType::from_id(self.doc.header.cut_type));
         self.undo.clear();
+        self.cad_canvas.clear_drag();
         self.reset_document_ui_state();
         self.state.selected_rows.clear();
         self.state.focused_cell = None;
@@ -1558,7 +1628,9 @@ impl KalipEditorApp {
                     l.rest_x,
                     crate::ui::line_function_grid_label_tr(l.function.to_id()),
                     l.group,
-                    l.comment.replace(';', ",")
+                    l.comment
+                        .replace(';', ",")
+                        .replace(['\r', '\n'], " ")
                 ));
             }
         }
@@ -1571,11 +1643,12 @@ impl KalipEditorApp {
     }
 
     fn export_and_open_printable_html(&mut self) {
-        let name = if self.doc.header.name.is_empty() {
+        let raw_name = if self.doc.header.name.is_empty() {
             "Yeni"
         } else {
             &self.doc.header.name
         };
+        let name = html_escape(raw_name);
         let mut html = format!(
             "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{name} - Stoll Kalıp Editörü</title>\
              <style>body{{font-family:Segoe UI,sans-serif;font-size:12px;margin:20px;}}\
@@ -1598,8 +1671,8 @@ impl KalipEditorApp {
                     l.step_y,
                     l.step_x,
                     l.step_factor,
-                    crate::ui::line_function_grid_label_tr(l.function.to_id()),
-                    l.comment
+                    html_escape(crate::ui::line_function_grid_label_tr(l.function.to_id())),
+                    html_escape(&l.comment)
                 ));
             }
         }
@@ -1817,7 +1890,7 @@ impl KalipEditorApp {
             if do_import {
                 let text = self.state.external_import_text.clone();
                 let side = self.state.table_mode.side();
-                self.push_undo("Harici tablo içe aktar");
+                let snapshot = self.doc.clone();
                 let added = import_external_table_lines(
                     &mut self.doc,
                     self.state.selected_elem,
@@ -1826,6 +1899,8 @@ impl KalipEditorApp {
                     false,
                 );
                 if added > 0 {
+                    self.undo.push("Harici tablo içe aktar", &snapshot);
+                    self.clamp_selection_after_doc_change();
                     self.state
                         .set_status(format!("{added} çizgi harici tablodan eklendi."), false);
                 } else {
@@ -1930,17 +2005,22 @@ impl KalipEditorApp {
                 .map(|g| g.clone())
                 .unwrap_or_else(|p| p.into_inner().clone());
             let icon_tex = load_app_icon_64(ctx);
+            let modal_size = if matches!(status_snapshot, UpdateStatus::UpdateAvailable(_)) {
+                vec2(520.0, 410.0)
+            } else {
+                vec2(490.0, 320.0)
+            };
 
             win32_window(
                 ctx,
                 egui::Id::new("about_modal"),
                 "Stoll Kalıp Editörü — Hakkında & Güncellemeler",
                 &mut open,
-                Some(vec2(480.0, 310.0)),
+                Some(modal_size),
                 false,
                 true,
                 |ui| {
-                    ui.set_min_width(456.0);
+                    ui.set_min_width(466.0);
 
                     // Header with custom 64x64 icon + title + version
                     ui.horizontal(|ui| {
@@ -2068,16 +2148,80 @@ impl KalipEditorApp {
                             });
 
                             if let UpdateStatus::UpdateAvailable(info) = &status_snapshot {
-                                if !info.body_notes.trim().is_empty() {
+                                let summary =
+                                    format_release_notes_summary(&info.body_notes, 10, 650);
+                                if !summary.is_empty() {
                                     ui.add_space(6.0);
-                                    let preview: String =
-                                        info.body_notes.trim().chars().take(240).collect();
-                                    ui.label(
-                                        egui::RichText::new(preview)
+                                    Frame::NONE
+                                        .fill(colors::CHROME_BG)
+                                        .corner_radius(CornerRadius::same(4))
+                                        .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
+                                        .inner_margin(Margin::symmetric(8, 6))
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(
+                                                egui::RichText::new("Sürüm Notları:")
+                                                    .font(bold_font(10.5))
+                                                    .color(colors::TEXT_SECONDARY),
+                                            );
+                                            egui::ScrollArea::vertical()
+                                                .max_height(76.0)
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(summary)
+                                                            .font(regular_font(10.5))
+                                                            .color(colors::TEXT_BLACK),
+                                                    );
+                                                });
+                                        });
+                                }
+
+                                ui.add_space(6.0);
+                                let is_ignored = self
+                                    .state
+                                    .user_settings
+                                    .ignored_update_version
+                                    .as_deref()
+                                    == Some(info.tag_name.as_str());
+                                ui.horizontal(|ui| {
+                                    if !is_ignored {
+                                        if win32_button(
+                                            ui,
+                                            "Bu sürümü şimdilik gizle",
+                                            vec2(168.0, 22.0),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.state.user_settings.ignored_update_version =
+                                                Some(info.tag_name.clone());
+                                            if self.capture.is_none() {
+                                                let _ = self.state.user_settings.save();
+                                            }
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Araç çubuğu rozeti bu sürüm için gizlendi.",
+                                            )
                                             .font(regular_font(10.5))
                                             .color(colors::TEXT_SECONDARY),
-                                    );
-                                }
+                                        );
+                                        if win32_button(
+                                            ui,
+                                            "Rozeti Göster",
+                                            vec2(96.0, 22.0),
+                                            true,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.state.user_settings.ignored_update_version = None;
+                                            if self.capture.is_none() {
+                                                let _ = self.state.user_settings.save();
+                                            }
+                                        }
+                                    }
+                                });
                             }
                         });
 
@@ -2166,14 +2310,143 @@ impl KalipEditorApp {
     }
 }
 
+impl KalipEditorApp {
+    fn apply_startup_window_placement(&mut self, ctx: &egui::Context) -> bool {
+        let Some(p) = self.pending_startup_placement else {
+            return false;
+        };
+        let ppp = ctx.pixels_per_point().max(0.5);
+        let outer_rect = ctx.input(|i| i.viewport().outer_rect);
+        let pos_matches = outer_rect
+            .map(|r| {
+                let cur_x = (r.min.x * ppp).round() as i32;
+                let cur_y = (r.min.y * ppp).round() as i32;
+                (cur_x - p.x).abs() <= 4 && (cur_y - p.y).abs() <= 4
+            })
+            .unwrap_or(false);
+
+        if !pos_matches && self.startup_settle_frames < 3 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                p.x as f32 / ppp,
+                p.y as f32 / ppp,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+                p.w as f32 / ppp,
+                p.h as f32 / ppp,
+            )));
+            self.startup_settle_frames += 1;
+            ctx.request_repaint();
+            return true;
+        }
+
+        if p.maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+        }
+        self.pending_startup_placement = None;
+        true
+    }
+
+    fn track_window_geometry(&mut self, ctx: &egui::Context) {
+        let (outer_rect, inner_rect, maximized, minimized) = ctx.input(|i| {
+            let vp = i.viewport();
+            (vp.outer_rect, vp.inner_rect, vp.maximized, vp.minimized)
+        });
+        if minimized == Some(true) {
+            return;
+        }
+
+        let is_max = maximized.unwrap_or(false);
+        let ppp = ctx.pixels_per_point().max(0.5);
+
+        if !is_max {
+            if let (Some(out_r), Some(in_r)) = (outer_rect, inner_rect) {
+                let x = (out_r.min.x * ppp).round() as i32;
+                let y = (out_r.min.y * ppp).round() as i32;
+                let w = (in_r.width() * ppp).round() as i32;
+                let h = (in_r.height() * ppp).round() as i32;
+                if w >= 400 && h >= 300 && (-20000..=20000).contains(&x) && (-20000..=20000).contains(&y) {
+                    self.last_normal_window_rect = Some((x, y, w, h));
+                }
+            }
+        } else if let Some(out_r) = outer_rect {
+            // If maximized window moved to a different monitor (e.g. Win+Shift+Arrow),
+            // relocate the saved normal restore rect onto that same monitor so next startup
+            // restores and maximizes on that monitor.
+            let cx = (out_r.center().x * ppp).round() as i32;
+            let cy = (out_r.center().y * ppp).round() as i32;
+            if let Some((cur_hmon, cur_work)) = monitor_work_area_for_rect(cx - 8, cy - 8, 16, 16) {
+                let normal_same_mon = self
+                    .last_normal_window_rect
+                    .and_then(|(nx, ny, nw, nh)| monitor_work_area_for_rect(nx, ny, nw, nh))
+                    .is_some_and(|(h, _)| h == cur_hmon);
+                if !normal_same_mon {
+                    let (nw, nh) = self
+                        .last_normal_window_rect
+                        .map(|(_, _, w, h)| (w, h))
+                        .unwrap_or((1360, 860));
+                    self.last_normal_window_rect =
+                        Some(relocate_rect_into_work_area(nw, nh, cur_work));
+                }
+            }
+        }
+
+        let desired_x = self.last_normal_window_rect.map(|r| r.0);
+        let desired_y = self.last_normal_window_rect.map(|r| r.1);
+        let desired_w = self.last_normal_window_rect.map(|r| r.2);
+        let desired_h = self.last_normal_window_rect.map(|r| r.3);
+
+        let changed = self.state.user_settings.window_x != desired_x
+            || self.state.user_settings.window_y != desired_y
+            || self.state.user_settings.window_w != desired_w
+            || self.state.user_settings.window_h != desired_h
+            || self.state.user_settings.window_maximized != is_max;
+
+        if changed {
+            self.state.user_settings.window_x = desired_x;
+            self.state.user_settings.window_y = desired_y;
+            self.state.user_settings.window_w = desired_w;
+            self.state.user_settings.window_h = desired_h;
+            self.state.user_settings.window_maximized = is_max;
+            self.window_save_deadline = Some(Instant::now() + Duration::from_millis(500));
+        }
+
+        if self
+            .window_save_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.window_save_deadline = None;
+            let _ = self.state.user_settings.save();
+        }
+    }
+
+    fn persist_window_settings_now(&mut self) {
+        if self.capture.is_some() {
+            return;
+        }
+        self.window_save_deadline = None;
+        let _ = self.state.user_settings.save();
+    }
+}
+
 impl eframe::App for KalipEditorApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist_window_settings_now();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.sync_window_title(ctx);
 
+        if self.capture.is_none() && !self.apply_startup_window_placement(ctx) {
+            self.track_window_geometry(ctx);
+        }
+
         // Intercept OS window close when document has unsaved edits
-        if ctx.input(|i| i.viewport().close_requested()) && self.doc.dirty && !self.allow_close {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && self.doc.dirty && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.state.pending_dirty_action = Some(PendingDirtyAction::Exit);
+        } else if close_requested {
+            self.persist_window_settings_now();
         }
 
         // Handle drag-and-drop `.shp` / `.shv` files
@@ -2191,8 +2464,8 @@ impl eframe::App for KalipEditorApp {
         // Global shortcuts
         self.handle_shortcuts(ctx, &mut actions);
 
-        // Evaluate 2D geometry once per frame for thumbnails, Top Panel, and Graphics window
-        let geom = evaluate_document_geometry(&self.doc);
+        // Evaluate 2D geometry (cached when doc.header & doc.elements are unchanged)
+        let geom = self.eval_cached_geometry();
 
         // ── Top Chrome: Menu Bar + Streamlined Studio Toolbar ──────────────────
         egui::TopBottomPanel::top("menu_and_toolbar_panel")
@@ -2212,7 +2485,12 @@ impl eframe::App for KalipEditorApp {
                     .lock()
                     .ok()
                     .and_then(|g| match &*g {
-                        UpdateStatus::UpdateAvailable(info) => Some(info.tag_name.clone()),
+                        UpdateStatus::UpdateAvailable(info)
+                            if self.state.user_settings.ignored_update_version.as_deref()
+                                != Some(info.tag_name.as_str()) =>
+                        {
+                            Some(info.tag_name.clone())
+                        }
                         _ => None,
                     });
                 show_toolbar(
@@ -2348,10 +2626,11 @@ impl eframe::App for KalipEditorApp {
             self.execute_actions(ctx, actions);
         }
 
-        // Auto-persist view preferences if changed from toolbar, menu, or CAD HUD
-        if self.state.snap_even_rows != self.state.user_settings.snap_even_rows
-            || self.state.show_dimensions != self.state.user_settings.show_dimensions
-            || self.state.show_detail_columns != self.state.user_settings.show_detail_columns
+        // Auto-persist view preferences if changed from toolbar, menu, or CAD HUD (never in capture mode)
+        if self.capture.is_none()
+            && (self.state.snap_even_rows != self.state.user_settings.snap_even_rows
+                || self.state.show_dimensions != self.state.user_settings.show_dimensions
+                || self.state.show_detail_columns != self.state.user_settings.show_detail_columns)
         {
             self.state.user_settings.snap_even_rows = self.state.snap_even_rows;
             self.state.user_settings.show_dimensions = self.state.show_dimensions;
@@ -2556,6 +2835,21 @@ impl KalipEditorApp {
             _ => {}
         }
     }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn mru_file_path() -> Option<PathBuf> {

@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
+
 use crate::model::document::FormDocument;
 
 /// Snapshot-based Undo/Redo stack for `FormDocument`.
 /// Captures lightweight clones of `(header, elements)` with a configurable depth limit.
 #[derive(Debug, Clone)]
 pub struct UndoStack {
-    undo: Vec<(String, FormDocument)>,
+    undo: VecDeque<(String, FormDocument)>,
     redo: Vec<(String, FormDocument)>,
     max_depth: usize,
 }
@@ -18,7 +20,7 @@ impl Default for UndoStack {
 impl UndoStack {
     pub fn new(max_depth: usize) -> Self {
         Self {
-            undo: Vec::new(),
+            undo: VecDeque::new(),
             redo: Vec::new(),
             max_depth: max_depth.max(1),
         }
@@ -27,9 +29,9 @@ impl UndoStack {
     /// Push a pre-edit snapshot onto the undo stack and clear redo history.
     pub fn push(&mut self, label: impl Into<String>, snapshot: &FormDocument) {
         if self.undo.len() >= self.max_depth {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
-        self.undo.push((label.into(), snapshot.clone()));
+        self.undo.push_back((label.into(), snapshot.clone()));
         self.redo.clear();
     }
 
@@ -42,7 +44,7 @@ impl UndoStack {
     }
 
     pub fn undo_label(&self) -> Option<&str> {
-        self.undo.last().map(|(l, _)| l.as_str())
+        self.undo.back().map(|(l, _)| l.as_str())
     }
 
     pub fn redo_label(&self) -> Option<&str> {
@@ -51,7 +53,7 @@ impl UndoStack {
 
     /// Undo the last change, restoring `current` and moving its prior state to redo.
     pub fn undo(&mut self, current: &mut FormDocument) -> bool {
-        if let Some((label, mut prev)) = self.undo.pop() {
+        if let Some((label, mut prev)) = self.undo.pop_back() {
             let cur_clone = current.clone();
             self.redo.push((label, cur_clone));
             prev.dirty = true;
@@ -66,7 +68,7 @@ impl UndoStack {
     pub fn redo(&mut self, current: &mut FormDocument) -> bool {
         if let Some((label, mut next)) = self.redo.pop() {
             let cur_clone = current.clone();
-            self.undo.push((label, cur_clone));
+            self.undo.push_back((label, cur_clone));
             next.dirty = true;
             *current = next;
             true

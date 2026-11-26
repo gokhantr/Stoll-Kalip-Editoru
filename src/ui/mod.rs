@@ -453,7 +453,7 @@ pub fn line_function_grid_label_tr(func_id: i32) -> &'static str {
         5 => "Tiktak",
         6 => "Remayözleme",
         8 => "Temel",
-        9 => "Reglan M",
+        9 => "Tiktak",
         _ => "",
     }
 }
@@ -461,9 +461,9 @@ pub fn line_function_grid_label_tr(func_id: i32) -> &'static str {
 /// Map `LineSegment` function to the corresponding initial tab index in Line Properties (`0..=7`).
 pub fn line_function_default_tab(func_id: i32) -> usize {
     match func_id {
-        1 | 9 => 1, // Reglan
+        1 => 1,     // Reglan
         2 => 2,     // Artırma
-        3 | 6 => 3, // Remayözleme
+        3 | 6 | 9 => 3, // Remayözleme / K&W Tiktak
         4 => 4,     // Kenar düzeltme
         _ => 0,     // Genel
     }

@@ -37,9 +37,17 @@ fn main() {
     let rc_path = out_path.join("app.rc");
     let res_path = out_path.join("app.res");
 
-    let manifest_xml = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "1.0.1".to_string());
+    let ver_major = env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_else(|_| "1".to_string());
+    let ver_minor = env::var("CARGO_PKG_VERSION_MINOR").unwrap_or_else(|_| "0".to_string());
+    let ver_patch = env::var("CARGO_PKG_VERSION_PATCH").unwrap_or_else(|_| "1".to_string());
+    let ver_quad_dots = format!("{ver_major}.{ver_minor}.{ver_patch}.0");
+    let ver_quad_commas = format!("{ver_major},{ver_minor},{ver_patch},0");
+
+    let manifest_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="GokhanYucel.StollKalipEditoru" type="win32"/>
+  <assemblyIdentity version="{ver_quad_dots}" processorArchitecture="*" name="GokhanYucel.StollKalipEditoru" type="win32"/>
   <description>Stoll .shp / .shv Kalıp Editörü</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
@@ -49,7 +57,8 @@ fn main() {
     </security>
   </trustInfo>
 </assembly>
-"#;
+"#
+    );
 
     if std::fs::write(&manifest_path, manifest_xml.as_bytes()).is_err() {
         return;
@@ -62,8 +71,8 @@ fn main() {
         "1 ICON \"{ico_escaped}\"\r\n\
          1 24 \"{manifest_escaped}\"\r\n\
          1 VERSIONINFO\r\n\
-         FILEVERSION 1,0,0,0\r\n\
-         PRODUCTVERSION 1,0,0,0\r\n\
+         FILEVERSION {ver_quad_commas}\r\n\
+         PRODUCTVERSION {ver_quad_commas}\r\n\
          FILEFLAGSMASK 0x3fL\r\n\
          FILEFLAGS 0x0L\r\n\
          FILEOS 0x40004L\r\n\
@@ -76,12 +85,12 @@ fn main() {
              BEGIN\r\n\
                VALUE \"CompanyName\", \"Gökhan Yücel\"\r\n\
                VALUE \"FileDescription\", \"Stoll .shp / .shv Kalıp Editörü\"\r\n\
-               VALUE \"FileVersion\", \"1.0.0\"\r\n\
+               VALUE \"FileVersion\", \"{pkg_ver}\"\r\n\
                VALUE \"InternalName\", \"Stoll_Kalip_Editoru\"\r\n\
                VALUE \"LegalCopyright\", \"Copyright (c) 2026 Gökhan\"\r\n\
                VALUE \"OriginalFilename\", \"Stoll_Kalip_Editoru.exe\"\r\n\
                VALUE \"ProductName\", \"Stoll Kalıp Editörü\"\r\n\
-               VALUE \"ProductVersion\", \"1.0.0\"\r\n\
+               VALUE \"ProductVersion\", \"{pkg_ver}\"\r\n\
              END\r\n\
            END\r\n\
            BLOCK \"VarFileInfo\"\r\n\

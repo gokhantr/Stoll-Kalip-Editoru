@@ -516,6 +516,37 @@ pub fn validate_document(doc: &FormDocument) -> ValidationReport {
                 ),
             });
         }
+
+        // 6. Stoll 13656 even start width / base width check for BasicShape
+        if el.element_type() == ElementType::BasicShape && doc.header.input_format != InputFormat::Mm
+        {
+            if el.start_width > 0.0 && (el.start_width - el.start_width.round()).abs() < 1e-4 {
+                let sw = el.start_width.round() as i32;
+                if sw % 2 != 0 {
+                    report.issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        element_index: ei,
+                        message: format!(
+                            "Eleman {} ({}): Başlama eni ({}) tek sayı — çift en kuralı uyarısı (13656)",
+                            el.index, el.name, sw
+                        ),
+                    });
+                }
+            }
+            if !el.mirrored && !el.left_lines.is_empty() && !el.right_lines.is_empty() {
+                let base_w = el.left_lines[0].stitches.abs() + el.right_lines[0].stitches.abs();
+                if base_w % 2 != 0 {
+                    report.issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        element_index: ei,
+                        message: format!(
+                            "Eleman {} ({}): Temel çizgi toplam eni ({} ilmek) tek sayı — çift en kuralı uyarısı (13656)",
+                            el.index, el.name, base_w
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     report

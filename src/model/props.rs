@@ -208,7 +208,7 @@ pub struct BindingOffProps {
     pub for_all_structures: i64,
     /// `ModulFarbeVerwenden` (ja/nein)
     pub use_module_color: bool,
-    /// `AbkettelTyp` — Remayözleme-tipi (`0` = Modül, `1` = Otomatik, `2` = El tipi)
+    /// UI-only legacy hint (`AbkettelTyp` is never written to Stoll `.shp` files).
     pub bind_off_type: Option<i32>,
     pub modules: Vec<ModuleAssignment>,
     pub raw: RawSectionMeta,

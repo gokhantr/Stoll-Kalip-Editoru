@@ -2,7 +2,7 @@
 
 use stoll_kalip_editoru::catalog::StollCatalog;
 use stoll_kalip_editoru::math::{rows_to_mm, stitches_to_mm, DocumentGeometry, SegmentSpan};
-use stoll_kalip_editoru::model::{DisplayUnit, FormDocument, InputFormat, LineSide, UndoStack};
+use stoll_kalip_editoru::model::{DisplayUnit, FormDocument, LineSide, UndoStack};
 
 use crate::ui::icons::{paint_icon, IconKind};
 use crate::ui::theme::{
@@ -402,11 +402,7 @@ pub fn show_settings_popover(
                                         ui.label(egui::RichText::new("Giriş formatı:").font(regular_font(10.5)));
                                         ui.add_enabled_ui(false, |ui| {
                                             win32_combo_scope(ui, |ui| {
-                                                let in_lbl = match doc.header.input_format {
-                                                    InputFormat::Steps | InputFormat::Stitches => "İlmekler",
-                                                    InputFormat::Stufung => "Basamaklar",
-                                                    InputFormat::Mm => "mm",
-                                                };
+                                                let in_lbl = doc.header.input_format.label_tr();
                                                 egui::ComboBox::from_id_salt("settings_giris_formati")
                                                     .width(102.0)
                                                     .selected_text(in_lbl)

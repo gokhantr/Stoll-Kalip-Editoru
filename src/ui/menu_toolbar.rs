@@ -108,17 +108,16 @@ pub fn show_menu_bar(
                     ui.separator();
 
                     ui.menu_button("çevrim ve giriş formatı ...", |ui| {
-                        let is_stitches = doc.header.input_format == InputFormat::Stitches;
-                        let is_steps = doc.header.input_format == InputFormat::Steps;
+                        let fmt = doc.header.input_format;
                         if ui
-                            .add_enabled(is_stitches || doc.header.input_format == InputFormat::Mm, egui::Button::new("İlmekler => Basamaklar"))
+                            .add_enabled(fmt != InputFormat::Steps, egui::Button::new("İlmekler => Basamaklar"))
                             .clicked()
                         {
                             actions.push(AppAction::ConvertFormat(InputFormat::Steps));
                             ui.close_menu();
                         }
                         if ui
-                            .add_enabled(is_steps || doc.header.input_format == InputFormat::Mm, egui::Button::new("Basamaklar => İlmekler"))
+                            .add_enabled(fmt != InputFormat::Stitches, egui::Button::new("Basamaklar => İlmekler"))
                             .clicked()
                         {
                             actions.push(AppAction::ConvertFormat(InputFormat::Stitches));
@@ -639,7 +638,24 @@ pub fn show_toolbar(
                     state.settings_popover_open = !state.settings_popover_open;
                 }
 
-                // ── Right-aligned Live Closure Badge / Update Pill ──────────────
+                if studio_icon_chip(
+                    ui,
+                    ChipIcon::Glyph(StudioGlyph::Info),
+                    "Hakkında",
+                    "Uygulama hakkında, sürüm ve güncellemeler",
+                    state.about_open,
+                    true,
+                ) {
+                    actions.push(AppAction::ShowAbout);
+                }
+
+                if let Some(tag) = available_update_tag {
+                    if studio_update_pill(ui, tag) {
+                        actions.push(AppAction::ShowAbout);
+                    }
+                }
+
+                // ── Right-aligned Live Closure Badge ────────────────────────────
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if line_count == 0 {
                         studio_badge(
@@ -671,12 +687,6 @@ pub fn show_toolbar(
                             TableMode::RightLines
                         };
                         actions.push(AppAction::CreateClosingLine);
-                    }
-
-                    if let Some(tag) = available_update_tag {
-                        if studio_update_pill(ui, tag) {
-                            actions.push(AppAction::ShowAbout);
-                        }
                     }
                 });
             });
@@ -787,12 +797,12 @@ fn studio_icon_chip(
 }
 
 fn studio_update_pill(ui: &mut Ui, tag: &str) -> bool {
-    let text = format!("Güncelleme: {tag}");
     let text_col = Color32::from_rgb(0x03, 0x69, 0xA1);
     let galley = ui
         .painter()
-        .layout_no_wrap(text, bold_font(10.5), text_col);
-    let size = vec2(galley.size().x + 16.0, 22.0);
+        .layout_no_wrap(tag.to_owned(), bold_font(10.5), text_col);
+    let arrow_w = 12.0;
+    let size = vec2(arrow_w + galley.size().x + 16.0, 22.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let (fill, border) = if resp.hovered() {
         (Color32::from_rgb(0xBA, 0xE6, 0xFD), Color32::from_rgb(0x02, 0x84, 0xC7))
@@ -807,18 +817,24 @@ fn studio_update_pill(ui: &mut Ui, tag: &str) -> bool {
         Stroke::new(1.0_f32, border),
         egui::StrokeKind::Inside,
     );
+    let arrow_rect = Rect::from_min_size(
+        egui::pos2(rect.left() + 6.0, rect.center().y - 5.5),
+        vec2(11.0, 11.0),
+    );
+    paint_studio_glyph(painter, arrow_rect, StudioGlyph::UpdateArrow, text_col);
     painter.galley(
         egui::pos2(
-            rect.center().x - galley.size().x * 0.5,
+            arrow_rect.right() + 3.0,
             rect.center().y - galley.size().y * 0.5,
         ),
         galley,
         text_col,
     );
     let clicked = resp.clicked();
-    resp.on_hover_text(format!(
-        "Yeni sürüm mevcut ({tag})! Hakkında & Güncellemeler penceresini açmak için tıklayın."
-    ));
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp.on_hover_text("Yeni sürüm mevcut — detaylar için tıklayın");
     clicked
 }
 

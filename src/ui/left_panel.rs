@@ -204,6 +204,13 @@ pub fn show_elements_strip(
                                 );
 
                                 if resp.clicked() {
+                                    if state.selected_elem != i {
+                                        crate::ui::grid_table::flush_active_grid_edit(doc, undo, state);
+                                        let old_idx = state.selected_elem;
+                                        ui.ctx().data_mut(|d| {
+                                            d.remove::<String>(ui.make_persistent_id(("studio_elem_name", old_idx)));
+                                        });
+                                    }
                                     state.selected_elem = i;
                                     state.all_elements_selected = false;
                                     state.editing_cell = None;

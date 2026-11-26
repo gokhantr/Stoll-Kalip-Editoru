@@ -232,7 +232,7 @@ pub fn show_grid_area(
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.set_height((top_h - 14.0).max(120.0));
-                        show_lines_card_header(ui, doc, state, actions, LineSide::Left, false);
+                        show_lines_card_header(ui, doc, undo, state, actions, LineSide::Left, false);
                         ui.add_space(4.0);
                         show_lines_grid_for_side(
                             ui,
@@ -263,6 +263,7 @@ pub fn show_grid_area(
                         show_lines_card_header(
                             ui,
                             doc,
+                            undo,
                             state,
                             actions,
                             LineSide::Right,
@@ -295,7 +296,7 @@ pub fn show_grid_area(
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.set_height((top_h - 14.0).max(120.0));
-                        show_markers_card_header(ui, doc, state, actions, LineSide::Left, false);
+                        show_markers_card_header(ui, doc, undo, state, actions, LineSide::Left, false);
                         ui.add_space(4.0);
                         show_markers_grid_for_side(
                             ui,
@@ -323,7 +324,7 @@ pub fn show_grid_area(
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.set_height((bot_h - 14.0).max(18.0));
-                        show_markers_card_header(ui, doc, state, actions, LineSide::Right, mirrored);
+                        show_markers_card_header(ui, doc, undo, state, actions, LineSide::Right, mirrored);
                         if !(mirrored && state.right_panel_collapsed) {
                             ui.add_space(4.0);
                             show_markers_grid_for_side(
@@ -349,7 +350,13 @@ pub fn show_grid_area(
     }
 }
 
-fn show_unit_toggle_pill(ui: &mut Ui, doc: &FormDocument, state: &mut UiState, scale: f32) {
+fn show_unit_toggle_pill(
+    ui: &mut Ui,
+    doc: &mut FormDocument,
+    undo: &mut UndoStack,
+    state: &mut UiState,
+    scale: f32,
+) {
     let base_lbl = if doc.header.input_format == InputFormat::Mm {
         "mm"
     } else {
@@ -390,6 +397,7 @@ fn show_unit_toggle_pill(ui: &mut Ui, doc: &FormDocument, state: &mut UiState, s
                 text_col,
             );
             if resp.clicked() && state.grid_unit_cm != is_cm {
+                flush_active_grid_edit(doc, undo, state);
                 state.grid_unit_cm = is_cm;
                 state.editing_cell = None;
             }
@@ -507,7 +515,8 @@ fn grid_header_button(
 
 fn show_lines_card_header(
     ui: &mut Ui,
-    doc: &FormDocument,
+    doc: &mut FormDocument,
+    undo: &mut UndoStack,
     state: &mut UiState,
     actions: &mut Vec<AppAction>,
     side: LineSide,
@@ -520,6 +529,7 @@ fn show_lines_card_header(
     };
     let is_active = state.active_table_side == side;
     let elem = doc.elements.get(state.selected_elem);
+    let elem_mirrored = elem.map(|e| e.mirrored).unwrap_or(true);
     let line_count = elem.map(|e| e.lines(side).len()).unwrap_or(0);
     let has_deletable = is_active
         && !read_only_mirrored
@@ -548,7 +558,7 @@ fn show_lines_card_header(
     let render_action_buttons = |ui: &mut Ui, state: &mut UiState, actions: &mut Vec<AppAction>| {
         ui.spacing_mut().item_spacing.x = 2.5 * hdr_scale;
         if side == LineSide::Left
-            && !elem.map(|e| e.mirrored).unwrap_or(true)
+            && !elem_mirrored
             && swap_sides_button(ui, hdr_scale).clicked()
         {
             actions.push(AppAction::SwapLeftRight);
@@ -652,7 +662,7 @@ fn show_lines_card_header(
             );
 
             if side == LineSide::Left {
-                show_unit_toggle_pill(ui, doc, state, hdr_scale);
+                show_unit_toggle_pill(ui, doc, undo, state, hdr_scale);
             }
 
             if read_only_mirrored {
@@ -739,7 +749,8 @@ fn swap_sides_button(ui: &mut Ui, scale: f32) -> egui::Response {
 
 fn show_markers_card_header(
     ui: &mut Ui,
-    doc: &FormDocument,
+    doc: &mut FormDocument,
+    undo: &mut UndoStack,
     state: &mut UiState,
     actions: &mut Vec<AppAction>,
     side: LineSide,
@@ -752,132 +763,164 @@ fn show_markers_card_header(
     };
     let is_active = state.active_table_side == side;
     let has_copied = !state.copied_markers.is_empty();
+    let point_count = doc
+        .elements
+        .get(state.selected_elem)
+        .map(|el| match side {
+            LineSide::Left => el.left_points.len(),
+            LineSide::Right => el.right_points.len(),
+        })
+        .unwrap_or(0);
+    let has_points = point_count > 0;
+    let has_selected = is_active
+        && (state
+            .selected_rows
+            .iter()
+            .any(|&r| r < point_count)
+            || state.primary_row().is_some_and(|r| r < point_count));
 
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0 * hdr_scale;
-        let title_col = if is_active {
-            colors::WIN_BLUE
+    let activate_markers_side = |st: &mut UiState| {
+        st.active_table_side = side;
+        st.table_mode = if side == LineSide::Left {
+            TableMode::LeftMarkers
         } else {
-            colors::TEXT_BLACK
+            TableMode::RightMarkers
         };
-        ui.label(
-            egui::RichText::new(title)
-                .font(bold_font(12.0 * hdr_scale))
-                .color(title_col),
-        );
+    };
 
-        if side == LineSide::Left {
-            show_unit_toggle_pill(ui, doc, state, hdr_scale);
+    let render_action_buttons = |ui: &mut Ui, state: &mut UiState, actions: &mut Vec<AppAction>| {
+        ui.spacing_mut().item_spacing.x = 2.5 * hdr_scale;
+        if grid_header_button(
+            ui,
+            "Yapıştır",
+            "Seçili işaretin üzerine yapıştır / değiştir (Ctrl+V)",
+            has_copied,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::PasteReplaceMarkers);
         }
-
-        if read_only_mirrored {
-            ui.label(
-                egui::RichText::new("(Aynalanmış)")
-                    .font(regular_font(10.0 * hdr_scale))
-                    .color(colors::TEXT_SECONDARY),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                show_collapse_toggle_button(ui, &mut state.right_panel_collapsed, hdr_scale);
-            });
-            return;
+        if grid_header_button(
+            ui,
+            "Ekle+Yapıştır",
+            "Kopyalanan işaretleri seçili işaretten önce ekle (Ctrl+Shift+V)",
+            has_copied,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::PasteInsertMarkers);
         }
+        if grid_header_button(
+            ui,
+            "Kopyala",
+            "Seçili işaretleri kopyala (Ctrl+C)",
+            has_selected && has_points,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::CopySelectedMarkers);
+        }
+        if grid_header_button(
+            ui,
+            "Çoğalt",
+            "İşaretleme noktalarını çoğalt...",
+            has_points,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::OpenMultiplyMarkers);
+        }
+        if grid_header_button(
+            ui,
+            "Sil",
+            "Seçili işaretleri sil (Delete)",
+            has_selected && has_points,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::DeleteSelectedMarker);
+        }
+        if grid_header_button(
+            ui,
+            "+ Öne",
+            "Seçili işaretten önce yeni işaret ekle",
+            true,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::InsertMarkerBefore);
+        }
+        if grid_header_button(
+            ui,
+            "+ Sona",
+            "Tablonun sonuna yeni işaret ekle",
+            true,
+            hdr_scale,
+        )
+        .clicked()
+        {
+            activate_markers_side(state);
+            actions.push(AppAction::AppendMarker);
+        }
+    };
 
-        let activate_markers_side = |st: &mut UiState| {
-            st.active_table_side = side;
-            st.table_mode = if side == LineSide::Left {
-                TableMode::LeftMarkers
+    let avail_w = ui.available_width();
+    let wrap_actions = !read_only_mirrored && avail_w < 640.0;
+
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0 * hdr_scale;
+            let title_col = if is_active {
+                colors::WIN_BLUE
             } else {
-                TableMode::RightMarkers
+                colors::TEXT_BLACK
             };
-        };
+            ui.label(
+                egui::RichText::new(title)
+                    .font(bold_font(12.0 * hdr_scale))
+                    .color(title_col),
+            );
 
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 2.5 * hdr_scale;
-            if grid_header_button(
-                ui,
-                "Yapıştır",
-                "Seçili işaretin üzerine yapıştır / değiştir (Ctrl+V)",
-                has_copied,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::PasteReplaceMarkers);
+            if side == LineSide::Left {
+                show_unit_toggle_pill(ui, doc, undo, state, hdr_scale);
             }
-            if grid_header_button(
-                ui,
-                "Ekle+Yapıştır",
-                "Kopyalanan işaretleri seçili işaretten önce ekle (Ctrl+Shift+V)",
-                has_copied,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::PasteInsertMarkers);
-            }
-            if grid_header_button(
-                ui,
-                "Kopyala",
-                "Seçili işaretleri kopyala (Ctrl+C)",
-                true,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::CopySelectedMarkers);
-            }
-            if grid_header_button(
-                ui,
-                "Çoğalt",
-                "İşaretleme noktalarını çoğalt...",
-                true,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::OpenMultiplyMarkers);
-            }
-            if grid_header_button(
-                ui,
-                "Sil",
-                "Seçili işaretleri sil (Delete)",
-                true,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::DeleteSelectedMarker);
-            }
-            if grid_header_button(
-                ui,
-                "+ Öne",
-                "Seçili işaretten önce yeni işaret ekle",
-                true,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::InsertMarkerBefore);
-            }
-            if grid_header_button(
-                ui,
-                "+ Sona",
-                "Tablonun sonuna yeni işaret ekle",
-                true,
-                hdr_scale,
-            )
-            .clicked()
-            {
-                activate_markers_side(state);
-                actions.push(AppAction::AppendMarker);
+
+            if read_only_mirrored {
+                ui.label(
+                    egui::RichText::new("(Aynalanmış)")
+                        .font(regular_font(10.0 * hdr_scale))
+                        .color(colors::TEXT_SECONDARY),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    show_collapse_toggle_button(ui, &mut state.right_panel_collapsed, hdr_scale);
+                });
+            } else if !wrap_actions {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    render_action_buttons(ui, state, actions);
+                });
             }
         });
+
+        if wrap_actions {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    render_action_buttons(ui, state, actions);
+                });
+            });
+        }
     });
 }
 
@@ -1021,20 +1064,43 @@ fn show_lines_grid_for_side(
                     let mut pending_commit: Option<(usize, usize, LineCol, String, EditMove)> = None;
                     let mut pending_start_edit: Option<(usize, usize, String)> = None;
                     let mut cancel_edit = false;
+                    let mut flush_pending = false;
                     let edit_init_id = ui.id().with(("lines_grid_edit_focused_cell", side as u8));
                     if state.editing_cell.is_none() || state.editing_side != side {
                         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(edit_init_id));
                     }
 
-                    for r in 0..row_count {
+                    let clip_rect = ui.clip_rect();
+                    let rows_top = grid_rect.top() + header_h;
+                    let first_vis = (((clip_rect.top() - rows_top) / row_h).floor() as isize - 1)
+                        .max(0) as usize;
+                    let last_vis = ((((clip_rect.bottom() - rows_top) / row_h).ceil() as isize
+                        + 1)
+                        .max(0) as usize)
+                        .min(row_count);
+                    let active_edit_row = if state.editing_side == side && !read_only_mirrored {
+                        state
+                            .editing_cell
+                            .as_ref()
+                            .map(|(er, _, _)| *er)
+                            .filter(|&er| er < row_count)
+                    } else {
+                        None
+                    };
+                    let mut rows_to_render: Vec<usize> = (first_vis..last_vis).collect();
+                    if let Some(er) = active_edit_row {
+                        if er < first_vis || er >= last_vis {
+                            rows_to_render.push(er);
+                        }
+                    }
+
+                    for r in rows_to_render {
                         let y = grid_rect.top() + header_h + (r as f32) * row_h;
                         let is_closing = closing_row_idx == Some(r);
                         let is_row_selected = is_active_side && state.selected_rows.contains(&r);
 
-                        // Read snapshot data for this line so we can render without borrow conflicts
-                        let line_snap = match doc.elements.get(elem_idx).and_then(|e| e.lines(side).get(r)) {
-                            Some(l) => l.clone(),
-                            None => continue,
+                        let Some(line_snap) = doc.elements.get(elem_idx).and_then(|e| e.lines(side).get(r)) else {
+                            continue;
                         };
                         let has_curve = line_snap
                             .curve
@@ -1211,7 +1277,7 @@ fn show_lines_grid_for_side(
                             } else {
                                 // Render static text
                                 let text = format_line_cell(
-                                    &line_snap,
+                                    line_snap,
                                     col,
                                     is_mm,
                                     unit_cm,
@@ -1283,6 +1349,7 @@ fn show_lines_grid_for_side(
                                             };
                                         }
                                         let modifiers = ui.input(|i| i.modifiers);
+                                        flush_pending = true;
                                         handle_no_col_press(state, side, r, vis_ci, modifiers);
                                     }
                                 } else if resp.clicked() {
@@ -1303,11 +1370,11 @@ fn show_lines_grid_for_side(
                                         let (lo, hi) = if anchor <= r { (anchor, r) } else { (r, anchor) };
                                         state.selected_rows = (lo..=hi).collect();
                                         state.focused_cell = Some((r, vis_ci));
-                                        state.editing_cell = None;
+                                        flush_pending = true;
                                     } else if modifiers.ctrl {
                                         toggle_row_selection(state, r);
                                         state.focused_cell = Some((r, vis_ci));
-                                        state.editing_cell = None;
+                                        flush_pending = true;
                                     } else {
                                         state.select_single_row(r);
                                         state.focused_cell = Some((r, vis_ci));
@@ -1318,7 +1385,7 @@ fn show_lines_grid_for_side(
                                             });
                                         } else if editable {
                                             let init = format_line_cell(
-                                                &line_snap,
+                                                line_snap,
                                                 col,
                                                 is_mm,
                                                 unit_cm,
@@ -1478,6 +1545,9 @@ fn show_lines_grid_for_side(
                         }
                     }
 
+                    if flush_pending {
+                        flush_active_grid_edit(doc, undo, state);
+                    }
                     if cancel_edit {
                         state.editing_cell = None;
                         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(edit_init_id));
@@ -1496,6 +1566,7 @@ fn show_lines_grid_for_side(
                         state.editing_cell = None;
                         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(edit_init_id));
                         if pending_start_edit.is_none() {
+                            let pending_scroll_id = ui.id().with(("lines_pending_scroll", side as u8));
                             match move_kind {
                                 EditMove::Stay => {}
                                 EditMove::Tab(forward) => {
@@ -1512,7 +1583,7 @@ fn show_lines_grid_for_side(
                                     if next_r != row_i {
                                         state.select_single_row(next_r);
                                     }
-                                    scroll_target = Some((next_r, next_c));
+                                    ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (next_r, next_c)));
                                 }
                                 EditMove::Delta(dr, dc) => {
                                     let nr = (row_i as i32 + dr)
@@ -1525,7 +1596,7 @@ fn show_lines_grid_for_side(
                                     if nr != row_i {
                                         state.select_single_row(nr);
                                     }
-                                    scroll_target = Some((nr, nc));
+                                    ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (nr, nc)));
                                 }
                             }
                         }
@@ -1533,6 +1604,16 @@ fn show_lines_grid_for_side(
                     if let Some((sr, sc, init)) = pending_start_edit {
                         *queued_start_edit = Some((side, sr, sc, init));
                         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(edit_init_id));
+                    }
+                    let pending_scroll_id = ui.id().with(("lines_pending_scroll", side as u8));
+                    if scroll_target.is_none() {
+                        scroll_target = ui.ctx().data_mut(|d| {
+                            let val = d.get_temp::<(usize, usize)>(pending_scroll_id);
+                            if val.is_some() {
+                                d.remove::<(usize, usize)>(pending_scroll_id);
+                            }
+                            val
+                        });
                     }
                     if let Some((sr, sc)) = scroll_target {
                         let col_x: f32 = visible_cols.iter().take(sc).map(|(_, w)| *w).sum();
@@ -1586,21 +1667,29 @@ fn show_markers_grid_for_side(
         ("Yorum", 140.0),
     ];
 
-    let points: Vec<PointEntry> = doc
+    let points_len = doc
         .elements
         .get(elem_idx)
         .map(|el| match side {
-            LineSide::Left => el.left_points.clone(),
-            LineSide::Right => el.right_points.clone(),
+            LineSide::Left => el.left_points.len(),
+            LineSide::Right => el.right_points.len(),
         })
-        .unwrap_or_default();
+        .unwrap_or(0);
 
     // Keyboard navigation & direct typing for Markers Grid
     let mut scroll_target: Option<(usize, usize)> = if is_active_side {
+        let pts_slice = doc
+            .elements
+            .get(elem_idx)
+            .map(|el| match side {
+                LineSide::Left => el.left_points.as_slice(),
+                LineSide::Right => el.right_points.as_slice(),
+            })
+            .unwrap_or(&[]);
         handle_markers_grid_keyboard(
             ui,
             &hdr,
-            &points,
+            pts_slice,
             state,
             side,
             read_only_mirrored,
@@ -1617,7 +1706,7 @@ fn show_markers_grid_for_side(
     let header_h = metrics.header_h;
     let row_h = metrics.row_h;
     let footer_h = if read_only_mirrored { 0.0 } else { metrics.footer_h };
-    let content_h = header_h + (points.len() as f32) * row_h + footer_h + 16.0;
+    let content_h = header_h + (points_len as f32) * row_h + footer_h + 16.0;
     let scroll_style = &ui.spacing().scroll;
     let vscroll_reserve = if content_h > avail_h {
         scroll_style.bar_width + scroll_style.bar_inner_margin + scroll_style.bar_outer_margin + 2.0
@@ -1634,6 +1723,7 @@ fn show_markers_grid_for_side(
     let mut pending_marker_start_edit: Option<(usize, usize, String)> = None;
     let mut pending_kind_change: Option<(usize, i32)> = None;
     let mut cancel_edit = false;
+    let mut flush_pending = false;
     let marker_edit_init_id = ui.id().with(("markers_grid_edit_focused_cell", side as u8));
     if state.editing_cell.is_none() || state.editing_side != side {
         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(marker_edit_init_id));
@@ -1646,7 +1736,7 @@ fn show_markers_grid_for_side(
                 .id_salt(("markers_grid_scroll", side as u8))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let canvas_h = (header_h + (points.len() as f32) * row_h + footer_h + 16.0)
+                    let canvas_h = (header_h + (points_len as f32) * row_h + footer_h + 16.0)
                         .max(ui.available_height());
                     let canvas_w = total_w.max(ui.available_width());
                     let (grid_rect, _) =
@@ -1657,7 +1747,7 @@ fn show_markers_grid_for_side(
                         ui,
                         state,
                         side,
-                        points.len(),
+                        points_len,
                         grid_rect.top(),
                         grid_rect.left(),
                         header_h,
@@ -1688,8 +1778,43 @@ fn show_markers_grid_for_side(
                         x += w;
                     }
 
-                    // Data rows
-                    for (r, pt) in points.iter().enumerate() {
+                    // Data rows (viewport-virtualized + active editing row)
+                    let pts_slice = doc
+                        .elements
+                        .get(elem_idx)
+                        .map(|el| match side {
+                            LineSide::Left => el.left_points.as_slice(),
+                            LineSide::Right => el.right_points.as_slice(),
+                        })
+                        .unwrap_or(&[]);
+                    let clip_rect = ui.clip_rect();
+                    let rows_top = grid_rect.top() + header_h;
+                    let first_vis = (((clip_rect.top() - rows_top) / row_h).floor() as isize - 1)
+                        .max(0) as usize;
+                    let last_vis = ((((clip_rect.bottom() - rows_top) / row_h).ceil() as isize
+                        + 1)
+                        .max(0) as usize)
+                        .min(points_len);
+                    let active_edit_row = if state.editing_side == side && !read_only_mirrored {
+                        state
+                            .editing_cell
+                            .as_ref()
+                            .map(|(er, _, _)| *er)
+                            .filter(|&er| er < points_len)
+                    } else {
+                        None
+                    };
+                    let mut rows_to_render: Vec<usize> = (first_vis..last_vis).collect();
+                    if let Some(er) = active_edit_row {
+                        if er < first_vis || er >= last_vis {
+                            rows_to_render.push(er);
+                        }
+                    }
+
+                    for r in rows_to_render {
+                        let Some(pt) = pts_slice.get(r) else {
+                            continue;
+                        };
                         let y = grid_rect.top() + header_h + (r as f32) * row_h;
                         let selected = is_active_side && state.selected_rows.contains(&r);
                         let multi_selected = selected && state.selected_rows.len() > 1;
@@ -1896,6 +2021,7 @@ fn show_markers_grid_for_side(
                                             };
                                         }
                                         let modifiers = ui.input(|i| i.modifiers);
+                                        flush_pending = true;
                                         handle_no_col_press(state, side, r, ci, modifiers);
                                     }
                                 } else if resp.clicked() {
@@ -1916,11 +2042,11 @@ fn show_markers_grid_for_side(
                                         let (lo, hi) = if anchor <= r { (anchor, r) } else { (r, anchor) };
                                         state.selected_rows = (lo..=hi).collect();
                                         state.focused_cell = Some((r, ci));
-                                        state.editing_cell = None;
+                                        flush_pending = true;
                                     } else if modifiers.ctrl {
                                         toggle_row_selection(state, r);
                                         state.focused_cell = Some((r, ci));
-                                        state.editing_cell = None;
+                                        flush_pending = true;
                                     } else {
                                         state.select_single_row(r);
                                         state.focused_cell = Some((r, ci));
@@ -2020,7 +2146,7 @@ fn show_markers_grid_for_side(
 
                     // Inline `+ İşaret Ekle` footer row
                     if !read_only_mirrored {
-                        let fy = grid_rect.top() + header_h + (points.len() as f32) * row_h;
+                        let fy = grid_rect.top() + header_h + (points_len as f32) * row_h;
                         let footer_w = total_w.min(canvas_w);
                         let footer_r = Rect::from_min_size(pos2(grid_rect.left(), fy), vec2(footer_w, footer_h));
                         let f_resp = ui.interact(
@@ -2062,6 +2188,16 @@ fn show_markers_grid_for_side(
                             actions.push(AppAction::AppendMarker);
                         }
                     }
+                    let pending_scroll_id = ui.id().with(("markers_pending_scroll", side as u8));
+                    if scroll_target.is_none() {
+                        scroll_target = ui.ctx().data_mut(|d| {
+                            let val = d.get_temp::<(usize, usize)>(pending_scroll_id);
+                            if val.is_some() {
+                                d.remove::<(usize, usize)>(pending_scroll_id);
+                            }
+                            val
+                        });
+                    }
                     if let Some((sr, sc)) = scroll_target {
                         let col_x: f32 = cols.iter().take(sc).map(|(_, w)| *w).sum();
                         let col_w = cols.get(sc).map(|(_, w)| *w).unwrap_or(40.0);
@@ -2092,6 +2228,9 @@ fn show_markers_grid_for_side(
         }
     }
 
+    if flush_pending {
+        flush_active_grid_edit(doc, undo, state);
+    }
     if cancel_edit {
         state.editing_cell = None;
         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(marker_edit_init_id));
@@ -2100,24 +2239,27 @@ fn show_markers_grid_for_side(
         state.editing_cell = None;
         ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, usize)>(marker_edit_init_id));
         if pending_marker_start_edit.is_none() {
+            let pending_scroll_id = ui.id().with(("markers_pending_scroll", side as u8));
             match move_kind {
                 EditMove::Stay => {}
                 EditMove::Tab(forward) => {
-                    let (next_r, next_c) = next_editable_marker_cell(points.len(), row_i, col_i, forward);
+                    let (next_r, next_c) = next_editable_marker_cell(points_len, row_i, col_i, forward);
                     state.focused_cell = Some((next_r, next_c));
                     if next_r != row_i {
                         state.select_single_row(next_r);
                     }
+                    ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (next_r, next_c)));
                 }
                 EditMove::Delta(dr, dc) => {
                     let next_r = (row_i as i32 + dr)
-                        .clamp(0, points.len().saturating_sub(1) as i32) as usize;
+                        .clamp(0, points_len.saturating_sub(1) as i32) as usize;
                     let next_c = (col_i as i32 + dc)
                         .clamp(0, cols.len().saturating_sub(1) as i32) as usize;
                     state.focused_cell = Some((next_r, next_c));
                     if next_r != row_i {
                         state.select_single_row(next_r);
                     }
+                    ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (next_r, next_c)));
                 }
             }
         }
@@ -2145,6 +2287,19 @@ fn handle_markers_grid_keyboard(
         return None;
     }
     let Some((r, c)) = state.focused_cell else {
+        let init_cell = (0, 1);
+        let wants_nav = ui.ctx().input(|i| {
+            i.key_pressed(Key::ArrowDown)
+                || i.key_pressed(Key::ArrowUp)
+                || i.key_pressed(Key::ArrowLeft)
+                || i.key_pressed(Key::ArrowRight)
+                || i.key_pressed(Key::Tab)
+        });
+        if wants_nav {
+            state.focused_cell = Some(init_cell);
+            state.select_single_row(0);
+            return Some(init_cell);
+        }
         return None;
     };
     let row_count = points.len();
@@ -2286,7 +2441,7 @@ fn commit_marker_cell_edit(
     let hdr = doc.header.clone();
     let is_mm = hdr.input_format == InputFormat::Mm;
     let trimmed = raw_text.trim().replace(',', ".");
-    let parsed_f = trimmed.parse::<f64>().ok();
+    let parsed_f = trimmed.parse::<f64>().ok().filter(|v| v.is_finite());
     let parsed_i = trimmed.parse::<i32>().ok();
 
     let Some(el) = doc.elements.get(elem_idx) else {
@@ -2301,6 +2456,9 @@ fn commit_marker_cell_edit(
     }
 
     let mirrored = el.mirrored;
+    let old_y = pts[row_idx].offsets.first().map(|o| o.y).unwrap_or(0);
+    let old_x = pts[row_idx].offsets.first().map(|o| o.x).unwrap_or(0);
+    let old_g = pts[row_idx].gruppe_tag_id;
     let mut changed = false;
 
     match col_idx {
@@ -2313,16 +2471,22 @@ fn commit_marker_cell_edit(
                 parsed_i
             };
             if let Some(y) = new_y {
-                undo.push("İşaret Boy", doc);
-                let pts = match side {
-                    LineSide::Left => &mut doc.elements[elem_idx].left_points,
-                    LineSide::Right => &mut doc.elements[elem_idx].right_points,
-                };
-                if pts[row_idx].offsets.is_empty() {
-                    pts[row_idx].offsets.push(PointOffset::default());
+                let text_unchanged = unit_cm
+                    && parsed_f
+                        .map(|v| (v - (rows_to_mm(old_y, &hdr) / 10.0)).abs() < 0.005)
+                        .unwrap_or(false);
+                if y != old_y && !text_unchanged {
+                    undo.push("İşaret Boy", doc);
+                    let pts = match side {
+                        LineSide::Left => &mut doc.elements[elem_idx].left_points,
+                        LineSide::Right => &mut doc.elements[elem_idx].right_points,
+                    };
+                    if pts[row_idx].offsets.is_empty() {
+                        pts[row_idx].offsets.push(PointOffset::default());
+                    }
+                    pts[row_idx].offsets[0].y = y;
+                    changed = true;
                 }
-                pts[row_idx].offsets[0].y = y;
-                changed = true;
             }
         }
         2 => {
@@ -2334,27 +2498,36 @@ fn commit_marker_cell_edit(
                 parsed_i
             };
             if let Some(x) = new_x {
-                undo.push("İşaret En", doc);
-                let pts = match side {
-                    LineSide::Left => &mut doc.elements[elem_idx].left_points,
-                    LineSide::Right => &mut doc.elements[elem_idx].right_points,
-                };
-                if pts[row_idx].offsets.is_empty() {
-                    pts[row_idx].offsets.push(PointOffset::default());
+                let text_unchanged = unit_cm
+                    && parsed_f
+                        .map(|v| (v - (stitches_to_mm(old_x, &hdr) / 10.0)).abs() < 0.005)
+                        .unwrap_or(false);
+                if x != old_x && !text_unchanged {
+                    undo.push("İşaret En", doc);
+                    let pts = match side {
+                        LineSide::Left => &mut doc.elements[elem_idx].left_points,
+                        LineSide::Right => &mut doc.elements[elem_idx].right_points,
+                    };
+                    if pts[row_idx].offsets.is_empty() {
+                        pts[row_idx].offsets.push(PointOffset::default());
+                    }
+                    pts[row_idx].offsets[0].x = x;
+                    changed = true;
                 }
-                pts[row_idx].offsets[0].x = x;
-                changed = true;
             }
         }
         4 => {
             if let Some(g) = parsed_i {
-                undo.push("İşaret Grup", doc);
-                let pts = match side {
-                    LineSide::Left => &mut doc.elements[elem_idx].left_points,
-                    LineSide::Right => &mut doc.elements[elem_idx].right_points,
-                };
-                pts[row_idx].gruppe_tag_id = g.max(0);
-                changed = true;
+                let clamped = g.max(0);
+                if clamped != old_g {
+                    undo.push("İşaret Grup", doc);
+                    let pts = match side {
+                        LineSide::Left => &mut doc.elements[elem_idx].left_points,
+                        LineSide::Right => &mut doc.elements[elem_idx].right_points,
+                    };
+                    pts[row_idx].gruppe_tag_id = clamped;
+                    changed = true;
+                }
             }
         }
         _ => {}
@@ -2386,6 +2559,19 @@ fn handle_lines_grid_keyboard(
         return None;
     }
     let Some((r, c)) = state.focused_cell else {
+        let init_cell = (0, 2.min(col_count.saturating_sub(1)));
+        let wants_nav = ui.ctx().input(|i| {
+            i.key_pressed(Key::ArrowDown)
+                || i.key_pressed(Key::ArrowUp)
+                || i.key_pressed(Key::ArrowLeft)
+                || i.key_pressed(Key::ArrowRight)
+                || i.key_pressed(Key::Tab)
+        });
+        if wants_nav {
+            state.focused_cell = Some(init_cell);
+            state.select_single_row(0);
+            return Some(init_cell);
+        }
         return None;
     };
     if r >= row_count || c >= col_count {
@@ -3025,7 +3211,6 @@ fn handle_no_col_press(
     col_idx: usize,
     modifiers: egui::Modifiers,
 ) {
-    state.editing_cell = None;
     if modifiers.shift {
         let anchor = state
             .row_select_anchor
@@ -3200,6 +3385,33 @@ fn show_line_context_menu(
     }
 }
 
+/// Commit any active inline grid cell edit (`state.editing_cell`) before switching tables, elements, or saving.
+pub fn flush_active_grid_edit(doc: &mut FormDocument, undo: &mut UndoStack, state: &mut UiState) {
+    let Some((row_i, col_i, buf)) = state.editing_cell.take() else {
+        return;
+    };
+    let elem_idx = state.selected_elem;
+    let side = state.editing_side;
+    if state.table_mode.is_lines() {
+        let visible_cols = visible_line_cols(state);
+        if let Some(&(col, _)) = visible_cols.get(col_i) {
+            commit_line_cell_edit(
+                doc,
+                undo,
+                elem_idx,
+                side,
+                row_i,
+                col,
+                &buf,
+                state.sign_mode,
+                state.grid_unit_cm,
+            );
+        }
+    } else {
+        commit_marker_cell_edit(doc, undo, elem_idx, side, row_i, col_i, &buf, state.grid_unit_cm);
+    }
+}
+
 fn commit_line_cell_edit(
     doc: &mut FormDocument,
     undo: &mut UndoStack,
@@ -3256,31 +3468,62 @@ fn commit_line_cell_edit(
             if unit_cm {
                 if let Ok(cm) = trimmed.parse::<f64>() {
                     if cm.is_finite() {
-                        let mm = cm * 10.0;
-                        if is_mm {
-                            line.height_mm = mm;
-                            recalc_line_from_mm(line, &hdr);
+                        let mm = (cm * 10.0).max(0.0);
+                        let same = if is_mm {
+                            (mm - line.height_mm).abs() < 0.05
+                                || format_cm_val(line.height_mm / 10.0) == format_cm_val(cm.max(0.0))
                         } else {
-                            line.rows = mm_to_rows(mm, &hdr);
-                            recalc_line_from_stitches_and_rows(line, &hdr);
+                            mm_to_rows(mm, &hdr) == line.rows
+                                || format_cm_val(line.height_mm / 10.0) == format_cm_val(cm.max(0.0))
+                        };
+                        if !same {
+                            if is_mm {
+                                line.height_mm = mm;
+                                recalc_line_from_mm(line, &hdr);
+                            } else {
+                                line.rows = mm_to_rows(mm, &hdr).max(0);
+                                recalc_line_from_stitches_and_rows(line, &hdr);
+                            }
+                            let is_closing = is_last_row
+                                && line.rows == 0
+                                && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                            auto_detect_line_function_in_context(
+                                line,
+                                row_idx == 0,
+                                is_closing,
+                                is_left,
+                                elem_type,
+                            );
+                            changed = true;
                         }
-                        let is_closing = is_last_row
-                            && line.rows == 0
-                            && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                        auto_detect_line_function_in_context(
-                            line,
-                            row_idx == 0,
-                            is_closing,
-                            is_left,
-                            elem_type,
-                        );
-                        changed = true;
                     }
                 }
             } else if is_mm {
                 if let Ok(v) = trimmed.parse::<f64>() {
-                    line.height_mm = v;
-                    recalc_line_from_mm(line, &hdr);
+                    if v.is_finite() {
+                        let clamped = v.max(0.0);
+                        if (clamped - line.height_mm).abs() >= 0.005 {
+                            line.height_mm = clamped;
+                            recalc_line_from_mm(line, &hdr);
+                            let is_closing = is_last_row
+                                && line.rows == 0
+                                && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                            auto_detect_line_function_in_context(
+                                line,
+                                row_idx == 0,
+                                is_closing,
+                                is_left,
+                                elem_type,
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+            } else if let Ok(v) = trimmed.parse::<i32>() {
+                let clamped = v.max(0);
+                if clamped != line.rows {
+                    line.rows = clamped;
+                    recalc_line_from_stitches_and_rows(line, &hdr);
                     let is_closing = is_last_row
                         && line.rows == 0
                         && (line.last_line != 0 || sum_x_others + line.stitches == 0);
@@ -3293,20 +3536,6 @@ fn commit_line_cell_edit(
                     );
                     changed = true;
                 }
-            } else if let Ok(v) = trimmed.parse::<i32>() {
-                line.rows = v;
-                recalc_line_from_stitches_and_rows(line, &hdr);
-                let is_closing = is_last_row
-                    && line.rows == 0
-                    && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                auto_detect_line_function_in_context(
-                    line,
-                    row_idx == 0,
-                    is_closing,
-                    is_left,
-                    elem_type,
-                );
-                changed = true;
             }
         }
         LineCol::Stitches => {
@@ -3314,30 +3543,63 @@ fn commit_line_cell_edit(
                 if let Ok(cm) = trimmed.parse::<f64>() {
                     if cm.is_finite() {
                         let mm = cm * 10.0 * (x_sign as f64);
-                        if is_mm {
-                            line.width_mm = mm;
-                            recalc_line_from_mm(line, &hdr);
+                        let same = if is_mm {
+                            (mm - line.width_mm).abs() < 0.05
+                                || format_cm_val((line.width_mm / 10.0) * (x_sign as f64))
+                                    == format_cm_val(cm)
                         } else {
-                            line.stitches = mm_to_stitches(mm, &hdr);
-                            recalc_line_from_stitches_and_rows(line, &hdr);
+                            mm_to_stitches(mm, &hdr) == line.stitches
+                                || format_cm_val((line.width_mm / 10.0) * (x_sign as f64))
+                                    == format_cm_val(cm)
+                        };
+                        if !same {
+                            if is_mm {
+                                line.width_mm = mm;
+                                recalc_line_from_mm(line, &hdr);
+                            } else {
+                                line.stitches = mm_to_stitches(mm, &hdr);
+                                recalc_line_from_stitches_and_rows(line, &hdr);
+                            }
+                            let is_closing = is_last_row
+                                && line.rows == 0
+                                && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                            auto_detect_line_function_in_context(
+                                line,
+                                row_idx == 0,
+                                is_closing,
+                                is_left,
+                                elem_type,
+                            );
+                            changed = true;
                         }
-                        let is_closing = is_last_row
-                            && line.rows == 0
-                            && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                        auto_detect_line_function_in_context(
-                            line,
-                            row_idx == 0,
-                            is_closing,
-                            is_left,
-                            elem_type,
-                        );
-                        changed = true;
                     }
                 }
             } else if is_mm {
                 if let Ok(v) = trimmed.parse::<f64>() {
-                    line.width_mm = v * (x_sign as f64);
-                    recalc_line_from_mm(line, &hdr);
+                    if v.is_finite() {
+                        let new_w = v * (x_sign as f64);
+                        if (new_w - line.width_mm).abs() >= 0.005 {
+                            line.width_mm = new_w;
+                            recalc_line_from_mm(line, &hdr);
+                            let is_closing = is_last_row
+                                && line.rows == 0
+                                && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                            auto_detect_line_function_in_context(
+                                line,
+                                row_idx == 0,
+                                is_closing,
+                                is_left,
+                                elem_type,
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+            } else if let Ok(v) = trimmed.parse::<i32>() {
+                let new_st = v * x_sign;
+                if new_st != line.stitches {
+                    line.stitches = new_st;
+                    recalc_line_from_stitches_and_rows(line, &hdr);
                     let is_closing = is_last_row
                         && line.rows == 0
                         && (line.last_line != 0 || sum_x_others + line.stitches == 0);
@@ -3350,114 +3612,132 @@ fn commit_line_cell_edit(
                     );
                     changed = true;
                 }
-            } else if let Ok(v) = trimmed.parse::<i32>() {
-                line.stitches = v * x_sign;
-                recalc_line_from_stitches_and_rows(line, &hdr);
-                let is_closing = is_last_row
-                    && line.rows == 0
-                    && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                auto_detect_line_function_in_context(
-                    line,
-                    row_idx == 0,
-                    is_closing,
-                    is_left,
-                    elem_type,
-                );
-                changed = true;
             }
         }
         LineCol::StepY => {
             if let Ok(v) = trimmed.parse::<i32>() {
-                line.step_y = v;
-                let is_closing = is_last_row
-                    && line.rows == 0
-                    && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                recalc_line_from_step_edit_for_element(
-                    line,
-                    &hdr,
-                    false,
-                    row_idx == 0,
-                    is_closing,
-                    is_left,
-                    elem_type,
-                );
-                changed = true;
+                if v != line.step_y {
+                    line.step_y = v;
+                    let is_closing = is_last_row
+                        && line.rows == 0
+                        && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                    recalc_line_from_step_edit_for_element(
+                        line,
+                        &hdr,
+                        false,
+                        row_idx == 0,
+                        is_closing,
+                        is_left,
+                        elem_type,
+                    );
+                    changed = true;
+                }
             }
         }
         LineCol::StepX => {
             if let Ok(v) = trimmed.parse::<i32>() {
-                line.step_x = v * x_sign;
-                let is_closing = is_last_row
-                    && line.rows == 0
-                    && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                recalc_line_from_step_edit_for_element(
-                    line,
-                    &hdr,
-                    false,
-                    row_idx == 0,
-                    is_closing,
-                    is_left,
-                    elem_type,
-                );
-                changed = true;
+                let new_sx = v * x_sign;
+                if new_sx != line.step_x {
+                    line.step_x = new_sx;
+                    let is_closing = is_last_row
+                        && line.rows == 0
+                        && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                    recalc_line_from_step_edit_for_element(
+                        line,
+                        &hdr,
+                        false,
+                        row_idx == 0,
+                        is_closing,
+                        is_left,
+                        elem_type,
+                    );
+                    changed = true;
+                }
             }
         }
         LineCol::Factor => {
             if let Ok(v) = trimmed.parse::<i32>() {
-                line.step_factor = v.max(1);
-                let is_closing = is_last_row
-                    && line.rows == 0
-                    && (line.last_line != 0 || sum_x_others + line.stitches == 0);
-                recalc_line_from_step_edit_for_element(
-                    line,
-                    &hdr,
-                    true,
-                    row_idx == 0,
-                    is_closing,
-                    is_left,
-                    elem_type,
-                );
-                changed = true;
+                let clamped = v.max(1);
+                if clamped != line.step_factor {
+                    line.step_factor = clamped;
+                    let is_closing = is_last_row
+                        && line.rows == 0
+                        && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                    recalc_line_from_step_edit_for_element(
+                        line,
+                        &hdr,
+                        true,
+                        row_idx == 0,
+                        is_closing,
+                        is_left,
+                        elem_type,
+                    );
+                    changed = true;
+                }
             }
         }
         LineCol::WidthNarrow => {
             if let Ok(v) = trimmed.parse::<i32>() {
                 let val = v.max(0);
-                let func_id = line.function.to_id();
-                if func_id == 2 {
-                    let w = line.widening.get_or_insert_with(Default::default);
-                    set_active_module_width(&mut w.modules, val, true);
-                    line.ensure_child_slot(KanteChildSlot::Widening);
-                    if let Some(ref mut cv) = line.curve {
-                        for st in &mut cv.steps {
-                            st.widening_width = val;
+                let cur_str = format_line_cell(
+                    line,
+                    LineCol::WidthNarrow,
+                    is_mm,
+                    unit_cm,
+                    sign_mode,
+                    side,
+                    line.is_curve(),
+                    is_base_row,
+                );
+                if cur_str.parse::<i32>().ok() != Some(val) {
+                    let func_id = line.function.to_id();
+                    if func_id == 2 {
+                        let w = line.widening.get_or_insert_with(Default::default);
+                        set_active_module_width(&mut w.modules, val, true);
+                        line.ensure_child_slot(KanteChildSlot::Widening);
+                        if let Some(ref mut cv) = line.curve {
+                            for st in &mut cv.steps {
+                                st.widening_width = val;
+                            }
+                        }
+                    } else {
+                        let n = line.narrowing.get_or_insert_with(Default::default);
+                        set_active_module_width(&mut n.modules, val, true);
+                        line.ensure_child_slot(KanteChildSlot::Narrowing);
+                        if let Some(ref mut cv) = line.curve {
+                            for st in &mut cv.steps {
+                                st.narrowing_width = val;
+                            }
                         }
                     }
-                } else {
-                    let n = line.narrowing.get_or_insert_with(Default::default);
-                    set_active_module_width(&mut n.modules, val, true);
-                    line.ensure_child_slot(KanteChildSlot::Narrowing);
-                    if let Some(ref mut cv) = line.curve {
-                        for st in &mut cv.steps {
-                            st.narrowing_width = val;
-                        }
-                    }
+                    changed = true;
                 }
-                changed = true;
             }
         }
         LineCol::WidthFadeOut => {
             if let Ok(v) = trimmed.parse::<i32>() {
                 let val = v.max(0);
-                let f = line.fade_out.get_or_insert_with(Default::default);
-                set_active_module_width(&mut f.modules, val, false);
-                line.ensure_child_slot(KanteChildSlot::FadeOut);
-                if let Some(ref mut cv) = line.curve {
-                    for st in &mut cv.steps {
-                        st.fade_out_width = val;
+                let cur_str = format_line_cell(
+                    line,
+                    LineCol::WidthFadeOut,
+                    is_mm,
+                    unit_cm,
+                    sign_mode,
+                    side,
+                    line.is_curve(),
+                    is_base_row,
+                );
+                if cur_str.parse::<i32>().ok() != Some(val) {
+                    let f = line.fade_out.get_or_insert_with(Default::default);
+                    set_active_module_width(&mut f.modules, val, false);
+                    line.ensure_child_slot(KanteChildSlot::FadeOut);
+                    if let Some(ref mut cv) = line.curve {
+                        for st in &mut cv.steps {
+                            st.fade_out_width = val;
+                        }
                     }
+                    changed = true;
                 }
-                changed = true;
             }
         }
         LineCol::Comment => {

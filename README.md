@@ -1,6 +1,6 @@
-# Stoll Kalıp Editörü
+﻿# Stoll Kalıp Editörü
 
-[![Sürüm](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.0.0-0F766E.svg)](https://github.com/gokhantr/Stoll-Kalip-Editoru/releases/latest)
+[![Sürüm](https://img.shields.io/badge/S%C3%BCr%C3%BCm-v1.0.1-0F766E.svg)](https://github.com/gokhantr/Stoll-Kalip-Editoru/releases/latest)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20(x64)-1E3A5F.svg)](https://github.com/gokhantr/Stoll-Kalip-Editoru/releases/latest)
 [![Lisans](https://img.shields.io/badge/Lisans-MIT-10B981.svg)](LICENSE)
 

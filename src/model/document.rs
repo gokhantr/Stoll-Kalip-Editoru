@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::model::enums::{
     CurveForm, DisplayUnit, ElementType, InputFormat, LineFunction, LineSide, XReferenceAxis,
@@ -453,7 +454,7 @@ impl Default for Guidelines {
 pub struct FormDocument {
     pub header: FormHeader,
     pub elements: Vec<ShapeElement>,
-    pub ole: OlePreservedStreams,
+    pub ole: Arc<OlePreservedStreams>,
     pub guidelines: Guidelines,
     pub file_path: Option<PathBuf>,
     pub dirty: bool,
@@ -493,11 +494,11 @@ impl FormDocument {
         Self {
             header,
             elements: vec![elem],
-            ole: OlePreservedStreams {
+            ole: Arc::new(OlePreservedStreams {
                 form_had_bom: false,
                 form_trailing_newline: true,
                 ..Default::default()
-            },
+            }),
             guidelines: Guidelines::default(),
             file_path: None,
             dirty: false,
@@ -516,6 +517,31 @@ impl FormDocument {
         let cur = self.header.last_line_tag_id.unwrap_or(0).max(max_existing);
         let next = cur + 1;
         self.header.last_line_tag_id = Some(next);
+        next
+    }
+
+    /// Allocate the next unique marking point `PunktTagId` and update `header.last_point_tag_id`.
+    pub fn next_point_tag_id(&mut self) -> i32 {
+        let max_existing = self
+            .elements
+            .iter()
+            .flat_map(|e| {
+                e.left_points
+                    .iter()
+                    .chain(e.right_points.iter())
+                    .chain(
+                        e.left_lines
+                            .iter()
+                            .chain(e.right_lines.iter())
+                            .flat_map(|l| l.points.iter()),
+                    )
+            })
+            .map(|p| p.punkt_tag_id)
+            .max()
+            .unwrap_or(0);
+        let cur = self.header.last_point_tag_id.unwrap_or(0).max(max_existing);
+        let next = cur + 1;
+        self.header.last_point_tag_id = Some(next);
         next
     }
 

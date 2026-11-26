@@ -115,6 +115,11 @@ impl CadCanvasState {
         self.measure_world = None;
     }
 
+    pub fn clear_drag(&mut self) {
+        self.drag_state = None;
+        self.hovered_target = None;
+    }
+
     /// Render the interactive CAD canvas inside the given `ui`.
     /// Returns `true` if `doc` was mutated (so `app.rs` marks dirty and recomputes geometry).
     pub fn show(
@@ -270,8 +275,40 @@ impl CadCanvasState {
             }
         }
 
-        // ── 2. Hit-Testing for Vertex Handles, Midpoints, and Edges ──────────────
-        let hover_pos = response.hover_pos();
+        // ── 2. Pre-project segments once + Hit-Testing for Vertex Handles, Midpoints, and Edges ──
+        let modal_open = state.any_modal_open();
+        let projected_elems: Vec<(Vec<Vec<Pos2>>, Vec<Vec<Pos2>>)> = geom
+            .elements
+            .iter()
+            .map(|eg| {
+                if eg.hidden {
+                    return (Vec::new(), Vec::new());
+                }
+                let l_pts = eg
+                    .left_segments
+                    .iter()
+                    .map(|seg| {
+                        seg.polyline_mm
+                            .iter()
+                            .map(|p| world_to_screen(p.x, p.y))
+                            .collect()
+                    })
+                    .collect();
+                let r_pts = eg
+                    .right_segments
+                    .iter()
+                    .map(|seg| {
+                        seg.polyline_mm
+                            .iter()
+                            .map(|p| world_to_screen(p.x, p.y))
+                            .collect()
+                    })
+                    .collect();
+                (l_pts, r_pts)
+            })
+            .collect();
+
+        let hover_pos = if modal_open { None } else { response.hover_pos() };
         let shift_held = ui.input(|i| i.modifiers.shift);
         let mut best_handle: Option<(f32, HoverTarget)> = None;
         let mut best_edge: Option<(f32, HoverTarget)> = None;
@@ -279,28 +316,26 @@ impl CadCanvasState {
         let active_elem = state.selected_elem;
         let active_side = state.active_table_side;
 
-        if self.drag_state.is_none() && !shift_held {
+        if modal_open {
+            self.hovered_target = None;
+        } else if self.drag_state.is_none() && !shift_held {
             if let Some(hp) = hover_pos {
                 for (ei, eg) in geom.elements.iter().enumerate() {
                     if eg.hidden {
                         continue;
                     }
-                    let sides: [(LineSide, &[SegmentSpan]); 2] = [
-                        (LineSide::Left, &eg.left_segments),
-                        (LineSide::Right, &eg.right_segments),
+                    let (ref l_pts, ref r_pts) = projected_elems[ei];
+                    let sides: [(LineSide, &[SegmentSpan], &[Vec<Pos2>]); 2] = [
+                        (LineSide::Left, &eg.left_segments, l_pts),
+                        (LineSide::Right, &eg.right_segments, r_pts),
                     ];
-                    for (side, segs) in sides {
-                        for seg in segs {
-                            if seg.polyline_mm.len() < 2 {
+                    for (side, segs, pts_list) in sides {
+                        for (seg, screen_pts) in segs.iter().zip(pts_list.iter()) {
+                            if screen_pts.len() < 2 {
                                 continue;
                             }
-                            let screen_pts: Vec<Pos2> = seg
-                                .polyline_mm
-                                .iter()
-                                .map(|p| world_to_screen(p.x, p.y))
-                                .collect();
                             let end_pt = *screen_pts.last().unwrap();
-                            let mid_pt = polyline_midpoint(&screen_pts);
+                            let mid_pt = polyline_midpoint(screen_pts);
 
                             let d_end = hp.distance(end_pt);
                             if d_end < 9.0
@@ -332,7 +367,7 @@ impl CadCanvasState {
                                 ));
                             }
 
-                            let d_edge = dist_to_polyline(hp, &screen_pts);
+                            let d_edge = dist_to_polyline(hp, screen_pts);
                             if d_edge < 7.5
                                 && best_edge.map(|(b, _)| d_edge < b).unwrap_or(true)
                             {
@@ -354,12 +389,12 @@ impl CadCanvasState {
         }
 
         // ── 3. Interactive Vertex/Midpoint Dragging (Seçenek 1: Komşu Korumalı) ──
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if !modal_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.measure_world = None;
             self.drag_state = None;
         }
 
-        if response.hovered() {
+        if !modal_open && response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
             if scroll.abs() > 0.1 {
                 let factor = (1.0 + scroll * 0.0025).clamp(0.75, 1.35);
@@ -374,18 +409,18 @@ impl CadCanvasState {
             }
         }
 
-        if self.drag_state.is_none() && shift_held && response.drag_started_by(PointerButton::Primary) {
+        if !modal_open && self.drag_state.is_none() && shift_held && response.drag_started_by(PointerButton::Primary) {
             if let Some(hp) = response.interact_pointer_pos() {
                 let w = screen_to_world_mm(hp);
                 self.measure_world = Some((w, w));
             }
-        } else if self.drag_state.is_none() && shift_held && response.dragged_by(PointerButton::Primary) {
+        } else if !modal_open && self.drag_state.is_none() && shift_held && response.dragged_by(PointerButton::Primary) {
             if let (Some((start, _)), Some(hp)) =
                 (self.measure_world, response.interact_pointer_pos())
             {
                 self.measure_world = Some((start, screen_to_world_mm(hp)));
             }
-        } else if response.drag_started_by(PointerButton::Primary) && !shift_held {
+        } else if !modal_open && response.drag_started_by(PointerButton::Primary) && !shift_held {
             if let Some(target) = self.hovered_target {
                 if matches!(target.kind, HandleKind::VertexEnd | HandleKind::Midpoint) {
                     let is_mirrored = doc
@@ -632,21 +667,17 @@ impl CadCanvasState {
                 paint_concave_polygon_fill(&painter, &poly, studio::PRIMARY_FILL);
             }
 
-            let sides: [(LineSide, &[SegmentSpan]); 2] = [
-                (LineSide::Left, &eg.left_segments),
-                (LineSide::Right, &eg.right_segments),
+            let (ref l_pts, ref r_pts) = projected_elems[ei];
+            let sides: [(LineSide, &[SegmentSpan], &[Vec<Pos2>]); 2] = [
+                (LineSide::Left, &eg.left_segments, l_pts),
+                (LineSide::Right, &eg.right_segments, r_pts),
             ];
 
-            for (side, segs) in sides {
-                for seg in segs {
-                    if seg.polyline_mm.len() < 2 {
+            for (side, segs, pts_list) in sides {
+                for (seg, screen_pts) in segs.iter().zip(pts_list.iter()) {
+                    if screen_pts.len() < 2 {
                         continue;
                     }
-                    let screen_pts: Vec<Pos2> = seg
-                        .polyline_mm
-                        .iter()
-                        .map(|p| world_to_screen(p.x, p.y))
-                        .collect();
 
                     let is_selected = ei == active_elem
                         && (side == active_side || (eg.mirrored && active_side == LineSide::Left))
@@ -666,9 +697,10 @@ impl CadCanvasState {
                         (base_color, if ei == 0 { 2.0_f32 } else { 1.8_f32 })
                     };
 
-                    for w in screen_pts.windows(2) {
-                        painter.line_segment([w[0], w[1]], Stroke::new(stroke_w, stroke_col));
-                    }
+                    painter.add(egui::Shape::line(
+                        screen_pts.clone(),
+                        Stroke::new(stroke_w, stroke_col),
+                    ));
 
                     // Line number label with collision avoidance & outward offset on horizontal edges
                     if self.show_line_numbers && screen_pts.len() >= 2 {
@@ -1014,7 +1046,7 @@ impl CadCanvasState {
                 }
             });
 
-        // Top-right live cursor readout
+        // Top-right live cursor readout (drops onto second row on narrow left pane so HUD never collides)
         if let Some(hp) = hover_pos {
             if canvas_rect.contains(hp) {
                 let (wx_mm, wy_mm) = screen_to_world_mm(hp);
@@ -1030,8 +1062,13 @@ impl CadCanvasState {
                 let painter = ui.painter().with_clip_rect(canvas_rect);
                 let galley = painter.layout_no_wrap(readout, regular_font(11.0), studio::HUD_TEXT);
                 let sz = galley.size() + vec2(14.0, 8.0);
+                let top_y = if canvas_rect.width() < 540.0 {
+                    canvas_rect.top() + 38.0
+                } else {
+                    canvas_rect.top() + 8.0
+                };
                 let r = Rect::from_min_size(
-                    pos2(canvas_rect.right() - sz.x - 10.0, canvas_rect.top() + 8.0),
+                    pos2((canvas_rect.right() - sz.x - 10.0).max(canvas_rect.left() + 10.0), top_y),
                     sz,
                 );
                 painter.rect_filled(r, CornerRadius::same(6), studio::HUD_BG);
@@ -1428,10 +1465,7 @@ fn paint_element_markers(
         }
     }
 
-    for (lines, segs) in [
-        (&el_doc.left_lines, &eg.left_segments),
-        (&el_doc.right_lines, &eg.right_segments),
-    ] {
+    let paint_side_line_markers = |lines: &[LineSegment], segs: &[SegmentSpan], mirror_x: bool| {
         for (line, seg) in lines.iter().zip(segs.iter()) {
             for pt in &line.points {
                 let has_mod = pt
@@ -1447,12 +1481,20 @@ fn paint_element_markers(
                 } else {
                     (seg.end_mm.x, seg.end_mm.y)
                 };
-                let (ox, oy) = pt.offsets.first().map(|o| (o.x, o.y)).unwrap_or((0, 0));
+                let (raw_ox, oy) = pt.offsets.first().map(|o| (o.x, o.y)).unwrap_or((0, 0));
+                let ox = if mirror_x { -raw_ox } else { raw_ox };
                 let wx = anchor.0 + stitches_to_mm(ox, &doc.header);
                 let wy = anchor.1 + rows_to_mm(oy, &doc.header);
                 draw_diamond(world_to_screen(wx, wy));
             }
         }
+    };
+
+    paint_side_line_markers(&el_doc.left_lines, &eg.left_segments, false);
+    if el_doc.right_lines.is_empty() && el_doc.mirrored && !eg.right_segments.is_empty() {
+        paint_side_line_markers(&el_doc.left_lines, &eg.right_segments, true);
+    } else {
+        paint_side_line_markers(&el_doc.right_lines, &eg.right_segments, false);
     }
 }
 

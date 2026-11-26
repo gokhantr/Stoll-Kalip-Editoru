@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::model::{
     enums::{parse_stoll_bool, DisplayUnit, InputFormat, LineFunction, YReferenceLine},
     BindingOffProps, ConnectPoint, ConnectionPoints, CurveData, CurveStep, ExternalLocalModule,
@@ -635,7 +637,9 @@ pub fn parse_form_text(text: &str, ole: OlePreservedStreams) -> Result<FormDocum
             ActiveSection::BindingOff => {
                 if let Some(k) = current_kante_mut(&mut elements, active_side) {
                     if let Some(ref mut b) = k.binding_off {
-                        b.raw.push_raw(key.to_string(), val.to_string());
+                        if key != "AbkettelTyp" {
+                            b.raw.push_raw(key.to_string(), val.to_string());
+                        }
                         match key {
                             "FuerAlleStrickarten" => b.for_all_structures = val.parse().unwrap_or(0),
                             "ModulFarbeVerwenden" => b.use_module_color = parse_stoll_bool(val),
@@ -770,7 +774,7 @@ pub fn parse_form_text(text: &str, ole: OlePreservedStreams) -> Result<FormDocum
     Ok(FormDocument {
         header,
         elements,
-        ole,
+        ole: Arc::new(ole),
         guidelines: Default::default(),
         file_path: None,
         dirty: false,

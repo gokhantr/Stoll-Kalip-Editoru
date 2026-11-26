@@ -11,8 +11,11 @@ use crate::model::{
     LineSide, ModuleAssignment, NarrowingProps, RawSectionMeta, ShapeCutType, WideningProps,
 };
 pub use settings::{
-    export_settings_bundle, export_settings_bundle_with_template_path, import_settings_bundle,
-    import_settings_bundle_to_dir, UserSettings,
+    clamp_rect_to_work_area, enable_per_monitor_dpi_awareness, export_settings_bundle,
+    export_settings_bundle_with_template_path, import_settings_bundle,
+    import_settings_bundle_to_dir, monitor_work_area_for_rect, primary_monitor_scale_factor,
+    relocate_rect_into_work_area, validate_saved_window_placement, MonitorWorkRect, UserSettings,
+    WindowPlacementPx,
 };
 
 /// Stoll knitting structure definition (`[ModuleArt] = id`), 1:1 with `messagetextresources_7.dll`.
@@ -88,8 +91,10 @@ pub enum ModuleCategory {
     NarrowingMultistage,
     /// Artırma (`[Zunahme]`)
     Widening,
-    /// Remayözleme (`[Bind-off-CA]` + `[Abketteln]`)
+    /// Remayözleme — Modül (`[Abketteln]`)
     BindOff,
+    /// Remayözleme — RA (`[Bind-off-CA]`)
+    BindOffCa,
     /// Kenar düzeltme (`[Ausblenden]`)
     FadeOut,
     /// Başlama (`[Shape edge Start]`)
@@ -108,7 +113,8 @@ impl ModuleCategory {
             Self::Narrowing => "Reglan",
             Self::NarrowingMultistage => "Çok kademeli reglan",
             Self::Widening => "Artırma",
-            Self::BindOff => "Remayözleme",
+            Self::BindOff => "Remayözleme (Modül)",
+            Self::BindOffCa => "Remayözleme (RA)",
             Self::FadeOut => "Kenar düzeltme",
             Self::Start => "Başlama",
             Self::StartVneck => "V-Yaka Başlama",
@@ -129,7 +135,8 @@ impl ModuleCategory {
                 Some(Self::NarrowingMultistage)
             }
             "Zunehmen" | "Zunahme" | "Widening" | "Artırma" => Some(Self::Widening),
-            "Abketteln" | "Bind-off-CA" | "BindOff" | "Remayözleme" => Some(Self::BindOff),
+            "Abketteln" | "BindOff" | "Remayözleme" | "Remayözleme (Modül)" => Some(Self::BindOff),
+            "Bind-off-CA" | "BindOffCa" | "RA" | "Remayözleme (RA)" => Some(Self::BindOffCa),
             "Ausblenden" | "FadeOut" | "Kenar düzeltme" => Some(Self::FadeOut),
             "Start" | "Shape edge Start" | "Başlama" => Some(Self::Start),
             "StartVneck" | "Start V-neck" | "V-Yaka Başlama" => Some(Self::StartVneck),
@@ -504,6 +511,38 @@ impl StollCatalog {
             .unwrap_or_default()
     }
 
+    /// Infer Stoll `Remayözleme-tipi` (`0 = Modül`, `1 = RA`) from a module GUID's root membership.
+    pub fn bind_off_type_for_guid(&self, guid: &str) -> usize {
+        let norm = normalize_guid(guid);
+        if norm.is_empty() || norm == "{00000000-0000-0000-0000-000000000000}" {
+            return 0;
+        }
+        let in_mod = self
+            .category_guids
+            .get(&ModuleCategory::BindOff)
+            .is_some_and(|v| v.contains(&norm));
+        let in_ca = self
+            .category_guids
+            .get(&ModuleCategory::BindOffCa)
+            .is_some_and(|v| v.contains(&norm));
+        if in_ca && !in_mod {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Returns `true` if `guid` belongs to the flat `NarrowingMultistage` (`{34FFFFF6-...}`) DB tree.
+    pub fn is_narrowing_multistage_guid(&self, guid: &str) -> bool {
+        let norm = normalize_guid(guid);
+        if norm.is_empty() || norm == "{00000000-0000-0000-0000-000000000000}" {
+            return false;
+        }
+        self.category_guids
+            .get(&ModuleCategory::NarrowingMultistage)
+            .is_some_and(|v| v.contains(&norm))
+    }
+
     fn register_category_guid(&mut self, cat: ModuleCategory, struct_id: Option<i32>, guid: &str) {
         let norm = normalize_guid(guid);
         if norm.is_empty() || norm == "{00000000-0000-0000-0000-000000000000}" {
@@ -622,21 +661,21 @@ impl StollCatalog {
             },
             CategoryRootSpec {
                 cat: ModuleCategory::BindOff,
-                root_guid: "{F39139E7-520E-4104-8BBA-A4D8A034FA80}", // Bind-off-CA (12 slots, first)
+                root_guid: "{4D55434B-0000-0000-000E-4B41524C4900}", // Abketteln ("Modül", 12 slots)
                 has_structure_slots: true,
                 include_dirs: true,
             },
             CategoryRootSpec {
-                cat: ModuleCategory::BindOff,
-                root_guid: "{4D55434B-0000-0000-000E-4B41524C4900}", // Abketteln (12 slots)
+                cat: ModuleCategory::BindOffCa,
+                root_guid: "{F39139E7-520E-4104-8BBA-A4D8A034FA80}", // Bind-off-CA ("RA", 12 slots)
                 has_structure_slots: true,
                 include_dirs: true,
             },
             CategoryRootSpec {
                 cat: ModuleCategory::FadeOut,
-                root_guid: "{4471D73D-1517-4989-A1AC-81239CFC4F9C}", // Ausblenden (12 slots)
+                root_guid: "{4471D73D-1517-4989-A1AC-81239CFC4F9C}", // Ausblenden (12 slots, skip 'Yeni modül grubu' folders)
                 has_structure_slots: true,
-                include_dirs: true,
+                include_dirs: false,
             },
             CategoryRootSpec {
                 cat: ModuleCategory::Start,
@@ -664,6 +703,8 @@ impl StollCatalog {
             },
         ];
 
+        let mut known_dir_guids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         for spec in roots {
             if spec.has_structure_slots {
                 let slot_dirs = read_dir_children_for_guid(root, spec.root_guid);
@@ -671,19 +712,27 @@ impl StollCatalog {
                     let struct_id = Some(slot_idx as i32);
                     let items = read_dir_children_for_guid(root, &slot_dir_guid);
                     for item_guid in items {
-                        if !spec.include_dirs && is_stoll_db_directory(root, &item_guid) {
-                            continue;
-                        }
-                        self.index_leaf_module(root, spec.cat, struct_id, &item_guid);
+                        self.index_leaf_module(
+                            root,
+                            spec.cat,
+                            struct_id,
+                            &item_guid,
+                            !spec.include_dirs,
+                            &mut known_dir_guids,
+                        );
                     }
                 }
             } else {
                 let items = read_dir_children_for_guid(root, spec.root_guid);
                 for item_guid in items {
-                    if !spec.include_dirs && is_stoll_db_directory(root, &item_guid) {
-                        continue;
-                    }
-                    self.index_leaf_module(root, spec.cat, None, &item_guid);
+                    self.index_leaf_module(
+                        root,
+                        spec.cat,
+                        None,
+                        &item_guid,
+                        !spec.include_dirs,
+                        &mut known_dir_guids,
+                    );
                 }
             }
         }
@@ -695,17 +744,27 @@ impl StollCatalog {
         cat: ModuleCategory,
         struct_id: Option<i32>,
         guid: &str,
+        skip_dirs: bool,
+        known_dir_guids: &mut std::collections::HashSet<String>,
     ) {
         let norm = normalize_guid(guid);
         if norm.is_empty() || norm == "{00000000-0000-0000-0000-000000000000}" {
             return;
         }
+        if skip_dirs && known_dir_guids.contains(&norm) {
+            return;
+        }
         if !self.modules_by_guid.contains_key(&norm) {
-            if let Some(mut info) = load_stoll_module_metadata_only(root, &norm) {
-                info.category = cat.label_tr().to_string();
-                self.modules_by_guid.insert(norm.clone(), info);
-            } else {
-                return;
+            match load_stoll_module_metadata_checked(root, &norm, skip_dirs) {
+                ModuleLoadOutcome::Loaded(mut info) => {
+                    info.category = cat.label_tr().to_string();
+                    self.modules_by_guid.insert(norm.clone(), info);
+                }
+                ModuleLoadOutcome::Directory => {
+                    known_dir_guids.insert(norm);
+                    return;
+                }
+                ModuleLoadOutcome::Missing => return,
             }
         }
         self.register_category_guid(cat, struct_id, &norm);
@@ -805,7 +864,7 @@ impl StollCatalog {
             return info.name.clone();
         }
         if let Some(ref root) = self.stoll_data_root {
-            if let Some(info) = load_stoll_module_from_db(root, &key) {
+            if let Some(info) = load_stoll_module_metadata_only(root, &key) {
                 return info.name;
             }
         }
@@ -915,6 +974,12 @@ pub fn load_stoll_module_from_db(stoll_root: &Path, guid: &str) -> Option<Knitti
     Some(info)
 }
 
+enum ModuleLoadOutcome {
+    Loaded(KnittingModuleInfo),
+    Directory,
+    Missing,
+}
+
 fn load_stoll_module_from_db_detailed(
     stoll_root: &Path,
     guid: &str,
@@ -926,28 +991,29 @@ fn load_stoll_module_from_db_detailed(
         .and_then(|e| e.to_str())
         .map(|e| e.eq_ignore_ascii_case("M1_Module_Deleted"))
         .unwrap_or(false);
-    load_module_file_inner(stoll_root, &norm, &path, 0, true).map(|info| (info, is_deleted))
+    match load_module_file_inner(stoll_root, &norm, &path, 0, true, false) {
+        ModuleLoadOutcome::Loaded(info) => Some((info, is_deleted)),
+        _ => None,
+    }
 }
 
 fn load_stoll_module_metadata_only(stoll_root: &Path, guid: &str) -> Option<KnittingModuleInfo> {
-    let norm = normalize_guid(guid);
-    let path = module_db_path(stoll_root, &norm)?;
-    load_module_file_inner(stoll_root, &norm, &path, 0, false)
+    match load_stoll_module_metadata_checked(stoll_root, guid, false) {
+        ModuleLoadOutcome::Loaded(info) => Some(info),
+        _ => None,
+    }
 }
 
-/// Return true if a Stoll DB node is a sub-folder (`M3_MOD_DirChildren` stream present).
-fn is_stoll_db_directory(stoll_root: &Path, guid: &str) -> bool {
+fn load_stoll_module_metadata_checked(
+    stoll_root: &Path,
+    guid: &str,
+    skip_dirs: bool,
+) -> ModuleLoadOutcome {
     let norm = normalize_guid(guid);
     let Some(path) = module_db_path(stoll_root, &norm) else {
-        return false;
+        return ModuleLoadOutcome::Missing;
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
-    };
-    let Ok(comp) = cfb::CompoundFile::open(std::io::Cursor::new(bytes)) else {
-        return false;
-    };
-    comp.exists("/M3_MOD_DirChildren")
+    load_module_file_inner(stoll_root, &norm, &path, 0, false, skip_dirs)
 }
 
 /// Read `M3_MOD_DirChildren` GUID list from a Stoll DB directory node (48-byte header + N*36-byte entries).
@@ -994,21 +1060,36 @@ fn load_module_file_inner(
     path: &Path,
     depth: u8,
     load_bitmap: bool,
-) -> Option<KnittingModuleInfo> {
+    skip_dirs: bool,
+) -> ModuleLoadOutcome {
     if depth > 3 {
-        return None;
+        return ModuleLoadOutcome::Missing;
     }
-    let bytes = std::fs::read(path).ok()?;
-    let mut comp = cfb::CompoundFile::open(std::io::Cursor::new(bytes)).ok()?;
+    let Ok(bytes) = std::fs::read(path) else {
+        return ModuleLoadOutcome::Missing;
+    };
+    let Ok(mut comp) = cfb::CompoundFile::open(std::io::Cursor::new(bytes)) else {
+        return ModuleLoadOutcome::Missing;
+    };
+
+    if skip_dirs && comp.exists("/M3_MOD_DirChildren") {
+        return ModuleLoadOutcome::Directory;
+    }
 
     // Check for M3_MOD_Attribs directly
     if comp.exists("/M3_MOD_Attribs") {
         let mut attribs = Vec::new();
-        comp.open_stream("/M3_MOD_Attribs")
-            .ok()?
-            .read_to_end(&mut attribs)
-            .ok()?;
-        let name = parse_m3_mod_attribs_name(&attribs)?;
+        {
+            let Ok(mut stream) = comp.open_stream("/M3_MOD_Attribs") else {
+                return ModuleLoadOutcome::Missing;
+            };
+            if stream.read_to_end(&mut attribs).is_err() {
+                return ModuleLoadOutcome::Missing;
+            }
+        }
+        let Some(name) = parse_m3_mod_attribs_name(&attribs) else {
+            return ModuleLoadOutcome::Missing;
+        };
         let thumbnail = if load_bitmap && comp.exists("/M3_UTL_Bitmap") {
             let mut bmp = Vec::new();
             if comp
@@ -1023,7 +1104,7 @@ fn load_module_file_inner(
         } else {
             None
         };
-        return Some(KnittingModuleInfo {
+        return ModuleLoadOutcome::Loaded(KnittingModuleInfo {
             guid: orig_guid.to_string(),
             name,
             category: "Stoll DB".to_string(),
@@ -1034,30 +1115,42 @@ fn load_module_file_inner(
     // Follow M3_MOD_VersionList pointer -> last version entry
     if comp.exists("/M3_MOD_VersionList") {
         let mut vlist = Vec::new();
-        comp.open_stream("/M3_MOD_VersionList")
-            .ok()?
-            .read_to_end(&mut vlist)
-            .ok()?;
+        {
+            let Ok(mut stream) = comp.open_stream("/M3_MOD_VersionList") else {
+                return ModuleLoadOutcome::Missing;
+            };
+            if stream.read_to_end(&mut vlist).is_err() {
+                return ModuleLoadOutcome::Missing;
+            }
+        }
         if vlist.len() >= 44 {
-            let count = u32::from_le_bytes(vlist[40..44].try_into().ok()?) as usize;
+            let Ok(cnt_bytes) = vlist[40..44].try_into() else {
+                return ModuleLoadOutcome::Missing;
+            };
+            let count = u32::from_le_bytes(cnt_bytes) as usize;
             if count > 0 {
                 let entry_off = 44 + (count - 1) * 36;
                 if vlist.len() >= entry_off + 36 {
-                    let target_guid = decode_win_guid(&vlist[entry_off + 16..entry_off + 32])?;
-                    let target_path = module_db_path(stoll_root, &target_guid)?;
+                    let Some(target_guid) = decode_win_guid(&vlist[entry_off + 16..entry_off + 32]) else {
+                        return ModuleLoadOutcome::Missing;
+                    };
+                    let Some(target_path) = module_db_path(stoll_root, &target_guid) else {
+                        return ModuleLoadOutcome::Missing;
+                    };
                     return load_module_file_inner(
                         stoll_root,
                         orig_guid,
                         &target_path,
                         depth + 1,
                         load_bitmap,
+                        skip_dirs,
                     );
                 }
             }
         }
     }
 
-    None
+    ModuleLoadOutcome::Missing
 }
 
 fn decode_win_guid(b: &[u8]) -> Option<String> {
@@ -1258,6 +1351,8 @@ fn builtin_module_entries() -> &'static [(&'static str, &'static str, ModuleCate
         ("{31BB46CF-D6F2-11D2-AE4D-0000F8081442}", "MG_Masche v mit Umhängen", ModuleCategory::FadeOut, Some(6)),
         ("{AAB4DE9D-30AF-4E62-8E19-301760376ADF}", "Standard (Structure single jersey)", ModuleCategory::Widening, Some(0)),
         ("{A0EB0C74-54C4-4295-9B98-63BC5E75BECF}", "Standard (Structure single jersey)", ModuleCategory::Widening, Some(0)),
+        ("{A372A90F-50DD-11D4-BE63-00A0C9ECEF97}", "Bind-off SJ-01", ModuleCategory::BindOff, Some(0)),
+        ("{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}", "Bind-Off RL with fixing 01", ModuleCategory::BindOffCa, Some(0)),
         ("{524134AE-CA09-4F92-8B75-1A33DF7A06BA}", "1-ISARET", ModuleCategory::Start, Some(0)),
         ("{CDF170A8-D448-458E-BB77-2DF1B3C29586}", "2-ISARET", ModuleCategory::Start, Some(0)),
         ("{BC07B9DE-16B6-405E-9ADA-07ED9F49F55E}", "3-ISARET", ModuleCategory::Start, Some(0)),
@@ -1367,33 +1462,40 @@ mod tests {
         assert_eq!(actual_wid0_guids, expected_wid0, "Widening slot 0 must match exact Stoll M3_MOD_DirChildren order");
         assert!(cat.modules_for_category_and_structure(ModuleCategory::Widening, 2).is_empty());
 
-        // 4. Remayözleme (Bind-off-CA + Abketteln): slot 0 = 61 + 16 = 77 items, includes user CA module,
-        // matches Bind-off-CA[0] ++ Abketteln[0] in exact Stoll order; slot 8 (1x1-MG Jac-Dolu) = empty!
-        let bo0 = cat.modules_for_category_and_structure(ModuleCategory::BindOff, 0);
-        assert_eq!(bo0.len(), 77);
-        assert!(bo0[0].name.contains("_CA"), "Bind-off-CA must precede Abketteln: {}", bo0[0].name);
-        assert!(bo0.iter().any(|m| m.name.contains("4no Kolevi Bind-off 1-igne_CA")));
-        let bo_ca_slots = read_dir_children_for_guid(root, "{F39139E7-520E-4104-8BBA-A4D8A034FA80}");
+        // 4. Remayözleme split 1:1 into Modül (`Abketteln`) and RA (`Bind-off-CA`):
+        //    - Modül slot 0 = 16 items starting with Bind-off SJ-01
+        //    - RA slot 0 = 61 items including CA modules; slot 8 (1x1-MG Jac-Dolu) = empty!
+        let bo_mod0 = cat.modules_for_category_and_structure(ModuleCategory::BindOff, 0);
+        assert_eq!(bo_mod0.len(), 16);
+        assert_eq!(bo_mod0[0].name, "Bind-off SJ-01");
         let bo_ab_slots = read_dir_children_for_guid(root, "{4D55434B-0000-0000-000E-4B41524C4900}");
-        let mut expected_bo0 = read_dir_children_for_guid(root, &bo_ca_slots[0]);
-        for g in read_dir_children_for_guid(root, &bo_ab_slots[0]) {
-            if !expected_bo0.contains(&g) {
-                expected_bo0.push(g);
-            }
-        }
-        let actual_bo0_guids: Vec<String> = bo0.iter().map(|m| m.guid.to_ascii_uppercase()).collect();
-        assert_eq!(actual_bo0_guids, expected_bo0, "BindOff slot 0 must match exact Stoll M3_MOD_DirChildren order");
-        for m in &bo0 {
+        let expected_bo_mod0 = read_dir_children_for_guid(root, &bo_ab_slots[0]);
+        let actual_bo_mod0: Vec<String> = bo_mod0.iter().map(|m| m.guid.to_ascii_uppercase()).collect();
+        assert_eq!(actual_bo_mod0, expected_bo_mod0, "BindOff (Modül) slot 0 must match Abketteln[0]");
+        assert_eq!(cat.bind_off_type_for_guid(&bo_mod0[0].guid), 0);
+
+        let bo_ca0 = cat.modules_for_category_and_structure(ModuleCategory::BindOffCa, 0);
+        assert_eq!(bo_ca0.len(), 61);
+        assert!(bo_ca0[0].name.contains("_CA"), "Bind-off-CA[0] first entry: {}", bo_ca0[0].name);
+        assert!(bo_ca0.iter().any(|m| m.name.contains("4no Kolevi Bind-off 1-igne_CA")));
+        let bo_ca_slots = read_dir_children_for_guid(root, "{F39139E7-520E-4104-8BBA-A4D8A034FA80}");
+        let expected_bo_ca0 = read_dir_children_for_guid(root, &bo_ca_slots[0]);
+        let actual_bo_ca0: Vec<String> = bo_ca0.iter().map(|m| m.guid.to_ascii_uppercase()).collect();
+        assert_eq!(actual_bo_ca0, expected_bo_ca0, "BindOffCa (RA) slot 0 must match Bind-off-CA[0]");
+        assert_eq!(cat.bind_off_type_for_guid(&bo_ca0[0].guid), 1);
+        for m in bo_mod0.iter().chain(bo_ca0.iter()) {
             let low = m.name.to_ascii_lowercase();
             assert!(!low.contains("mg_"), "1x1-MG leaked into BindOff[0]: {}", m.name);
         }
         assert!(cat.modules_for_category_and_structure(ModuleCategory::BindOff, 8).is_empty());
+        assert!(cat.modules_for_category_and_structure(ModuleCategory::BindOffCa, 8).is_empty());
 
-        // 5. Kenar düzeltme (Ausblenden): slot 0 = 40 items starting with Front stitch with transfer;
-        // slot 2 (Jac-Dolu) = empty!
+        // 5. Kenar düzeltme (Ausblenden): slot 0 = 39 leaf items starting with Front stitch with transfer
+        //    ('Yeni modül grubu' organizational folder {363924DE-...} excluded); slot 2 (Jac-Dolu) = empty!
         let fo0 = cat.modules_for_category_and_structure(ModuleCategory::FadeOut, 0);
-        assert_eq!(fo0.len(), 40);
+        assert_eq!(fo0.len(), 39);
         assert_eq!(fo0[0].name, "Front stitch with transfer");
+        assert!(fo0.iter().all(|m| !m.name.eq_ignore_ascii_case("Yeni modül grubu") && !m.name.eq_ignore_ascii_case("Neue Modulgruppe")));
         assert!(cat.modules_for_category_and_structure(ModuleCategory::FadeOut, 2).is_empty());
 
         // 6. Başlama / Bitiş / İşaretleme cleanly separated and `element`/`ELEMENT` directory nodes excluded

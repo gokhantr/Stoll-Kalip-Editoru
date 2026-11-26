@@ -321,6 +321,8 @@ pub enum StudioGlyph {
     Mirror,
     Columns,
     Settings,
+    Info,
+    UpdateArrow,
     Check,
     Swap,
     ChevronUp,
@@ -411,6 +413,21 @@ pub fn paint_studio_glyph(painter: &Painter, rect: Rect, glyph: StudioGlyph, col
                     stroke,
                 );
             }
+        }
+        StudioGlyph::Info => {
+            painter.circle_stroke(c, 5.2 * s, thin);
+            painter.circle_filled(pos2(c.x, c.y - 2.4 * s), 0.9 * s, color);
+            painter.line_segment(
+                [pos2(c.x, c.y - 0.5 * s), pos2(c.x, c.y + 3.0 * s)],
+                stroke,
+            );
+        }
+        StudioGlyph::UpdateArrow => {
+            let top = pos2(c.x, c.y - 4.2 * s);
+            let bot = pos2(c.x, c.y + 4.2 * s);
+            painter.line_segment([bot, top], stroke);
+            painter.line_segment([top, pos2(c.x - 3.2 * s, c.y - 0.8 * s)], stroke);
+            painter.line_segment([top, pos2(c.x + 3.2 * s, c.y - 0.8 * s)], stroke);
         }
         StudioGlyph::Check => {
             let p0 = pos2(c.x - 4.2 * s, c.y + 0.3 * s);

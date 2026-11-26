@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use stoll_kalip_editoru::catalog::{
-    export_settings_bundle_with_template_path, import_settings_bundle_to_dir,
-    knitting_structure_name_tr, ModuleCategory, StollCatalog, UserSettings, KNITTING_STRUCTURES,
+    clamp_rect_to_work_area, export_settings_bundle_with_template_path,
+    import_settings_bundle_to_dir, knitting_structure_name_tr, relocate_rect_into_work_area,
+    ModuleCategory, MonitorWorkRect, StollCatalog, UserSettings, KNITTING_STRUCTURES,
 };
 use stoll_kalip_editoru::io::bitmap::{decode_muster_bitmap, render_muster_bitmap};
 use stoll_kalip_editoru::io::parser::decode_form_utf16le;
@@ -26,7 +27,8 @@ use stoll_kalip_editoru::math::{
 };
 use stoll_kalip_editoru::model::{
     BindingOffProps, CurveData, CurveForm, ElementType, FormDocument, InputFormat, KanteChildSlot,
-    LineFunction, LineSegment, LineSide, PointEntry, ShapeCutType, UndoStack, YReferenceLine,
+    LineFunction, LineSegment, LineSide, ModuleAssignment, NarrowingProps, PointEntry,
+    ShapeCutType, UndoStack, WideningProps, YReferenceLine,
 };
 
 fn make_sample_rect_doc() -> FormDocument {
@@ -515,20 +517,33 @@ fn test_phase2_engine_parity_eng01_to_eng13() {
     assert_eq!(doc.elements[0].left_lines[1].step_x, 2);
     assert_eq!(doc.elements[0].left_lines[1].step_y, 4);
 
-    // [ENG-09] BindOffType persistence round-trip
+    // [ENG-09] Remayözleme (`[Abketteln]`): NEVER emits non-existent `AbkettelTyp`, and
+    // catalog distinguishes `Modül` (`BindOff`) vs `RA` (`BindOffCa`) by GUID root.
     doc.elements[0].left_lines[1].binding_off = Some(BindingOffProps {
-        bind_off_type: Some(1),
+        modules: vec![ModuleAssignment {
+            module_art_id: 0,
+            id: "{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}".to_string(),
+            ..Default::default()
+        }],
         ..BindingOffProps::default()
     });
     let saved = save_to_bytes(&doc).unwrap();
     let reloaded = load_from_bytes(&saved).unwrap();
-    assert_eq!(
-        reloaded.elements[0].left_lines[1]
-            .binding_off
-            .as_ref()
-            .and_then(|b| b.bind_off_type),
-        Some(1)
-    );
+    let reloaded_bo = reloaded.elements[0].left_lines[1].binding_off.as_ref().unwrap();
+    assert!(reloaded_bo.raw.get_raw("AbkettelTyp").is_none());
+    assert_eq!(reloaded_bo.modules[0].id, "{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}");
+    let offline_cat = StollCatalog::load_from_root(None, ShapeCutType::Standard);
+    assert_eq!(offline_cat.bind_off_type_for_guid("{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}"), 1);
+    assert_eq!(offline_cat.bind_off_type_for_guid("{A372A90F-50DD-11D4-BE63-00A0C9ECEF97}"), 0);
+    if cat.stoll_data_root.is_some() {
+        let mod_list = cat.modules_for_category_and_structure(ModuleCategory::BindOff, 0);
+        let ra_list = cat.modules_for_category_and_structure(ModuleCategory::BindOffCa, 0);
+        assert_eq!(mod_list.len(), 16);
+        assert_eq!(ra_list.len(), 61);
+        assert_ne!(mod_list[0].guid, ra_list[0].guid);
+        assert_eq!(cat.bind_off_type_for_guid(&mod_list[0].guid), 0);
+        assert_eq!(cat.bind_off_type_for_guid(&ra_list[0].guid), 1);
+    }
 
     // [ENG-10] .crv save & load round-trip
     let crv_steps = generate_curve_steps(&CurveGenParams {
@@ -873,11 +888,44 @@ fn test_5_fixes_axis_geometry_row1_closing_none_and_settings_bundle() {
         show_dimensions: false,
         show_detail_columns: true,
         custom_stoll_defaultform_path: Some(Path::new(r"D:\Stoll\M1plus\8.0.010\ConfigData\defaultform.shp").to_path_buf()),
+        window_x: Some(-1800),
+        window_y: Some(120),
+        window_w: Some(1400),
+        window_h: Some(900),
+        window_maximized: true,
+        ignored_update_version: Some("v1.0.1".to_string()),
     };
     let ini_path = src_dir.join("settings.ini");
     settings.save_to_path(&ini_path).unwrap();
     let loaded_settings = UserSettings::load_from_path(&ini_path);
     assert_eq!(loaded_settings, settings);
+
+    // Window geometry work-area clamping & off-screen rejection (secondary monitor with negative X)
+    let secondary_work = MonitorWorkRect {
+        left: -1920,
+        top: 0,
+        right: 0,
+        bottom: 1040,
+    };
+    assert_eq!(
+        clamp_rect_to_work_area(-1800, 120, 1400, 900, secondary_work),
+        Some((-1800, 120, 1400, 900))
+    );
+    // Oversized / partially shifted window clamps cleanly within secondary monitor work area
+    assert_eq!(
+        clamp_rect_to_work_area(-1000, 500, 1600, 800, secondary_work),
+        Some((-1600, 240, 1600, 800))
+    );
+    // Completely disconnected monitor rect returns None
+    assert_eq!(
+        clamp_rect_to_work_area(3000, 100, 1360, 860, secondary_work),
+        None
+    );
+    // Relocating a maximized window moved to a secondary monitor preserves size and centers in work area
+    assert_eq!(
+        relocate_rect_into_work_area(1360, 860, secondary_work),
+        (-1640, 90, 1360, 860)
+    );
 
     let mut cat = StollCatalog::load_from_root(None, ShapeCutType::Standard);
     let mut sample_tpl = LineSegment::default();
@@ -1201,5 +1249,303 @@ fn test_audit_bug_fixes_elemanlar_math_and_ops() {
             assert!((dm - expected_mm).abs() < 1e-6);
             assert!(!suw.elements[1].is_base_line_row(LineSide::Left, 0));
         }
+    }
+}
+
+#[test]
+fn test_sweep_serializer_emits_newly_added_optional_fields() {
+    use stoll_kalip_editoru::io::parser::parse_form_text;
+    let raw_form = concat!(
+        "[Form] = 0\r\n",
+        "Name = PartialLoaded\r\n",
+        "TagId = {11111111-1111-1111-1111-111111111111}\r\n",
+        "Version = M1 SHX-Version 0.36\r\n",
+        "SchnittArt = -1\r\n",
+        "ErstellDatum = 1700000000\r\n",
+        "EingabeFormat = Raster\r\n",
+        "EingabeDisplayFormat = mm\r\n",
+        "MaschenDichteAuf = 100.00\r\n",
+        "MaschenDichteX = 30.00\r\n",
+        "MaschenDichteY = 30.00\r\n",
+        "LastFreeLinienTagId = 0\r\n",
+        "[Element] = 1\r\n",
+        "Name = Grundform\r\n",
+        "ArtTagId = 1\r\n",
+        "Gespiegelt = 1\r\n",
+        "AnfangsBreite = 500.00\r\n",
+        "[LinienLinks]\r\n",
+        "[Kante] = 1\r\n",
+        "TagID = 1\r\n",
+        "Breite = -100.00\r\n",
+        "Höhe = 100.00\r\n",
+        "NadelZahl = -30\r\n",
+        "Reihen = 30\r\n",
+        "Funktion = 1\r\n",
+        "StufungX = -1\r\n",
+        "StufungY = 1\r\n",
+        "StufungFaktor = 30\r\n",
+        "RestX = 0\r\n",
+        "RestY = 0\r\n",
+        "[Ausblenden]\r\n",
+        "ModulFarbeVerwenden = ja\r\n",
+        "[Mindern]\r\n",
+        "ModulFarbeVerwenden = ja\r\n",
+        "[ModuleArt] = 0\r\n",
+        "ID = {D52E8466-70AD-11D3-BE0D-00A0C9ECEF97}\r\n",
+        "Breite = 6\r\n",
+        "[Punkt] = 0\r\n",
+        "PunktTagId = 1\r\n",
+        "PunktArtTagId = 0\r\n",
+        "[Kurve]\r\n",
+        "Funktion = 3\r\n",
+        "[KurvenLinie] = 1\r\n",
+        "TagID = 1\r\n",
+        "StufungBreite = -30\r\n",
+        "StufungHoehe = 30\r\n",
+        "Faktor = 1\r\n",
+    );
+
+    let mut doc = parse_form_text(raw_form, stoll_kalip_editoru::model::OlePreservedStreams::default()).unwrap();
+    let next_lid = doc.next_line_tag_id();
+    assert_eq!(next_lid, 2);
+    let next_pid = doc.next_point_tag_id();
+    assert_eq!(next_pid, 2);
+
+    let line = &mut doc.elements[0].left_lines[0];
+    line.with_bind_off = Some(1);
+    line.gore_knitting = Some(1);
+    line.gore_rows_additional = Some(4);
+    line.gore_rows_in_gore = Some(6);
+    line.gore_align_rows = Some(2);
+    line.start_ref_element = Some(1);
+    line.is_hand_knitting_suppress_first_y = Some(1);
+    line.gks_line_state = Some(3);
+    line.fill_color = Some(255);
+
+    let fo = line.fade_out.as_mut().unwrap();
+    fo.no_auto_fade_out = true;
+    fo.offset_x = 5;
+
+    let nar = line.narrowing.as_mut().unwrap();
+    nar.stitch_count = 12;
+    nar.modules[0].bind_off_limit = 8;
+    nar.modules[0].narrowing_position = 2;
+
+    line.points[0].mark_ke_alignment = Some(2);
+    line.points[0].number_of_marks = Some(3);
+    line.curve.as_mut().unwrap().steps[0].suppress_first_y = Some(1);
+
+    let out_text = serialize_form_text(&doc);
+    let reparsed = parse_form_text(&out_text, stoll_kalip_editoru::model::OlePreservedStreams::default()).unwrap();
+
+    assert_eq!(reparsed.header.last_line_tag_id, Some(2));
+    assert_eq!(reparsed.header.last_point_tag_id, Some(2));
+    let rl = &reparsed.elements[0].left_lines[0];
+    assert_eq!(rl.with_bind_off, Some(1));
+    assert_eq!(rl.gore_knitting, Some(1));
+    assert_eq!(rl.gore_rows_additional, Some(4));
+    assert_eq!(rl.gore_rows_in_gore, Some(6));
+    assert_eq!(rl.gore_align_rows, Some(2));
+    assert_eq!(rl.start_ref_element, Some(1));
+    assert_eq!(rl.is_hand_knitting_suppress_first_y, Some(1));
+    assert_eq!(rl.gks_line_state, Some(3));
+    assert_eq!(rl.fill_color, Some(255));
+    assert!(rl.fade_out.as_ref().unwrap().no_auto_fade_out);
+    assert_eq!(rl.fade_out.as_ref().unwrap().offset_x, 5);
+    assert_eq!(rl.narrowing.as_ref().unwrap().stitch_count, 12);
+    assert_eq!(rl.narrowing.as_ref().unwrap().modules[0].bind_off_limit, 8);
+    assert_eq!(rl.narrowing.as_ref().unwrap().modules[0].narrowing_position, 2);
+    assert_eq!(rl.points[0].mark_ke_alignment, Some(2));
+    assert_eq!(rl.points[0].number_of_marks, Some(3));
+    assert_eq!(rl.curve.as_ref().unwrap().steps[0].suppress_first_y, Some(1));
+}
+
+#[test]
+fn test_sweep_point_tag_ids_paste_baseline_and_undo_arc_ole() {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use stoll_kalip_editoru::math::paste_insert_line;
+    use stoll_kalip_editoru::model::PointOffset;
+
+    let mut doc = make_sample_rect_doc();
+    let p1 = doc.next_point_tag_id();
+    assert_eq!(p1, 1);
+    doc.elements[0].left_points.push(PointEntry {
+        index: 1,
+        punkt_tag_id: p1,
+        offsets: vec![PointOffset {
+            index: 0,
+            x: -20,
+            y: 40,
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    sync_mirrored_right_lines(&mut doc, 0);
+    let copied = copy_markers(&doc, 0, LineSide::Left, &[0]);
+    assert_eq!(paste_insert_markers(&mut doc, 0, LineSide::Left, 0, &copied), 1);
+    assert_eq!(paste_replace_markers(&mut doc, 0, LineSide::Left, 1, &copied), 1);
+
+    let mut seen_tags = HashSet::new();
+    for pt in doc.elements[0]
+        .left_points
+        .iter()
+        .chain(doc.elements[0].right_points.iter())
+    {
+        assert!(pt.punkt_tag_id > 0);
+        assert!(seen_tags.insert(pt.punkt_tag_id), "duplicate PunktTagId {}", pt.punkt_tag_id);
+    }
+    assert_eq!(
+        doc.header.last_point_tag_id,
+        seen_tags.iter().copied().max()
+    );
+
+    // BaseLine protection in paste_line / paste_insert_line
+    let base_src = copy_line(&doc, 0, LineSide::Left, 0).unwrap();
+    let straight_src = copy_line(&doc, 0, LineSide::Left, 1).unwrap();
+    assert!(!paste_line(&mut doc, 0, LineSide::Left, 0, &straight_src));
+    let before_tag = doc.header.last_line_tag_id.unwrap();
+    let ins_pos = paste_insert_line(&mut doc, 0, LineSide::Left, 1, &base_src).unwrap();
+    assert_eq!(ins_pos, 1);
+    assert_eq!(doc.elements[0].left_lines[1].function, LineFunction::None);
+    assert_eq!(doc.header.last_line_tag_id.unwrap(), before_tag + 1);
+
+    // UndoStack shares Arc<OlePreservedStreams> without cloning binary buffers
+    let mut undo = UndoStack::new(10);
+    let ole_ptr = Arc::as_ptr(&doc.ole);
+    undo.push("Test", &doc);
+    doc.header.name = "Changed".to_string();
+    assert!(undo.undo(&mut doc));
+    assert_eq!(Arc::as_ptr(&doc.ole), ole_ptr);
+}
+
+#[test]
+fn test_sweep_dxf_csv_validation_settings_and_updater() {
+    // 1. DXF zero-length first segment + out-of-order LINE chaining + NaN filtering
+    let dxf_zero_start = "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n10\n0.0\n20\n0.0\n10\n0.0\n20\n0.0\n10\n-150.0\n20\n0.0\n10\n-150.0\n20\n300.0\n0\nENDSEC\n0\nEOF\n";
+    let d_doc = parse_dxf_contour(dxf_zero_start, "ZeroStart").unwrap();
+    assert_eq!(d_doc.elements[0].left_lines[0].function, LineFunction::BaseLine);
+
+    let dxf_lines = "0\nSECTION\n2\nENTITIES\n\
+        0\nLINE\n10\n-100.0\n20\n200.0\n11\n-100.0\n21\n0.0\n\
+        0\nLINE\n10\n0.0\n20\n0.0\n11\n-100.0\n21\n0.0\n\
+        0\nLINE\n10\n-100.0\n20\n200.0\n11\n0.0\n21\n200.0\n\
+        0\nENDSEC\n0\nEOF\n";
+    let l_doc = parse_dxf_contour(dxf_lines, "LineChain").unwrap();
+    assert_eq!(l_doc.elements[0].left_lines.len(), 3);
+    assert_eq!(l_doc.elements[0].left_lines[0].function, LineFunction::BaseLine);
+
+    // 2. External CSV table rejects NaN/inf
+    let hdr = stoll_kalip_editoru::model::FormHeader::default();
+    let parsed_csv = stoll_kalip_editoru::math::parse_external_table_lines(
+        "NaN;10\ninf;20\n20;-10\n",
+        &hdr,
+        LineSide::Left,
+    );
+    assert_eq!(parsed_csv.len(), 1);
+    assert_eq!(parsed_csv[0].rows, 20);
+    assert_eq!(parsed_csv[0].stitches, -10);
+
+    // 3. Stoll 13656 odd start width warning
+    let mut odd_doc = make_sample_rect_doc();
+    odd_doc.elements[0].start_width = 501.0;
+    let rep = validate_document(&odd_doc);
+    assert!(rep.warnings().any(|w| w.message.contains("13656")));
+
+    // 4. Updater URL scheme validation + surrogate pair decoding
+    let json = r#"{
+        "tag_name": "v2.0.0",
+        "html_url": "file:///C:/Windows/System32/calc.exe",
+        "body": "Güncelleme \uD83D\uDE80 hazır!",
+        "assets": [
+            { "browser_download_url": "javascript:alert(1)" },
+            { "browser_download_url": "https://github.com/gokhantr/Stoll-Kalip-Editoru/releases/download/v2.0.0/Stoll_Kalip_Editoru.exe" }
+        ]
+    }"#;
+    let info = stoll_kalip_editoru::updater::parse_github_release_json(json).unwrap();
+    assert_eq!(info.html_url, stoll_kalip_editoru::updater::GITHUB_REPO_URL);
+    assert!(info.download_url.starts_with("https://"));
+    assert!(info.body_notes.contains("🚀"));
+    assert!(!stoll_kalip_editoru::updater::is_safe_http_url("file:///C:/foo.exe"));
+}
+
+#[test]
+fn test_function_window_stoll_1to1_invariants() {
+    // 1. `[Abketteln]` NEVER serializes non-existent `AbkettelTyp` key, even if legacy field is Some(...)
+    let mut doc = make_sample_rect_doc();
+    doc.elements[0].left_lines[1].function = LineFunction::BindOff;
+    doc.elements[0].left_lines[1].binding_off = Some(BindingOffProps {
+        for_all_structures: 0,
+        use_module_color: true,
+        bind_off_type: Some(1),
+        modules: vec![ModuleAssignment {
+            module_art_id: 0,
+            id: "{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}".to_string(),
+            ..Default::default()
+        }],
+        ..BindingOffProps::default()
+    });
+    let form_txt = stoll_kalip_editoru::io::serializer::serialize_form_text(&doc);
+    assert!(
+        !form_txt.contains("AbkettelTyp"),
+        "Stoll .shp must never emit non-existent AbkettelTyp key"
+    );
+
+    // 2. `MinderPosition` (1, 4, 2) and `FairIsleStatus` (1=Altta, 2=Üstte) round-trip cleanly
+    doc.elements[0].left_lines[1].narrowing = Some(NarrowingProps {
+        for_all_structures: 0,
+        modules: vec![ModuleAssignment {
+            module_art_id: 0,
+            id: "{0C0BE9E4-8338-40FC-BF91-5B50B311D21C}".to_string(),
+            narrowing_position: 1,
+            fair_isle_status: 2,
+            ..Default::default()
+        }],
+        ..NarrowingProps::default()
+    });
+    doc.elements[0].left_lines[1].widening = Some(WideningProps {
+        for_all_structures: 0,
+        modules: vec![ModuleAssignment {
+            module_art_id: 0,
+            id: "{AAB4DE9D-30AF-4E62-8E19-301760376ADF}".to_string(),
+            narrowing_position: 1,
+            ..Default::default()
+        }],
+        ..WideningProps::default()
+    });
+    let bytes = save_to_bytes(&doc).unwrap();
+    let rt = load_from_bytes(&bytes).unwrap();
+    let rt_nar = &rt.elements[0].left_lines[1].narrowing.as_ref().unwrap().modules[0];
+    assert_eq!(rt_nar.narrowing_position, 1);
+    assert_eq!(rt_nar.fair_isle_status, 2);
+    let rt_wid = &rt.elements[0].left_lines[1].widening.as_ref().unwrap().modules[0];
+    assert_eq!(rt_wid.narrowing_position, 1);
+
+    // 3. Stoll Catalog (guarded for CI when Stoll DB is not installed)
+    let offline_cat = StollCatalog::load_from_root(None, ShapeCutType::Standard);
+    assert_eq!(
+        offline_cat.bind_off_type_for_guid("{A372A90F-50DD-11D4-BE63-00A0C9ECEF97}"),
+        0
+    );
+    assert_eq!(
+        offline_cat.bind_off_type_for_guid("{0A4C87EC-24EB-4C71-90AC-F3FB9793E0A4}"),
+        1
+    );
+    let cat = StollCatalog::load_with_autodetect();
+    if cat.stoll_data_root.is_some() {
+        let mod_list = cat.modules_for_category_and_structure(ModuleCategory::BindOff, 0);
+        let ra_list = cat.modules_for_category_and_structure(ModuleCategory::BindOffCa, 0);
+        assert_eq!(mod_list.len(), 16);
+        assert_eq!(ra_list.len(), 61);
+        assert_eq!(mod_list[0].name, "Bind-off SJ-01");
+        assert_eq!(cat.bind_off_type_for_guid(&mod_list[0].guid), 0);
+        assert_eq!(cat.bind_off_type_for_guid(&ra_list[0].guid), 1);
+
+        let fade0 = cat.modules_for_category_and_structure(ModuleCategory::FadeOut, 0);
+        assert_eq!(fade0.len(), 39);
+        assert!(fade0
+            .iter()
+            .all(|m| !m.name.eq_ignore_ascii_case("Yeni modül grubu")
+                && !m.name.eq_ignore_ascii_case("Neue Modulgruppe")));
     }
 }

@@ -422,12 +422,16 @@ impl PointMultiplyDialogState {
             .trim()
             .replace(',', ".")
             .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
             .unwrap_or(0.0);
         let py = self
             .delta_y_text
             .trim()
             .replace(',', ".")
             .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
             .unwrap_or(0.0);
 
         if use_mm {
@@ -533,8 +537,10 @@ impl PointMultiplyDialogState {
             coords
         };
 
-        for (i, &(x, y)) in slice.iter().enumerate() {
+        let mut new_entries = Vec::with_capacity(slice.len());
+        for &(x, y) in slice {
             let mut entry = base_template.clone();
+            entry.punkt_tag_id = doc.next_point_tag_id();
             if self.group_generated {
                 entry.gruppe_tag_id = next_group_id;
             }
@@ -546,6 +552,18 @@ impl PointMultiplyDialogState {
             }];
             entry.number_of_marks = Some(1);
             entry.raw.original_header = None;
+            new_entries.push(entry);
+        }
+
+        let Some(el) = doc.elements.get_mut(req.elem_idx) else {
+            return;
+        };
+        let pts = match req.side {
+            LineSide::Left => &mut el.left_points,
+            LineSide::Right => &mut el.right_points,
+        };
+        let inserted_count = new_entries.len();
+        for (i, entry) in new_entries.into_iter().enumerate() {
             pts.insert((insert_at + i).min(pts.len()), entry);
         }
 
@@ -553,6 +571,21 @@ impl PointMultiplyDialogState {
         for (idx, p) in pts.iter_mut().enumerate() {
             p.index = (idx + 1) as i32;
             p.raw.original_header = Some(format!("[Punkt] = {}", p.index));
+        }
+
+        let sel_start = insert_at.min(pts.len().saturating_sub(1));
+        let sel_end = (insert_at + inserted_count).min(pts.len());
+        if sel_start < sel_end {
+            state.selected_rows = (sel_start..sel_end).collect();
+            state.row_select_anchor = Some(sel_start);
+            state.focused_cell = Some((sel_start, 1));
+        } else if !pts.is_empty() {
+            let r = req.marker_idx.min(pts.len() - 1);
+            state.select_single_row(r);
+            state.focused_cell = Some((r, 1));
+        } else {
+            state.selected_rows.clear();
+            state.focused_cell = None;
         }
 
         // Mirror points to right side if element is mirrored and edited on left

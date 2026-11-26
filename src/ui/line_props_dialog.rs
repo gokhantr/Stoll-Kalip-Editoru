@@ -12,7 +12,7 @@ use stoll_kalip_editoru::catalog::{
 use stoll_kalip_editoru::math::{apply_standard_preset_to_line, sync_mirrored_right_lines};
 use stoll_kalip_editoru::model::{
     ConnectPoint, FormDocument, KanteChildSlot, LineFunction, LineSegment, LineSide,
-    ModuleAssignment, NarrowingProps, PointEntry, PointKind, PointOffset, UndoStack,
+    ModuleAssignment, NarrowingProps, PointEntry, PointKind, PointOffset, ShapeCutType, UndoStack,
     YReferenceLine,
 };
 
@@ -61,6 +61,7 @@ enum PreviewCategory {
     NarrowingMultistage,
     Widening,
     BindOff,
+    BindOffCa,
     FadeOut,
     PointStart,
     PointStartVneck,
@@ -74,6 +75,7 @@ impl PreviewCategory {
             Self::NarrowingMultistage => ModuleCategory::NarrowingMultistage,
             Self::Widening => ModuleCategory::Widening,
             Self::BindOff => ModuleCategory::BindOff,
+            Self::BindOffCa => ModuleCategory::BindOffCa,
             Self::FadeOut => ModuleCategory::FadeOut,
             Self::PointStart => ModuleCategory::Start,
             Self::PointStartVneck => ModuleCategory::StartVneck,
@@ -97,7 +99,13 @@ pub struct LinePropsDialogState {
     selected_struct: [usize; 6],
     /// Optional delayed-narrowing flag (`Reglanı gecikmeli uygula` — unchecked by default matching `222038.png`).
     reglan_delayed: bool,
-    /// Selected `Remayözleme-tipi` index (`0 = Modül`, `1 = Otomatik`, `2 = El tipi`).
+    /// Multi-stage narrowing mode (`çok kademeli`, `15677`) — switches Tab 1 to `Eksiltme M`.
+    reglan_multistage: bool,
+    /// Show all narrowing models across all structures (`Tüm modelleri göster`, `15681`).
+    show_all_models: bool,
+    /// K&W sleeve checkbox (`15675`) that disables `Genişlik` when checked.
+    kw_sleeve_no_width: bool,
+    /// Selected `Remayözleme-tipi` index (`0 = Modül`, `1 = RA`).
     bind_off_type_idx: usize,
     /// Selected connection point row on Tab 7 (`Bağlantılar`).
     selected_conn_idx: Option<usize>,
@@ -107,6 +115,8 @@ pub struct LinePropsDialogState {
     resolved_cache: HashMap<String, Option<KnittingModuleInfo>>,
     /// Cached GPU textures for decoded `M3_UTL_Bitmap` 128×128 thumbnails keyed by uppercase GUID.
     texture_cache: HashMap<String, Option<TextureHandle>>,
+    /// Cached dropdown choices keyed by `(category, structure_id, norm_guid, ext_count)`.
+    cached_cat_choices: Option<((PreviewCategory, i32, String, usize), Vec<(String, String)>)>,
 }
 
 impl Default for LinePropsDialogState {
@@ -118,11 +128,15 @@ impl Default for LinePropsDialogState {
             active_tab: 0,
             selected_struct: [0; 6],
             reglan_delayed: false,
+            reglan_multistage: false,
+            show_all_models: false,
+            kw_sleeve_no_width: false,
             bind_off_type_idx: 0,
             selected_conn_idx: None,
             help_popup_open: false,
             resolved_cache: HashMap::new(),
             texture_cache: HashMap::new(),
+            cached_cat_choices: None,
         }
     }
 }
@@ -144,6 +158,18 @@ impl LinePropsDialogState {
             return;
         };
 
+        let is_kw = ShapeCutType::from_id(doc.header.cut_type) != ShapeCutType::Standard;
+        let elem_art_id = doc
+            .elements
+            .get(req.elem_idx)
+            .map(|e| e.art_tag_id)
+            .unwrap_or(1);
+        let is_base_line = doc
+            .elements
+            .get(req.elem_idx)
+            .map(|e| e.is_base_line_row(req.side, req.line_idx))
+            .unwrap_or(false);
+
         // Initialize working clone whenever a new request opens
         if self.active_req != Some(req) {
             if let Some(line) = doc
@@ -154,7 +180,11 @@ impl LinePropsDialogState {
                 self.original = line.clone();
                 self.working = line.clone();
                 self.active_req = Some(req);
-                self.active_tab = req.initial_tab.min(7);
+                self.active_tab = if req.initial_tab == 7 && !is_kw {
+                    0
+                } else {
+                    req.initial_tab.min(7)
+                };
                 self.selected_struct = [0; 6];
                 self.reglan_delayed = line
                     .narrowing
@@ -162,12 +192,25 @@ impl LinePropsDialogState {
                     .and_then(|n| n.raw.get_raw("VerzoegertAusfuehren"))
                     .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "ja" | "true"))
                     .unwrap_or(false);
-                self.bind_off_type_idx = line
+                self.reglan_multistage = line.narrowing.as_ref().is_some_and(|n| {
+                    n.modules.iter().any(|m| {
+                        m.fair_isle_status != 0 || catalog.is_narrowing_multistage_guid(&m.id)
+                    })
+                });
+                self.show_all_models = false;
+                self.kw_sleeve_no_width = false;
+
+                let cur_bo_guid = line
                     .binding_off
                     .as_ref()
-                    .and_then(|b| b.bind_off_type)
-                    .map(|v| v.clamp(0, 2) as usize)
-                    .unwrap_or(0);
+                    .map(|b| {
+                        let fa = is_for_all_structures(b.for_all_structures);
+                        let sid = if fa { b.for_all_structures as i32 } else { 0 };
+                        get_or_default_module(&b.modules, sid, fa).id
+                    })
+                    .unwrap_or_default();
+                self.bind_off_type_idx = catalog.bind_off_type_for_guid(&cur_bo_guid);
+
                 self.selected_conn_idx = self
                     .working
                     .connection_points
@@ -242,7 +285,7 @@ impl LinePropsDialogState {
                     .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
                         // ── 1. Classic Win32 8-Tab Strip (`222026.png` – `222125.png`) ──
-                        self.show_tab_strip(ui);
+                        self.show_tab_strip(ui, is_kw);
 
                         // ── 2. Active Tab Body inside classic raised white/light tab pane ─
                         Frame::NONE
@@ -259,8 +302,15 @@ impl LinePropsDialogState {
                                 ui.set_min_height(378.0);
 
                                 match self.active_tab {
-                                    0 => self.show_tab_genel(ui),
-                                    1 => self.show_tab_reglan(ui, ctx, catalog, &doc_ext_modules),
+                                    0 => self.show_tab_genel(ui, is_kw, elem_art_id, is_base_line),
+                                    1 => self.show_tab_reglan(
+                                        ui,
+                                        ctx,
+                                        catalog,
+                                        &doc_ext_modules,
+                                        is_kw,
+                                        elem_art_id,
+                                    ),
                                     2 => self.show_tab_artirma(ui, ctx, catalog, &doc_ext_modules),
                                     3 => self.show_tab_remayozleme(ui, ctx, catalog, &doc_ext_modules),
                                     4 => self.show_tab_kenar_duzeltme(ui, ctx, catalog, &doc_ext_modules),
@@ -271,6 +321,7 @@ impl LinePropsDialogState {
                                         &doc_ext_modules,
                                         0,
                                         PreviewCategory::PointStart,
+                                        elem_art_id,
                                     ),
                                     6 => self.show_tab_point(
                                         ui,
@@ -279,6 +330,7 @@ impl LinePropsDialogState {
                                         &doc_ext_modules,
                                         1,
                                         PreviewCategory::PointEnd,
+                                        elem_art_id,
                                     ),
                                     7 => self.show_tab_baglantilar(ui),
                                     _ => {}
@@ -372,19 +424,13 @@ impl LinePropsDialogState {
     }
 
     /// Determine whether a tab is enabled/active for the current `working.function`,
-    /// and whether it shows the Stoll active-function checkmark `✓` (Board note #12 + `222026`–`222125`).
-    fn tab_visual_state(&self, tab_idx: usize) -> (bool, bool) {
+    /// and whether it shows the Stoll active-function checkmark `✓` (`formtable.dll` `0x1007dc38..0x1007dd11`, `0x1007ce60`).
+    fn tab_visual_state(&self, tab_idx: usize, is_kw: bool) -> (bool, bool) {
         let f = self.working.function;
-        let has_conns = self
-            .working
-            .connection_points
-            .as_ref()
-            .map(|c| !c.points.is_empty())
-            .unwrap_or(false);
         match tab_idx {
             0 | 4 | 5 | 6 => (true, false),
             1 => {
-                let active = matches!(f, LineFunction::Narrowing | LineFunction::NarrowingMulti);
+                let active = f == LineFunction::Narrowing;
                 (active, active)
             }
             2 => {
@@ -392,22 +438,27 @@ impl LinePropsDialogState {
                 (active, active)
             }
             3 => {
-                let is_bindoff = f == LineFunction::BindOff;
-                // Enabled when Remayözleme is active OR when jumped to from Reglan
-                let enabled = is_bindoff || self.active_tab == 3;
-                (enabled, is_bindoff)
+                let active = matches!(f, LineFunction::BindOff | LineFunction::NarrowingMulti);
+                // Enabled when Remayözleme / K&W Tiktak (`9`) is active OR when jumped to from Reglan
+                let enabled = active || self.active_tab == 3;
+                (enabled, active)
             }
-            7 => (has_conns || self.active_tab == 7, false),
+            7 => (is_kw, false),
             _ => (true, false),
         }
     }
 
-    fn show_tab_strip(&mut self, ui: &mut Ui) {
+    fn show_tab_strip(&mut self, ui: &mut Ui, is_kw: bool) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
-            for (idx, &label) in TAB_LABELS.iter().enumerate() {
+            for (idx, &default_label) in TAB_LABELS.iter().enumerate() {
+                let label = if idx == 1 && self.reglan_multistage {
+                    "Eksiltme M"
+                } else {
+                    default_label
+                };
                 let is_selected = self.active_tab == idx;
-                let (is_enabled_visual, has_check) = self.tab_visual_state(idx);
+                let (is_enabled_visual, has_check) = self.tab_visual_state(idx, is_kw);
 
                 let text_galley = ui.painter().layout_no_wrap(
                     label.to_owned(),
@@ -418,7 +469,12 @@ impl LinePropsDialogState {
                 let tab_w = (text_galley.size().x + 14.0 + check_w).max(40.0);
                 let tab_h = if is_selected { 23.0 } else { 21.0 };
 
-                let (rect, resp) = ui.allocate_exact_size(vec2(tab_w, tab_h), Sense::click());
+                let sense = if is_enabled_visual {
+                    Sense::click()
+                } else {
+                    Sense::hover()
+                };
+                let (rect, resp) = ui.allocate_exact_size(vec2(tab_w, tab_h), sense);
                 let draw_rect = if is_selected {
                     rect
                 } else {
@@ -427,7 +483,7 @@ impl LinePropsDialogState {
 
                 let bg = if is_selected {
                     Color32::from_rgb(0xF9, 0xF9, 0xF9)
-                } else if resp.hovered() && (is_enabled_visual || idx == 7) {
+                } else if resp.hovered() && is_enabled_visual {
                     colors::WIN_BLUE_HOVER
                 } else {
                     Color32::from_rgb(0xEC, 0xEC, 0xEC)
@@ -480,8 +536,7 @@ impl LinePropsDialogState {
                     text_col,
                 );
 
-                // Allow switching to enabled tabs + Bağlantılar (always clickable so connections can be added)
-                if resp.clicked() && (is_enabled_visual || idx == 7) {
+                if resp.clicked() && is_enabled_visual {
                     self.active_tab = idx;
                 }
             }
@@ -489,31 +544,40 @@ impl LinePropsDialogState {
     }
 
     // ── Tab 0: Genel (`DIALOG 4266`, Screenshot `222026.png`) ────────────────────
-    fn show_tab_genel(&mut self, ui: &mut Ui) {
+    fn show_tab_genel(&mut self, ui: &mut Ui, is_kw: bool, elem_art_id: i32, is_base_line: bool) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label("Fonksiyon:");
             ui.add_space(34.0);
-            let cur_lbl = self.working.function.label_tr();
-            win32_combo_scope(ui, |ui| {
-                egui::ComboBox::from_id_salt("lp_genel_func")
-                    .width(136.0)
-                    .selected_text(if cur_lbl.is_empty() { " " } else { cur_lbl })
-                    .show_ui(ui, |ui| {
-                        for &func in LineFunction::all() {
-                            let lbl = if func == LineFunction::None {
-                                "(Yok)"
-                            } else {
-                                func.label_tr()
-                            };
-                            if ui
-                                .selectable_value(&mut self.working.function, func, lbl)
-                                .changed()
-                            {
-                                self.working.user_set_function = true;
+            let cur_lbl = match self.working.function {
+                LineFunction::NarrowingMulti => "Tiktak",
+                other => other.label_tr(),
+            };
+            ui.add_enabled_ui(!is_base_line, |ui| {
+                win32_combo_scope(ui, |ui| {
+                    egui::ComboBox::from_id_salt("lp_genel_func")
+                        .width(136.0)
+                        .selected_text(if cur_lbl.is_empty() { " " } else { cur_lbl })
+                        .show_ui(ui, |ui| {
+                            let mut funcs: Vec<(LineFunction, &str)> = vec![
+                                (LineFunction::None, "(Yok)"),
+                                (LineFunction::Narrowing, "Reglan"),
+                                (LineFunction::Widening, "Artırma"),
+                                (LineFunction::BindOff, "Remayözleme"),
+                            ];
+                            if is_kw {
+                                funcs.push((LineFunction::NarrowingMulti, "Tiktak"));
                             }
-                        }
-                    });
+                            for (func, lbl) in funcs {
+                                if ui
+                                    .selectable_value(&mut self.working.function, func, lbl)
+                                    .changed()
+                                {
+                                    self.working.user_set_function = true;
+                                }
+                            }
+                        });
+                });
             });
         });
 
@@ -535,15 +599,29 @@ impl LinePropsDialogState {
                             ui.label("Değer");
                             ui.end_row();
 
-                            // NP ön
+                            // NP ön (0 -> >0 auto-defaults to 12.0 = 1200 per Stoll 0x1006cce0)
                             ui.label("NP ön:");
+                            let prev_front_idx = self.working.ml_np_front_index;
                             np_index_combo(ui, "lp_np_front_idx", &mut self.working.ml_np_front_index);
+                            if prev_front_idx <= 0
+                                && self.working.ml_np_front_index > 0
+                                && self.working.ml_np_front == 0
+                            {
+                                self.working.ml_np_front = 1200;
+                            }
                             np_tenths_edit(ui, "lp_np_front_val", &mut self.working.ml_np_front);
                             ui.end_row();
 
-                            // NP arka
+                            // NP arka (0 -> >0 auto-defaults to 12.0 = 1200 per Stoll 0x1006cd60)
                             ui.label("NP arka:");
+                            let prev_back_idx = self.working.ml_np_back_index;
                             np_index_combo(ui, "lp_np_back_idx", &mut self.working.ml_np_back_index);
+                            if prev_back_idx <= 0
+                                && self.working.ml_np_back_index > 0
+                                && self.working.ml_np_back == 0
+                            {
+                                self.working.ml_np_back = 1200;
+                            }
                             np_tenths_edit(ui, "lp_np_back_val", &mut self.working.ml_np_back);
                             ui.end_row();
 
@@ -567,7 +645,7 @@ impl LinePropsDialogState {
                 });
             });
 
-            // Optional `İkinci ayar (NPS)` group (`DLG-03`)
+            // Optional `İkinci ayar (NPS)` group (`15655..15658`)
             if self.working.second_stitch_length
                 || self.working.ml_npz_front != 0
                 || self.working.ml_npz_back != 0
@@ -576,25 +654,19 @@ impl LinePropsDialogState {
                 ui.vertical(|ui| {
                     ui.set_max_width(235.0);
                     win32_group_box_on(ui, "İkinci ayar (NPS)", TAB_PANE_BG, |ui| {
-                        win32_checkbox(
-                            ui,
-                            &mut self.working.second_stitch_length,
-                            "İkinci ilmek uzunluğu kullan",
-                        );
-                        ui.add_space(4.0);
                         ui.add_enabled_ui(self.working.second_stitch_length, |ui| {
                             egui::Grid::new("lp_genel_nps_grid")
                                 .num_columns(2)
                                 .spacing(vec2(8.0, 6.0))
                                 .show(ui, |ui| {
-                                    ui.label("NPS ön:");
+                                    ui.label("Ön:");
                                     np_tenths_edit(
                                         ui,
                                         "lp_npz_front_val",
                                         &mut self.working.ml_npz_front,
                                     );
                                     ui.end_row();
-                                    ui.label("NPS arka:");
+                                    ui.label("Arka:");
                                     np_tenths_edit(
                                         ui,
                                         "lp_npz_back_val",
@@ -614,9 +686,12 @@ impl LinePropsDialogState {
 
         ui.horizontal(|ui| {
             let mut dont_knit = self.working.change_attrib != 0;
-            if win32_checkbox(ui, &mut dont_knit, "Sakın Örme").changed() {
-                self.working.change_attrib = if dont_knit { 1 } else { 0 };
-            }
+            let can_dont_knit = is_kw && elem_art_id == 1;
+            ui.add_enabled_ui(can_dont_knit, |ui| {
+                if win32_checkbox(ui, &mut dont_knit, "Sakın Örme").changed() {
+                    self.working.change_attrib = if dont_knit { 1 } else { 0 };
+                }
+            });
             ui.add_space(48.0);
             win32_checkbox(
                 ui,
@@ -626,19 +701,29 @@ impl LinePropsDialogState {
         });
     }
 
-    // ── Tab 1: Reglan (`DIALOG 4267`, Screenshot `222038.png`) ───────────────────
+    // ── Tab 1: Reglan / Eksiltme M (`DIALOG 4267`, Screenshot `222038.png`) ──────
     fn show_tab_reglan(
         &mut self,
         ui: &mut Ui,
         ctx: &egui::Context,
         catalog: &StollCatalog,
         choices: &[(String, String)],
+        is_kw: bool,
+        elem_art_id: i32,
     ) {
         let mut props = self.working.narrowing.clone().unwrap_or_default();
         let before_props = props.clone();
 
-        let for_all = is_for_all_structures(props.for_all_structures);
-        let struct_id = if for_all {
+        let mut is_multi = self.reglan_multistage;
+        let prev_multi = is_multi;
+        let for_all = if is_multi {
+            false
+        } else {
+            is_for_all_structures(props.for_all_structures)
+        };
+        let struct_id = if is_multi {
+            0
+        } else if for_all {
             props.for_all_structures as i32
         } else {
             self.selected_struct[0] as i32
@@ -650,26 +735,32 @@ impl LinePropsDialogState {
         let mut width_changed = false;
         let mut jump_to_bindoff = false;
 
-        // Top row: Genişlik | Basamaktan sonra | Remayözleme >>
-        ui.horizontal(|ui| {
-            ui.label("Genişlik:");
-            ui.add_space(12.0);
-            if win32_int_edit(ui, "lp_reglan_width", &mut width, 42.0, 0..=999) {
-                let m = get_or_insert_module(&mut props.modules, struct_id);
-                m.width = width;
-                width_changed = true;
-            }
-            ui.add_space(60.0);
-            ui.label("Basamaktan sonra");
-            if win32_int_edit(ui, "lp_reglan_bo_limit", &mut bo_limit, 42.0, 0..=999) {
-                let m = get_or_insert_module(&mut props.modules, struct_id);
-                m.bind_off_limit = bo_limit;
-            }
-            ui.add_space(8.0);
-            if win32_button(ui, "Remayözleme >>", vec2(96.0, 21.0), true).clicked() {
-                jump_to_bindoff = true;
-            }
-        });
+        // Top row (hidden in `çok kademeli` mode per Stoll 0x10070590)
+        if !is_multi {
+            let is_kw_sleeve = is_kw && elem_art_id == 3;
+            let width_enabled = !(is_kw_sleeve && self.kw_sleeve_no_width);
+            ui.horizontal(|ui| {
+                ui.add_enabled_ui(width_enabled, |ui| {
+                    ui.label("Genişlik:");
+                    ui.add_space(6.0);
+                    if win32_int_edit(ui, "lp_reglan_width", &mut width, 40.0, 0..=999) {
+                        let m = get_or_insert_module(&mut props.modules, struct_id);
+                        m.width = width;
+                        width_changed = true;
+                    }
+                });
+                ui.add_space(16.0);
+                ui.label("Basamaktan sonra Remayözleme:");
+                if win32_int_edit(ui, "lp_reglan_bo_limit", &mut bo_limit, 40.0, 0..=999) {
+                    let m = get_or_insert_module(&mut props.modules, struct_id);
+                    m.bind_off_limit = bo_limit;
+                }
+                ui.add_space(6.0);
+                if win32_button(ui, "Remayözleme >>", vec2(96.0, 21.0), true).clicked() {
+                    jump_to_bindoff = true;
+                }
+            });
+        }
 
         // Sync narrowing width to curve steps if a curve exists (`DLG-04` / Kural 45)
         if width_changed {
@@ -683,7 +774,6 @@ impl LinePropsDialogState {
         ui.add_space(4.0);
 
         // GroupBox `Genel` (`222038.png`) with crisp vertical & horizontal dividers (`DLG-04`)
-        let mut is_multi = self.working.function == LineFunction::NarrowingMulti;
         let mut delayed_flag = self.reglan_delayed;
         let mut delayed_toggled = false;
         win32_group_box_on(ui, "Genel", TAB_PANE_BG, |ui| {
@@ -693,45 +783,63 @@ impl LinePropsDialogState {
             let right_w = (avail_w - left_w - 14.0).max(160.0);
             let mut div_x = ui.cursor().left() + left_w + 5.0;
             let resp_h = ui.horizontal_top(|ui| {
-                // Left column
+                // Left column (hidden in `çok kademeli` mode)
                 ui.vertical(|ui| {
                     ui.set_width(left_w);
-                    if win32_checkbox(ui, &mut delayed_flag, "Reglanı gecikmeli uygula").changed() {
-                        delayed_toggled = true;
-                        if delayed_flag {
-                            props.execute_immediately = false;
-                        }
-                    }
-                    if win32_checkbox(
-                        ui,
-                        &mut props.execute_immediately,
-                        "Reglanı hemen uygula",
-                    )
-                    .changed()
-                    {
-                        if props.execute_immediately {
+                    if !is_multi {
+                        if win32_checkbox(ui, &mut delayed_flag, "Reglanı gecikmeli uygula")
+                            .changed()
+                        {
+                            delayed_toggled = true;
                             if delayed_flag {
-                                delayed_toggled = true;
+                                props.execute_immediately = false;
                             }
-                            delayed_flag = false;
                         }
-                    }
-                    ui.add_space(3.0);
-                    ui.separator();
-                    ui.add_space(3.0);
-                    ui.horizontal(|ui| {
-                        win32_int_edit(
+                        if win32_checkbox(
                             ui,
-                            "lp_reglan_stitch_cnt",
-                            &mut props.stitch_count,
-                            36.0,
-                            0..=99,
-                        );
+                            &mut props.execute_immediately,
+                            "Reglanı hemen uygula",
+                        )
+                        .changed()
+                        {
+                            if props.execute_immediately {
+                                if delayed_flag {
+                                    delayed_toggled = true;
+                                }
+                                delayed_flag = false;
+                            }
+                        }
+                        if is_kw && elem_art_id == 3 {
+                            win32_checkbox(
+                                ui,
+                                &mut self.kw_sleeve_no_width,
+                                "Kol reglan genişliği yok",
+                            );
+                        }
+                        ui.add_space(3.0);
+                        ui.separator();
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            win32_int_edit(
+                                ui,
+                                "lp_reglan_stitch_cnt",
+                                &mut props.stitch_count,
+                                36.0,
+                                0..=99,
+                            );
+                            ui.label(
+                                egui::RichText::new("İlmek sayısına, omuz Remayözleme uygula")
+                                    .font(regular_font(10.5)),
+                            );
+                        });
+                    } else {
+                        ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("İlmek sayısına, omuz Remayözleme uygula")
-                                .font(regular_font(10.5)),
+                            egui::RichText::new("Çok kademeli reglan modu etkin.")
+                                .font(regular_font(10.5))
+                                .color(colors::TEXT_SECONDARY),
                         );
-                    });
+                    }
                 });
 
                 div_x = ui.cursor().left() + 4.0;
@@ -741,7 +849,7 @@ impl LinePropsDialogState {
                 ui.vertical(|ui| {
                     ui.set_width(right_w);
                     win32_checkbox(ui, &mut is_multi, "çok kademeli");
-                    ui.add_space(21.0);
+                    ui.add_space(if is_multi { 4.0 } else { 21.0 });
                     ui.separator();
                     ui.add_space(3.0);
                     win32_checkbox(ui, &mut props.use_module_color, "Modül rengi kullan");
@@ -758,72 +866,124 @@ impl LinePropsDialogState {
         if delayed_toggled {
             set_narrowing_delayed_raw(&mut props, delayed_flag);
         }
-
-        if is_multi && self.working.function == LineFunction::Narrowing {
-            self.working.function = LineFunction::NarrowingMulti;
-            self.working.user_set_function = true;
-        } else if !is_multi && self.working.function == LineFunction::NarrowingMulti {
-            self.working.function = LineFunction::Narrowing;
-            self.working.user_set_function = true;
-        }
+        self.reglan_multistage = is_multi;
+        let multi_toggled = is_multi != prev_multi;
 
         ui.add_space(4.0);
 
         // GroupBox `Modül düzeni` (`222038.png`)
-        let mut for_all_flag = is_for_all_structures(props.for_all_structures);
-        let mut cur_struct = if for_all_flag {
+        let mut for_all_flag = if is_multi {
+            false
+        } else {
+            is_for_all_structures(props.for_all_structures)
+        };
+        let mut cur_struct = if is_multi {
+            0
+        } else if for_all_flag {
             props.for_all_structures as usize
         } else {
             self.selected_struct[0]
         };
         let active_mod = get_or_default_module(&props.modules, cur_struct as i32, for_all_flag);
         let mut nar_pos = active_mod.narrowing_position;
+        let mut fair_isle = active_mod.fair_isle_status;
         let mut cur_guid = active_mod.id;
         let mut nar_pos_changed = false;
-
+        let mut fair_isle_changed = false;
         let mut guid_changed = false;
+
+        if multi_toggled {
+            if is_multi {
+                if fair_isle != 1 && fair_isle != 2 {
+                    fair_isle = 1;
+                    fair_isle_changed = true;
+                }
+                if !catalog.is_narrowing_multistage_guid(&cur_guid) {
+                    if let Some(first) = catalog
+                        .modules_for_category_and_structure(ModuleCategory::NarrowingMultistage, 0)
+                        .first()
+                    {
+                        cur_guid = first.guid.clone();
+                        guid_changed = true;
+                    }
+                }
+            } else {
+                if fair_isle != 0 {
+                    fair_isle = 0;
+                    fair_isle_changed = true;
+                }
+                if catalog.is_narrowing_multistage_guid(&cur_guid) {
+                    if let Some(first) = catalog
+                        .modules_for_category_and_structure(ModuleCategory::Narrowing, cur_struct as i32)
+                        .first()
+                    {
+                        cur_guid = first.guid.clone();
+                        guid_changed = true;
+                    }
+                }
+            }
+        }
+
         let reglan_cat = if is_multi {
             PreviewCategory::NarrowingMultistage
         } else {
             PreviewCategory::Narrowing
         };
         win32_group_box_on(ui, "Modül düzeni", TAB_PANE_BG, |ui| {
-            let mut pos_mode = if nar_pos == 0 {
-                0
-            } else if nar_pos == 4 {
-                4
-            } else {
-                2
-            };
-            let p_changed = win32_radio(
-                ui,
-                &mut pos_mode,
-                0,
-                "Reglanı mevcut aktarmadan önce uygula",
-            )
-            .changed()
-                | win32_radio(
+            if !is_multi {
+                // Stoll `DIALOG 4267`: radios map (before, with, after) -> (1, 4, 2)
+                let mut pos_mode = match nar_pos {
+                    1 => 1,
+                    2 => 2,
+                    _ => 4,
+                };
+                let p_changed = win32_radio(
                     ui,
                     &mut pos_mode,
-                    4,
-                    "Reglanı mevcut aktarmayla beraber uygula",
+                    1,
+                    "Reglanı mevcut aktarmadan önce uygula",
                 )
                 .changed()
-                | win32_radio(
-                    ui,
-                    &mut pos_mode,
-                    2,
-                    "Reglanı mevcut aktarmadan sonra uygula",
-                )
-                .changed();
-            if p_changed {
-                nar_pos = pos_mode;
-                nar_pos_changed = true;
+                    | win32_radio(
+                        ui,
+                        &mut pos_mode,
+                        4,
+                        "Reglanı mevcut aktarmayla beraber uygula",
+                    )
+                    .changed()
+                    | win32_radio(
+                        ui,
+                        &mut pos_mode,
+                        2,
+                        "Reglanı mevcut aktarmadan sonra uygula",
+                    )
+                    .changed();
+                if p_changed {
+                    nar_pos = pos_mode;
+                    nar_pos_changed = true;
+                }
+            } else {
+                // `çok kademeli` (`DIALOG 4267` 15678 / 15679): Altta (1) / Üstte (2)
+                let mut fi_mode = if fair_isle == 2 { 2 } else { 1 };
+                ui.horizontal(|ui| {
+                    let fi_changed = win32_radio(ui, &mut fi_mode, 1, "Altta").changed()
+                        | win32_radio(ui, &mut fi_mode, 2, "Üstte").changed();
+                    if fi_changed || fair_isle != fi_mode {
+                        fair_isle = fi_mode;
+                        fair_isle_changed = true;
+                    }
+                });
             }
 
             ui.add_space(6.0);
 
-            guid_changed = self.show_module_picker_body(
+            let mut show_all_tmp = self.show_all_models;
+            let show_all_opt = if !is_multi && !for_all_flag {
+                Some(&mut show_all_tmp)
+            } else {
+                None
+            };
+            guid_changed |= self.show_module_picker_body(
                 ui,
                 ctx,
                 catalog,
@@ -835,16 +995,30 @@ impl LinePropsDialogState {
                 reglan_cat,
                 None,
                 None,
+                is_multi,
+                show_all_opt,
             );
+            self.show_all_models = show_all_tmp;
         });
 
         self.selected_struct[0] = cur_struct;
-        props.for_all_structures = encode_for_all_structures(for_all_flag, cur_struct);
-        let final_id = cur_struct as i32;
-        if nar_pos_changed || guid_changed {
+        props.for_all_structures = if is_multi {
+            0
+        } else {
+            encode_for_all_structures(for_all_flag, cur_struct)
+        };
+        let final_id = if is_multi { 0 } else { cur_struct as i32 };
+        if nar_pos_changed
+            || fair_isle_changed
+            || guid_changed
+            || ((for_all_flag || is_multi) && !props.modules.iter().any(|m| m.module_art_id == final_id))
+        {
             let m = get_or_insert_module(&mut props.modules, final_id);
             if nar_pos_changed {
                 m.narrowing_position = nar_pos;
+            }
+            if fair_isle_changed {
+                m.fair_isle_status = fair_isle;
             }
             if guid_changed {
                 m.id = cur_guid;
@@ -934,14 +1108,13 @@ impl LinePropsDialogState {
 
         let mut guid_changed = false;
         win32_group_box_on(ui, "Modül düzeni", TAB_PANE_BG, |ui| {
-            let mut pos_mode = if nar_pos == 0 {
-                0
-            } else if nar_pos == 4 {
-                4
-            } else {
-                2
+            // Stoll `DIALOG 4270`: radios map (before, with, after) -> (1, 4, 2)
+            let mut pos_mode = match nar_pos {
+                1 => 1,
+                2 => 2,
+                _ => 4,
             };
-            let p_changed = win32_radio(ui, &mut pos_mode, 0, "mevcut aktarmalardan önce artır")
+            let p_changed = win32_radio(ui, &mut pos_mode, 1, "mevcut aktarmalardan önce artır")
                 .changed()
                 | win32_radio(ui, &mut pos_mode, 4, "mevcut aktarmalar ile artır").changed()
                 | win32_radio(ui, &mut pos_mode, 2, "mevcut aktarmalardan sonra artır").changed();
@@ -964,13 +1137,18 @@ impl LinePropsDialogState {
                 PreviewCategory::Widening,
                 None,
                 None,
+                false,
+                None,
             );
         });
 
         self.selected_struct[1] = cur_struct;
         props.for_all_structures = encode_for_all_structures(for_all_flag, cur_struct);
         let final_id = cur_struct as i32;
-        if nar_pos_changed || guid_changed {
+        if nar_pos_changed
+            || guid_changed
+            || (for_all_flag && !props.modules.iter().any(|m| m.module_art_id == final_id))
+        {
             let m = get_or_insert_module(&mut props.modules, final_id);
             if nar_pos_changed {
                 m.narrowing_position = nar_pos;
@@ -1011,7 +1189,12 @@ impl LinePropsDialogState {
         };
         let active_id = cur_struct as i32;
         let mut cur_guid = get_or_default_module(&props.modules, active_id, for_all_flag).id;
-        let mut bo_type = self.bind_off_type_idx;
+        let mut bo_type = self.bind_off_type_idx.min(1);
+        let bo_cat = if bo_type == 1 {
+            PreviewCategory::BindOffCa
+        } else {
+            PreviewCategory::BindOff
+        };
 
         let mut guid_changed = false;
         win32_group_box_on(ui, "Modül düzeni", TAB_PANE_BG, |ui| {
@@ -1024,22 +1207,25 @@ impl LinePropsDialogState {
                 &mut for_all_flag,
                 &mut cur_struct,
                 &mut cur_guid,
-                PreviewCategory::BindOff,
+                bo_cat,
                 Some(&mut bo_type),
+                None,
+                false,
                 None,
             );
         });
 
-        let prev_bo_type = self.bind_off_type_idx;
         self.bind_off_type_idx = bo_type;
         self.selected_struct[2] = cur_struct;
         props.for_all_structures = encode_for_all_structures(for_all_flag, cur_struct);
-        if bo_type != prev_bo_type {
-            props.bind_off_type = Some(bo_type as i32);
-        }
         let final_id = cur_struct as i32;
-        if guid_changed {
-            get_or_insert_module(&mut props.modules, final_id).id = cur_guid;
+        if guid_changed
+            || (for_all_flag && !props.modules.iter().any(|m| m.module_art_id == final_id))
+        {
+            let m = get_or_insert_module(&mut props.modules, final_id);
+            if guid_changed {
+                m.id = cur_guid;
+            }
         }
 
         if props != before_props {
@@ -1066,16 +1252,22 @@ impl LinePropsDialogState {
             self.selected_struct[3]
         };
         let active_id = cur_struct as i32;
-        let mut width = get_or_default_module(&props.modules, active_id, for_all_flag).width;
+        let active_mod = get_or_default_module(&props.modules, active_id, for_all_flag);
+        let mut width = active_mod.width;
+        let mut cur_guid = active_mod.id.clone();
         let mut width_changed = false;
+        let has_valid_module = !cur_guid.is_empty() && !cur_guid.eq_ignore_ascii_case(ZERO_GUID);
+        let fade_width_enabled = for_all_flag && has_valid_module;
 
         ui.horizontal(|ui| {
-            ui.label("Kenar düzeltme eni:");
-            ui.add_space(12.0);
-            if win32_int_edit(ui, "lp_kenar_width", &mut width, 42.0, 0..=999) {
-                get_or_insert_module(&mut props.modules, active_id).width = width;
-                width_changed = true;
-            }
+            ui.add_enabled_ui(fade_width_enabled, |ui| {
+                ui.label("Kenar düzeltme eni:");
+                ui.add_space(12.0);
+                if win32_int_edit(ui, "lp_kenar_width", &mut width, 42.0, 1..=999) {
+                    get_or_insert_module(&mut props.modules, active_id).width = width;
+                    width_changed = true;
+                }
+            });
         });
 
         // Propagate fade-out width to curve steps if present (`DLG-07`)
@@ -1122,8 +1314,6 @@ impl LinePropsDialogState {
 
         ui.add_space(4.0);
 
-        let mut cur_guid = get_or_default_module(&props.modules, active_id, for_all_flag).id;
-
         let mut guid_changed = false;
         win32_group_box_on(ui, "Modül düzeni", TAB_PANE_BG, |ui| {
             guid_changed = self.show_module_picker_body(
@@ -1138,14 +1328,21 @@ impl LinePropsDialogState {
                 PreviewCategory::FadeOut,
                 None,
                 None,
+                false,
+                None,
             );
         });
 
         self.selected_struct[3] = cur_struct;
         props.for_all_structures = encode_for_all_structures(for_all_flag, cur_struct);
         let final_id = cur_struct as i32;
-        if guid_changed {
-            get_or_insert_module(&mut props.modules, final_id).id = cur_guid;
+        if guid_changed
+            || (for_all_flag && !props.modules.iter().any(|m| m.module_art_id == final_id))
+        {
+            let m = get_or_insert_module(&mut props.modules, final_id);
+            if guid_changed {
+                m.id = cur_guid;
+            }
         }
 
         if props != before_props {
@@ -1164,6 +1361,7 @@ impl LinePropsDialogState {
         choices: &[(String, String)],
         point_slot: usize,
         category: PreviewCategory,
+        elem_art_id: i32,
     ) {
         let slot_i32 = point_slot as i32;
         let existing_pos = self.working.points.iter().position(|p| p.index == slot_i32);
@@ -1185,26 +1383,26 @@ impl LinePropsDialogState {
 
         ui.add_space(4.0);
 
+        // Stoll `DIALOG 4271` / `4272`: only Normal (0), üst sol yaka kesimi (1), Delik (3) — never Alt kol kesimi (2).
+        // On Tab 6 (`Bitiş`, 4272), disable `15727` when element is `Yaka Kesimi` (2) or `Kesim Yaka açıklığı` (7).
+        let pt_func_enabled = !(point_slot == 1 && (elem_art_id == 2 || elem_art_id == 7));
         win32_group_box_on(ui, "Fonksiyon", TAB_PANE_BG, |ui| {
             let cur_kind = PointKind::from_id(pt_copy.punkt_art_tag_id);
-            win32_combo_scope(ui, |ui| {
-                egui::ComboBox::from_id_salt(format!("lp_pt_func_{point_slot}"))
-                    .width(210.0)
-                    .selected_text(cur_kind.label_tr())
-                    .show_ui(ui, |ui| {
-                        for k in [
-                            PointKind::Normal,
-                            PointKind::TopLeftNeck,
-                            PointKind::BottomArmhole,
-                            PointKind::Hole,
-                        ] {
-                            ui.selectable_value(
-                                &mut pt_copy.punkt_art_tag_id,
-                                k.to_id(),
-                                k.label_tr(),
-                            );
-                        }
-                    });
+            ui.add_enabled_ui(pt_func_enabled, |ui| {
+                win32_combo_scope(ui, |ui| {
+                    egui::ComboBox::from_id_salt(format!("lp_pt_func_{point_slot}"))
+                        .width(210.0)
+                        .selected_text(cur_kind.label_tr())
+                        .show_ui(ui, |ui| {
+                            for k in [PointKind::Normal, PointKind::TopLeftNeck, PointKind::Hole] {
+                                ui.selectable_value(
+                                    &mut pt_copy.punkt_art_tag_id,
+                                    k.to_id(),
+                                    k.label_tr(),
+                                );
+                            }
+                        });
+                });
             });
         });
 
@@ -1245,6 +1443,8 @@ impl LinePropsDialogState {
                 effective_category,
                 None,
                 Some(&mut off_xy),
+                false,
+                None,
             );
         });
 
@@ -1275,7 +1475,7 @@ impl LinePropsDialogState {
         }
     }
 
-    // ── Tab 7: Bağlantılar (`DIALOG 4273`) ──────────────────────────────────────
+    // ── Tab 7: Bağlantılar (`DIALOG 4273` `15739` CCheckListBox, K&W only) ──────
     fn show_tab_baglantilar(&mut self, ui: &mut Ui) {
         let mut cp = self.working.connection_points.clone().unwrap_or_default();
         let before_cp = cp.clone();
@@ -1287,125 +1487,65 @@ impl LinePropsDialogState {
             |ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Elemanlar arası (ör. kol-beden) bağlantı noktalarını tanımlayın ve düzenleyin.",
+                        "K&W elemanları arası bağlantı noktası kimliklerini işaretleyin:",
                     )
                     .font(regular_font(10.5))
-                    .color(colors::TEXT_DISABLED),
+                    .color(colors::TEXT_SECONDARY),
                 );
                 ui.add_space(6.0);
+
+                // Collect standard Stoll bit IDs (1, 2, 4, ..., 8192) + any custom IDs present
+                let mut candidate_ids: Vec<i32> = (0..14).map(|shift| 1i32 << shift).collect();
+                for pt in &cp.points {
+                    if !candidate_ids.contains(&pt.connect_id) {
+                        candidate_ids.push(pt.connect_id);
+                    }
+                }
 
                 Frame::NONE
                     .fill(colors::INPUT_BG)
                     .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
-                    .inner_margin(Margin::same(3))
+                    .inner_margin(Margin::same(4))
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical()
                             .id_salt("lp_conn_list_scroll")
-                            .min_scrolled_height(175.0)
-                            .max_height(175.0)
+                            .min_scrolled_height(260.0)
+                            .max_height(260.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                if cp.points.is_empty() {
-                                    ui.add_space(60.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            egui::RichText::new("(Bağlantı noktası tanımlı değil)")
-                                                .color(colors::TEXT_DISABLED),
-                                        );
-                                    });
-                                } else {
-                                    for (i, pt) in cp.points.iter().enumerate() {
-                                        let is_sel = self.selected_conn_idx == Some(i);
-                                        let type_txt = pt
-                                            .connect_type
-                                            .map(|t| format!("Tip {t}"))
-                                            .unwrap_or_else(|| "Standart".to_string());
-                                        let dir_txt =
-                                            if pt.direction { "İleri (ja)" } else { "Geri (nein)" };
-                                        let row_txt = format!(
-                                            "#{}  —  Bağlantı ID: {}   |   {}   |   Yön: {}",
-                                            i + 1,
-                                            pt.connect_id,
-                                            type_txt,
-                                            dir_txt
-                                        );
-                                        let resp = ui.selectable_label(is_sel, row_txt);
-                                        if resp.clicked() {
-                                            self.selected_conn_idx = Some(i);
+                                for &cid in &candidate_ids {
+                                    let pos = cp.points.iter().position(|p| p.connect_id == cid);
+                                    let mut checked = pos.is_some();
+                                    let lbl = format!("Bağlantı {cid}");
+                                    ui.horizontal(|ui| {
+                                        if win32_checkbox(ui, &mut checked, &lbl).changed() {
+                                            if checked {
+                                                cp.points.push(ConnectPoint {
+                                                    connect_id: cid,
+                                                    connect_type: None,
+                                                    direction: true,
+                                                    raw: Default::default(),
+                                                });
+                                            } else if let Some(idx) = pos {
+                                                cp.points.remove(idx);
+                                            }
                                         }
-                                    }
+                                        if let Some(idx) = pos {
+                                            if checked {
+                                                if let Some(pt) = cp.points.get_mut(idx) {
+                                                    ui.add_space(16.0);
+                                                    win32_checkbox(
+                                                        ui,
+                                                        &mut pt.direction,
+                                                        "İleri (ja)",
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
                             });
                     });
-
-                ui.add_space(8.0);
-
-                // Inline edit selected connection point
-                if let Some(sel) = self.selected_conn_idx {
-                    if let Some(pt) = cp.points.get_mut(sel) {
-                        ui.horizontal(|ui| {
-                            ui.label("Bağlantı ID:");
-                            win32_int_edit(
-                                ui,
-                                format!("lp_conn_id_{sel}"),
-                                &mut pt.connect_id,
-                                52.0,
-                                0..=9999,
-                            );
-                            ui.add_space(12.0);
-                            ui.label("Tip:");
-                            let mut ctype = pt.connect_type.unwrap_or(0);
-                            if win32_int_edit(
-                                ui,
-                                format!("lp_conn_type_{sel}"),
-                                &mut ctype,
-                                46.0,
-                                0..=99,
-                            ) {
-                                pt.connect_type = if ctype == 0 { None } else { Some(ctype) };
-                            }
-                            ui.add_space(12.0);
-                            win32_checkbox(ui, &mut pt.direction, "Yön: İleri (ja)");
-                        });
-                    }
-                }
-
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    if win32_button(ui, "+ Bağlantı Ekle", vec2(106.0, 22.0), true).clicked() {
-                        let next_id =
-                            cp.points.iter().map(|p| p.connect_id).max().unwrap_or(0) + 1;
-                        cp.points.push(ConnectPoint {
-                            connect_id: next_id,
-                            connect_type: None,
-                            direction: true,
-                            raw: Default::default(),
-                        });
-                        self.selected_conn_idx = Some(cp.points.len() - 1);
-                    }
-                    let can_del = self
-                        .selected_conn_idx
-                        .map(|i| i < cp.points.len())
-                        .unwrap_or(false);
-                    if win32_button(ui, "Seçileni Sil", vec2(84.0, 22.0), can_del).clicked() {
-                        if let Some(i) = self.selected_conn_idx {
-                            cp.points.remove(i);
-                            self.selected_conn_idx = if cp.points.is_empty() {
-                                None
-                            } else {
-                                Some(i.min(cp.points.len() - 1))
-                            };
-                        }
-                    }
-                    if win32_button(ui, "Yön Değiştir", vec2(86.0, 22.0), can_del).clicked() {
-                        if let Some(i) = self.selected_conn_idx {
-                            if let Some(pt) = cp.points.get_mut(i) {
-                                pt.direction = !pt.direction;
-                            }
-                        }
-                    }
-                });
             },
         );
 
@@ -1431,10 +1571,12 @@ impl LinePropsDialogState {
         category: PreviewCategory,
         mut bind_off_type: Option<&mut usize>,
         mut offset_xy: Option<&mut (i32, i32)>,
+        multistage_mode: bool,
+        mut show_all_models: Option<&mut bool>,
     ) -> bool {
         let mut guid_changed = false;
         ui.horizontal_top(|ui| {
-            // Left column: 12-item Knitting Structure ListBox + `Tüm örgü türleri için geçerlidir`
+            // Left column: 12-item Knitting Structure ListBox (or single `'Tüm örgü türleri'` row in `çok kademeli`)
             ui.vertical(|ui| {
                 ui.set_width(188.0);
 
@@ -1448,7 +1590,7 @@ impl LinePropsDialogState {
                 // Sunken ListBox frame
                 let list_h = 192.0;
                 Frame::NONE
-                    .fill(if *for_all_flag {
+                    .fill(if *for_all_flag && !multistage_mode {
                         Color32::BLACK
                     } else {
                         colors::INPUT_BG
@@ -1459,99 +1601,120 @@ impl LinePropsDialogState {
                         ui.set_width(184.0);
                         ui.set_min_height(list_h);
                         let row_h = list_h / 12.0;
-                        for (idx, ks) in KNITTING_STRUCTURES.iter().take(12).enumerate() {
-                            let (row_rect, resp) =
-                                ui.allocate_exact_size(vec2(182.0, row_h), Sense::click());
+                        if multistage_mode {
+                            let (row_rect, _) =
+                                ui.allocate_exact_size(vec2(182.0, row_h), Sense::hover());
                             let painter = ui.painter();
+                            painter.rect_filled(row_rect, CornerRadius::ZERO, colors::WIN_BLUE);
+                            painter.text(
+                                pos2(row_rect.left() + 4.0, row_rect.center().y),
+                                Align2::LEFT_CENTER,
+                                "Tüm örgü türleri",
+                                regular_font(10.5),
+                                Color32::WHITE,
+                            );
+                        } else {
+                            for (idx, ks) in KNITTING_STRUCTURES.iter().take(12).enumerate() {
+                                let (row_rect, resp) =
+                                    ui.allocate_exact_size(vec2(182.0, row_h), Sense::click());
+                                let painter = ui.painter();
 
-                            if *for_all_flag {
-                                if idx == *selected_struct {
-                                    // Active structure row: white icon + green `✓` + blue selection bar (`222038.png`!)
-                                    let icon_rect = Rect::from_min_size(
-                                        row_rect.min,
-                                        vec2(16.0, row_rect.height()),
-                                    );
-                                    let label_rect = Rect::from_min_max(
-                                        pos2(row_rect.left() + 16.0, row_rect.top()),
-                                        row_rect.max,
-                                    );
-                                    painter.rect_filled(icon_rect, CornerRadius::ZERO, Color32::WHITE);
-                                    painter.rect_filled(
-                                        label_rect,
-                                        CornerRadius::ZERO,
-                                        colors::WIN_BLUE,
-                                    );
-                                    // Crisp green checkmark
-                                    let c = icon_rect.center();
-                                    let g_stroke = Stroke::new(1.8_f32, Color32::from_rgb(0x00, 0xA8, 0x00));
-                                    painter.line_segment(
-                                        [pos2(c.x - 4.0, c.y), pos2(c.x - 1.0, c.y + 3.5)],
-                                        g_stroke,
-                                    );
-                                    painter.line_segment(
-                                        [pos2(c.x - 1.0, c.y + 3.5), pos2(c.x + 4.5, c.y - 4.0)],
-                                        g_stroke,
-                                    );
+                                if *for_all_flag {
+                                    if idx == *selected_struct {
+                                        // Active structure row: white icon + green `✓` + blue selection bar (`222038.png`!)
+                                        let icon_rect = Rect::from_min_size(
+                                            row_rect.min,
+                                            vec2(16.0, row_rect.height()),
+                                        );
+                                        let label_rect = Rect::from_min_max(
+                                            pos2(row_rect.left() + 16.0, row_rect.top()),
+                                            row_rect.max,
+                                        );
+                                        painter.rect_filled(
+                                            icon_rect,
+                                            CornerRadius::ZERO,
+                                            Color32::WHITE,
+                                        );
+                                        painter.rect_filled(
+                                            label_rect,
+                                            CornerRadius::ZERO,
+                                            colors::WIN_BLUE,
+                                        );
+                                        // Crisp green checkmark
+                                        let c = icon_rect.center();
+                                        let g_stroke =
+                                            Stroke::new(1.8_f32, Color32::from_rgb(0x00, 0xA8, 0x00));
+                                        painter.line_segment(
+                                            [pos2(c.x - 4.0, c.y), pos2(c.x - 1.0, c.y + 3.5)],
+                                            g_stroke,
+                                        );
+                                        painter.line_segment(
+                                            [pos2(c.x - 1.0, c.y + 3.5), pos2(c.x + 4.5, c.y - 4.0)],
+                                            g_stroke,
+                                        );
+                                        painter.text(
+                                            pos2(label_rect.left() + 3.0, label_rect.center().y),
+                                            Align2::LEFT_CENTER,
+                                            ks.name_tr,
+                                            regular_font(10.5),
+                                            Color32::WHITE,
+                                        );
+                                    } else {
+                                        // Rows 1..11: solid black background + crisp red `X` (`222038.png`, `222102.png`, `222110.png`)
+                                        painter.rect_filled(
+                                            row_rect,
+                                            CornerRadius::ZERO,
+                                            Color32::BLACK,
+                                        );
+                                        let cx = row_rect.left() + 8.0;
+                                        let cy = row_rect.center().y;
+                                        let r_stroke =
+                                            Stroke::new(1.7_f32, Color32::from_rgb(0xFF, 0x18, 0x18));
+                                        painter.line_segment(
+                                            [pos2(cx - 4.0, cy - 4.0), pos2(cx + 4.0, cy + 4.0)],
+                                            r_stroke,
+                                        );
+                                        painter.line_segment(
+                                            [pos2(cx - 4.0, cy + 4.0), pos2(cx + 4.0, cy - 4.0)],
+                                            r_stroke,
+                                        );
+                                    }
+                                } else {
+                                    // Individual per-structure mode (`222054.png`, `222119.png`, `222125.png`)
+                                    let is_sel = *selected_struct == idx;
+                                    let bg = if is_sel {
+                                        colors::WIN_BLUE
+                                    } else if resp.hovered() {
+                                        colors::WIN_BLUE_HOVER
+                                    } else {
+                                        colors::INPUT_BG
+                                    };
+                                    let fg = if is_sel {
+                                        Color32::WHITE
+                                    } else {
+                                        colors::TEXT_BLACK
+                                    };
+                                    painter.rect_filled(row_rect, CornerRadius::ZERO, bg);
                                     painter.text(
-                                        pos2(label_rect.left() + 3.0, label_rect.center().y),
+                                        pos2(row_rect.left() + 4.0, row_rect.center().y),
                                         Align2::LEFT_CENTER,
                                         ks.name_tr,
                                         regular_font(10.5),
-                                        Color32::WHITE,
+                                        fg,
                                     );
-                                } else {
-                                    // Rows 1..11: solid black background + crisp red `X` (`222038.png`, `222102.png`, `222110.png`)
-                                    painter.rect_filled(
-                                        row_rect,
-                                        CornerRadius::ZERO,
-                                        Color32::BLACK,
-                                    );
-                                    let cx = row_rect.left() + 8.0;
-                                    let cy = row_rect.center().y;
-                                    let r_stroke =
-                                        Stroke::new(1.7_f32, Color32::from_rgb(0xFF, 0x18, 0x18));
-                                    painter.line_segment(
-                                        [pos2(cx - 4.0, cy - 4.0), pos2(cx + 4.0, cy + 4.0)],
-                                        r_stroke,
-                                    );
-                                    painter.line_segment(
-                                        [pos2(cx - 4.0, cy + 4.0), pos2(cx + 4.0, cy - 4.0)],
-                                        r_stroke,
-                                    );
-                                }
-                            } else {
-                                // Individual per-structure mode (`222054.png`, `222119.png`, `222125.png`)
-                                let is_sel = *selected_struct == idx;
-                                let bg = if is_sel {
-                                    colors::WIN_BLUE
-                                } else if resp.hovered() {
-                                    colors::WIN_BLUE_HOVER
-                                } else {
-                                    colors::INPUT_BG
-                                };
-                                let fg = if is_sel {
-                                    Color32::WHITE
-                                } else {
-                                    colors::TEXT_BLACK
-                                };
-                                painter.rect_filled(row_rect, CornerRadius::ZERO, bg);
-                                painter.text(
-                                    pos2(row_rect.left() + 4.0, row_rect.center().y),
-                                    Align2::LEFT_CENTER,
-                                    ks.name_tr,
-                                    regular_font(10.5),
-                                    fg,
-                                );
-                                if resp.clicked() && *selected_struct != idx {
-                                    *selected_struct = idx;
-                                    ctx.request_repaint();
+                                    if resp.clicked() && *selected_struct != idx {
+                                        *selected_struct = idx;
+                                        ctx.request_repaint();
+                                    }
                                 }
                             }
                         }
                     });
 
-                ui.add_space(5.0);
-                win32_checkbox(ui, for_all_flag, "Tüm örgü türleri için geçerlidir");
+                if !multistage_mode {
+                    ui.add_space(5.0);
+                    win32_checkbox(ui, for_all_flag, "Tüm örgü türleri için geçerlidir");
+                }
             });
 
             ui.add_space(14.0);
@@ -1560,11 +1723,12 @@ impl LinePropsDialogState {
             ui.vertical(|ui| {
                 ui.set_min_width(250.0);
 
-                let mut mod_picker_enabled = true;
+                let mut active_category = category;
                 if let Some(ref mut bo_idx) = bind_off_type {
                     ui.label("Remayözleme-tipi:");
-                    let bo_types = ["Modül", "Otomatik", "El tipi"];
-                    let cur_bo = bo_types.get(**bo_idx).copied().unwrap_or("Modül");
+                    let bo_types = ["Modül", "RA"];
+                    let prev_bo = **bo_idx;
+                    let cur_bo = bo_types.get(prev_bo).copied().unwrap_or("Modül");
                     win32_combo_scope(ui, |ui| {
                         egui::ComboBox::from_id_salt(format!("lp_bo_type_{id_tag}"))
                             .width(210.0)
@@ -1575,53 +1739,108 @@ impl LinePropsDialogState {
                                 }
                             });
                     });
-                    mod_picker_enabled = **bo_idx == 0;
-                    ui.add_space(10.0);
-                } else {
+                    if **bo_idx != prev_bo {
+                        active_category = if **bo_idx == 1 {
+                            PreviewCategory::BindOffCa
+                        } else {
+                            PreviewCategory::BindOff
+                        };
+                        if let Some(first) = catalog
+                            .modules_for_category_and_structure(
+                                active_category.to_module_category(),
+                                *selected_struct as i32,
+                            )
+                            .first()
+                        {
+                            *cur_guid = first.guid.clone();
+                            guid_changed = true;
+                        }
+                    }
+                    ui.add_space(8.0);
                     ui.label("Modül:");
+                } else {
+                    if let Some(ref mut show_all) = show_all_models {
+                        ui.horizontal(|ui| {
+                            ui.label("Modül:");
+                            ui.add_space(18.0);
+                            win32_checkbox(ui, show_all, "Tüm modelleri göster");
+                        });
+                    } else {
+                        ui.label("Modül:");
+                    }
                 }
 
-                // Build category- & structure-specific Stoll DB module dropdown (`ENG-01` / `#48.3`)
-                let cat_choices = collect_category_module_choices(
-                    catalog,
-                    category.to_module_category(),
-                    *selected_struct as i32,
-                    choices,
-                    cur_guid,
-                    &self.resolved_cache,
-                );
-
-                // Resolve display name of current GUID
+                // Resolve display name of current GUID first (populates `self.resolved_cache`)
                 let selected_label = self.resolve_display_name(catalog, cur_guid);
-                ui.add_enabled_ui(mod_picker_enabled, |ui| {
-                    win32_combo_scope(ui, |ui| {
-                        egui::ComboBox::from_id_salt(format!(
-                            "lp_mod_combo_{id_tag}_{}",
-                            *selected_struct
-                        ))
-                        .width(216.0)
-                        .selected_text(&selected_label)
-                        .show_ui(ui, |ui| {
-                                // `(Modül yok)` option
-                                if ui
-                                    .selectable_label(
-                                        cur_guid.is_empty()
-                                            || cur_guid.eq_ignore_ascii_case(ZERO_GUID),
-                                        "(Modül yok)",
-                                    )
-                                    .clicked()
-                                {
-                                    *cur_guid = ZERO_GUID.to_string();
-                                    guid_changed = true;
-                                }
-                                for (guid, name) in &cat_choices {
-                                    let is_sel = cur_guid.eq_ignore_ascii_case(guid);
-                                    if ui.selectable_label(is_sel, name).clicked() {
-                                        *cur_guid = guid.clone();
-                                        guid_changed = true;
-                                    }
-                                }
-                            });
+                let show_all_active = show_all_models.as_deref().copied().unwrap_or(false);
+                let effective_struct_id: i32 = if multistage_mode || show_all_active {
+                    -1
+                } else {
+                    *selected_struct as i32
+                };
+
+                // Cached category- & structure-specific Stoll DB module dropdown (`ENG-01` / `#48.3`)
+                let cache_key = (
+                    active_category,
+                    effective_struct_id,
+                    normalize_guid(cur_guid),
+                    choices.len(),
+                );
+                let cat_choices = if let Some((ref k, ref list)) = self.cached_cat_choices {
+                    if *k == cache_key {
+                        list.clone()
+                    } else {
+                        let built = collect_category_module_choices(
+                            catalog,
+                            active_category.to_module_category(),
+                            effective_struct_id,
+                            choices,
+                            cur_guid,
+                            &self.resolved_cache,
+                        );
+                        self.cached_cat_choices = Some((cache_key, built.clone()));
+                        built
+                    }
+                } else {
+                    let built = collect_category_module_choices(
+                        catalog,
+                        active_category.to_module_category(),
+                        effective_struct_id,
+                        choices,
+                        cur_guid,
+                        &self.resolved_cache,
+                    );
+                    self.cached_cat_choices = Some((cache_key, built.clone()));
+                    built
+                };
+                win32_combo_scope(ui, |ui| {
+                    egui::ComboBox::from_id_salt(format!(
+                        "lp_mod_combo_{id_tag}_{}_{}_{}",
+                        effective_struct_id,
+                        if active_category == PreviewCategory::BindOffCa { 1 } else { 0 },
+                        if show_all_active { 1 } else { 0 }
+                    ))
+                    .width(216.0)
+                    .selected_text(&selected_label)
+                    .show_ui(ui, |ui| {
+                        // `(Modül yok)` option
+                        if ui
+                            .selectable_label(
+                                cur_guid.is_empty() || cur_guid.eq_ignore_ascii_case(ZERO_GUID),
+                                "(Modül yok)",
+                            )
+                            .clicked()
+                        {
+                            *cur_guid = ZERO_GUID.to_string();
+                            guid_changed = true;
+                        }
+                        for (guid, name) in &cat_choices {
+                            let is_sel = cur_guid.eq_ignore_ascii_case(guid);
+                            if ui.selectable_label(is_sel, name).clicked() {
+                                *cur_guid = guid.clone();
+                                guid_changed = true;
+                            }
+                        }
                     });
                 });
 
@@ -1860,10 +2079,18 @@ fn get_or_insert_module(list: &mut Vec<ModuleAssignment>, struct_id: i32) -> &mu
         return &mut list[pos];
     }
     let mut base = ModuleAssignment::default();
-    if let Some(first) = list.first() {
-        base.width = first.width;
-        base.bind_off_limit = first.bind_off_limit;
-        base.narrowing_position = first.narrowing_position;
+    if let Some(fallback) = list
+        .iter()
+        .find(|m| m.module_art_id == 0)
+        .or_else(|| list.iter().find(|m| m.module_art_id == -1))
+        .or_else(|| list.first())
+    {
+        if !fallback.id.is_empty() {
+            base.id = fallback.id.clone();
+        }
+        base.width = fallback.width;
+        base.bind_off_limit = fallback.bind_off_limit;
+        base.narrowing_position = fallback.narrowing_position;
     }
     base.module_art_id = struct_id;
     base.raw.original_header = Some(format!("[ModuleArt] = {struct_id}"));
@@ -2053,7 +2280,7 @@ fn paint_schematic_module_preview(
                 );
             }
         }
-        PreviewCategory::BindOff => {
+        PreviewCategory::BindOff | PreviewCategory::BindOffCa => {
             // Diagonal bind-off cascade ladder
             for k in 0..6 {
                 let x = rect.left() + (k as f32 + 1.0) * cw;
@@ -2128,6 +2355,12 @@ pub struct NecklinePropsDialogState {
     orig_imitated_neck: bool,
     gore_knitting: bool,
     orig_gore_knitting: bool,
+    gore_rows_additional: i32,
+    orig_gore_rows_additional: i32,
+    gore_rows_in_gore: i32,
+    orig_gore_rows_in_gore: i32,
+    gore_align_rows: i32,
+    orig_gore_align_rows: i32,
 }
 
 impl Default for NecklinePropsDialogState {
@@ -2142,6 +2375,12 @@ impl Default for NecklinePropsDialogState {
             orig_imitated_neck: false,
             gore_knitting: false,
             orig_gore_knitting: false,
+            gore_rows_additional: 0,
+            orig_gore_rows_additional: 0,
+            gore_rows_in_gore: 0,
+            orig_gore_rows_in_gore: 0,
+            gore_align_rows: 0,
+            orig_gore_align_rows: 0,
         }
     }
 }
@@ -2181,6 +2420,24 @@ impl NecklinePropsDialogState {
                 .iter()
                 .any(|l| l.gore_knitting.unwrap_or(0) != 0);
             self.orig_gore_knitting = self.gore_knitting;
+            self.gore_rows_additional = el
+                .left_lines
+                .iter()
+                .find_map(|l| l.gore_rows_additional)
+                .unwrap_or(0);
+            self.orig_gore_rows_additional = self.gore_rows_additional;
+            self.gore_rows_in_gore = el
+                .left_lines
+                .iter()
+                .find_map(|l| l.gore_rows_in_gore)
+                .unwrap_or(0);
+            self.orig_gore_rows_in_gore = self.gore_rows_in_gore;
+            self.gore_align_rows = el
+                .left_lines
+                .iter()
+                .find_map(|l| l.gore_align_rows)
+                .unwrap_or(0);
+            self.orig_gore_align_rows = self.gore_align_rows;
         }
 
         let mut close =
@@ -2253,6 +2510,37 @@ impl NecklinePropsDialogState {
                                 &mut self.gore_knitting,
                                 "Pens / Gore örme etkin (GoreKnitting)",
                             );
+                            ui.add_enabled_ui(self.gore_knitting, |ui| {
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Ek sıra:");
+                                    win32_int_edit(
+                                        ui,
+                                        "neck_gore_add_rows",
+                                        &mut self.gore_rows_additional,
+                                        40.0,
+                                        0..=999,
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label("Gore sıra:");
+                                    win32_int_edit(
+                                        ui,
+                                        "neck_gore_in_rows",
+                                        &mut self.gore_rows_in_gore,
+                                        40.0,
+                                        0..=999,
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label("Hiza sıra:");
+                                    win32_int_edit(
+                                        ui,
+                                        "neck_gore_align_rows",
+                                        &mut self.gore_align_rows,
+                                        40.0,
+                                        0..=999,
+                                    );
+                                });
+                            });
                         });
 
                         ui.add_space(8.0);
@@ -2289,6 +2577,24 @@ impl NecklinePropsDialogState {
                     let v = Some(if self.gore_knitting { 1 } else { 0 });
                     for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
                         l.gore_knitting = v;
+                    }
+                }
+                if self.gore_rows_additional != self.orig_gore_rows_additional {
+                    let v = Some(self.gore_rows_additional);
+                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
+                        l.gore_rows_additional = v;
+                    }
+                }
+                if self.gore_rows_in_gore != self.orig_gore_rows_in_gore {
+                    let v = Some(self.gore_rows_in_gore);
+                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
+                        l.gore_rows_in_gore = v;
+                    }
+                }
+                if self.gore_align_rows != self.orig_gore_align_rows {
+                    let v = Some(self.gore_align_rows);
+                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
+                        l.gore_align_rows = v;
                     }
                 }
                 if !self.mirrored {
@@ -2460,16 +2766,25 @@ impl RefLineSelectDialogState {
                 .and_then(|e| e.lines(side).get(self.selected_source_idx))
                 .cloned();
             if let Some(src_line) = source_opt {
-                undo.push("Referans çizgi özelliklerini al", doc);
                 let target_rows = if state.selected_rows.is_empty() {
                     state.primary_row().into_iter().collect::<Vec<_>>()
                 } else {
                     state.selected_rows.clone()
                 };
-                if let Some(el) = doc.elements.get_mut(elem_idx) {
-                    let lines = el.lines_mut(side);
-                    for &r in &target_rows {
-                        if r != self.selected_source_idx {
+                let max_len = doc
+                    .elements
+                    .get(elem_idx)
+                    .map(|e| e.lines(side).len())
+                    .unwrap_or(0);
+                let effective_targets: Vec<usize> = target_rows
+                    .into_iter()
+                    .filter(|&r| r != self.selected_source_idx && r < max_len)
+                    .collect();
+                if !effective_targets.is_empty() {
+                    undo.push("Referans çizgi özelliklerini al", doc);
+                    if let Some(el) = doc.elements.get_mut(elem_idx) {
+                        let lines = el.lines_mut(side);
+                        for r in effective_targets {
                             if let Some(dst) = lines.get_mut(r) {
                                 apply_standard_preset_to_line(dst, &src_line);
                                 if state.preset_name_as_comment && !src_line.comment.is_empty() {
@@ -2477,19 +2792,19 @@ impl RefLineSelectDialogState {
                                 }
                             }
                         }
+                        if side == LineSide::Left && el.mirrored {
+                            sync_mirrored_right_lines(doc, elem_idx);
+                        }
+                        doc.dirty = true;
                     }
-                    if side == LineSide::Left && el.mirrored {
-                        sync_mirrored_right_lines(doc, elem_idx);
-                    }
-                    doc.dirty = true;
+                    state.set_status(
+                        format!(
+                            "Çizgi {} özellikleri seçili satırlara aktarıldı.",
+                            self.selected_source_idx + 1
+                        ),
+                        false,
+                    );
                 }
-                state.set_status(
-                    format!(
-                        "Çizgi {} özellikleri seçili satırlara aktarıldı.",
-                        self.selected_source_idx + 1
-                    ),
-                    false,
-                );
             }
         }
 

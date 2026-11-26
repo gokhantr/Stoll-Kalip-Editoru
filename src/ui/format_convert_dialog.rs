@@ -382,17 +382,17 @@ impl FormatConvertDialogState {
         let mut h = orig.clone();
         h.display_unit = self.display_unit;
         if let Ok(v) = self.density_base_text.trim().replace(',', ".").parse::<f64>() {
-            if v > 0.01 {
+            if v.is_finite() && (1.0..=1000.0).contains(&v) {
                 h.density_base_mm = v;
             }
         }
         if let Ok(v) = self.density_x_text.trim().replace(',', ".").parse::<f64>() {
-            if v > 0.01 {
+            if v.is_finite() && (1.0..=500.0).contains(&v) {
                 h.density_x = v;
             }
         }
         if let Ok(v) = self.density_y_text.trim().replace(',', ".").parse::<f64>() {
-            if v > 0.01 {
+            if v.is_finite() && (1.0..=500.0).contains(&v) {
                 h.density_y = v;
             }
         }
@@ -453,9 +453,23 @@ impl FormatConvertDialogState {
                     Ok(()) => {
                         doc.file_path = Some(path.clone());
                         doc.dirty = false;
-                        if !state.recent_files.contains(&path) {
-                            state.recent_files.insert(0, path.clone());
-                            state.recent_files.truncate(8);
+                        state.recent_files.retain(|p| p != &path);
+                        state.recent_files.insert(0, path.clone());
+                        state.recent_files.truncate(8);
+                        if let Some(appdata) = std::env::var_os("APPDATA") {
+                            let mru_p = std::path::PathBuf::from(appdata)
+                                .join("kalipeditor")
+                                .join("mru.txt");
+                            if let Some(parent) = mru_p.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let body: String = state
+                                .recent_files
+                                .iter()
+                                .map(|p| p.to_string_lossy())
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let _ = std::fs::write(mru_p, body);
                         }
                         state.set_status(
                             format!(

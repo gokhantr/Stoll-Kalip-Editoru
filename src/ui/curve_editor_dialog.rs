@@ -6,13 +6,13 @@ use egui::{
 use stoll_kalip_editoru::io::{load_curve_file, save_curve_file};
 use stoll_kalip_editoru::math::{
     apply_curve_to_line, auto_detect_line_function_in_context, compress_pairs_to_steps,
-    curve_steps_sum, element_distance_from_top, extract_curve_module_widths, generate_curve_steps,
-    recalc_line_from_stitches_and_rows, resample_user_curve, stoll_round, sync_endline_element_y,
-    sync_mirrored_right_lines, CurveGenParams,
+    curve_steps_sum_slice, element_distance_from_top, extract_curve_module_widths,
+    generate_curve_steps, recalc_line_from_stitches_and_rows, resample_user_curve, stoll_round,
+    sync_endline_element_y, sync_mirrored_right_lines, CurveGenParams,
 };
 use stoll_kalip_editoru::model::{
-    CurveData, CurveForm, CurveStep, FormDocument, LineFunction, LineSide, UndoStack,
-    YReferenceLine,
+    CurveData, CurveForm, CurveStep, FormDocument, KanteChildSlot, LineFunction, LineSide,
+    UndoStack, YReferenceLine,
 };
 
 use crate::ui::icons::{paint_icon, IconKind};
@@ -1016,12 +1016,7 @@ impl CurveEditorDialogState {
         let row_h = 21.0_f32;
 
         // Compute totals for the pinned summary row directly beneath column headers
-        let tmp = CurveData {
-            function: self.curve_form.to_id(),
-            steps: self.steps.clone(),
-            raw: Default::default(),
-        };
-        let (sum_dx, sum_dy) = curve_steps_sum(&tmp);
+        let (sum_dx, sum_dy) = curve_steps_sum_slice(&self.steps);
 
         // Keyboard navigation when no cell TextEdit is active and toolbar input doesn't have focus
         let mut scroll_target = self.handle_step_table_keyboard(ui);
@@ -1171,12 +1166,35 @@ impl CurveEditorDialogState {
                                 });
 
                                 let painter = ui.painter().clone();
-                                for r in 0..row_count {
+                                let clip_rect = ui.clip_rect();
+                                let rows_top = rows_rect.top();
+                                let first_vis = (((clip_rect.top() - rows_top) / row_h).floor()
+                                    as isize
+                                    - 1)
+                                .max(0) as usize;
+                                let last_vis = ((((clip_rect.bottom() - rows_top) / row_h).ceil()
+                                    as isize
+                                    + 1)
+                                .max(0) as usize)
+                                    .min(row_count);
+                                let active_edit_row = self
+                                    .editing_cell
+                                    .as_ref()
+                                    .map(|(er, _, _)| *er)
+                                    .filter(|&er| er < row_count);
+                                let mut rows_to_render: Vec<usize> = (first_vis..last_vis).collect();
+                                if let Some(er) = active_edit_row {
+                                    if er < first_vis || er >= last_vis {
+                                        rows_to_render.push(er);
+                                    }
+                                }
+
+                                for r in rows_to_render {
                                     let ry = rows_rect.top() + (r as f32) * row_h;
                                     let is_row_sel = self.selected_steps.contains(&r);
                                     let multi_sel = is_row_sel && self.selected_steps.len() > 1;
                                     let is_plot_hov = self.hovered_plot_step == Some(r);
-                                    let step_snap = self.steps[r].clone();
+                                    let step_group_zero = self.steps[r].group_tag_id == 0;
 
                                     let mut cx = rows_rect.left();
                                     for (ci, &cw) in col_widths.iter().enumerate() {
@@ -1199,7 +1217,7 @@ impl CurveEditorDialogState {
                                             }
                                         } else if multi_sel && !is_focused {
                                             colors::WIN_BLUE_FILL
-                                        } else if ci == 2 && step_snap.group_tag_id == 0 {
+                                        } else if ci == 2 && step_group_zero {
                                             // Grey shaded `Grup` cell when 0 (matches Screenshot 2)
                                             Color32::from_rgb(0xD6, 0xDC, 0xE5)
                                         } else if is_plot_hov {
@@ -1356,6 +1374,17 @@ impl CurveEditorDialogState {
                                     }
                                 }
 
+                                let pending_scroll_id =
+                                    ui.id().with(("curve_pending_scroll", open_gen));
+                                if scroll_target.is_none() {
+                                    scroll_target = ui.ctx().data_mut(|d| {
+                                        let val = d.get_temp::<(usize, usize)>(pending_scroll_id);
+                                        if val.is_some() {
+                                            d.remove::<(usize, usize)>(pending_scroll_id);
+                                        }
+                                        val
+                                    });
+                                }
                                 if let Some((sr, sc)) = scroll_target {
                                     let col_x: f32 = col_widths.iter().take(sc).sum();
                                     let col_w = col_widths.get(sc).copied().unwrap_or(44.0);
@@ -1380,6 +1409,7 @@ impl CurveEditorDialogState {
             self.editing_pristine = false;
             ui.ctx().data_mut(|d| d.remove::<(u64, usize, usize)>(edit_init_id));
             if pending_start_edit.is_none() && row_count > 0 {
+                let pending_scroll_id = ui.id().with(("curve_pending_scroll", open_gen));
                 match move_kind {
                     CurveEditMove::Stay => {}
                     CurveEditMove::Tab(forward) => {
@@ -1388,6 +1418,7 @@ impl CurveEditorDialogState {
                         if nr != row_i {
                             self.select_single(nr);
                         }
+                        ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (nr, nc)));
                     }
                     CurveEditMove::Delta(dr, dc) => {
                         let nr = (row_i as i32 + dr).clamp(0, (row_count - 1) as i32) as usize;
@@ -1396,6 +1427,7 @@ impl CurveEditorDialogState {
                         if nr != row_i {
                             self.select_single(nr);
                         }
+                        ui.ctx().data_mut(|d| d.insert_temp(pending_scroll_id, (nr, nc)));
                     }
                 }
             }
@@ -1538,12 +1570,7 @@ impl CurveEditorDialogState {
     }
 
     fn show_closure_bar(&mut self, ui: &mut Ui, max_width: f32, bar_height: f32) {
-        let tmp = CurveData {
-            function: self.curve_form.to_id(),
-            steps: self.steps.clone(),
-            raw: Default::default(),
-        };
-        let (sum_dx, sum_dy) = curve_steps_sum(&tmp);
+        let (sum_dx, sum_dy) = curve_steps_sum_slice(&self.steps);
         let exact = sum_dx == self.target_dx && sum_dy == self.target_dy;
 
         let (bg, border, fg) = if exact {
@@ -1615,6 +1642,11 @@ impl CurveEditorDialogState {
                                             )
                                             .clicked()
                                         {
+                                            let tmp = CurveData {
+                                                function: self.curve_form.to_id(),
+                                                steps: self.steps.clone(),
+                                                raw: Default::default(),
+                                            };
                                             let resampled = resample_user_curve(
                                                 &tmp,
                                                 self.target_dx,
@@ -1824,8 +1856,8 @@ impl CurveEditorDialogState {
                 (Color32::from_rgb(0x0F, 0x76, 0x6E), 2.0_f32)
             };
 
-            for w in spts.windows(2) {
-                painter.line_segment([w[0], w[1]], Stroke::new(width, col));
+            if spts.len() >= 2 {
+                painter.add(egui::Shape::line(spts, Stroke::new(width, col)));
             }
         }
 
@@ -1954,6 +1986,9 @@ impl CurveEditorDialogState {
             if let Some(line) = el.lines_mut(req.side).get_mut(req.line_idx) {
                 if self.steps.is_empty() {
                     line.curve = None;
+                    line.kurven_form = 0;
+                    line.child_order
+                        .retain(|s| !matches!(s, KanteChildSlot::Curve));
                     line.stitches = self.target_dx;
                     line.rows = self.target_dy;
                     recalc_line_from_stitches_and_rows(line, &hdr);
@@ -2420,18 +2455,16 @@ fn consume_curve_text_edit_nav_keys(
     buf: &str,
 ) -> CurveEditNavAction {
     let char_len = buf.chars().count();
-    let (all_sel, at_start, at_end) = if let Some(te_state) = egui::TextEdit::load_state(ctx, te_id) {
+    let (at_start, at_end) = if let Some(te_state) = egui::TextEdit::load_state(ctx, te_id) {
         if let Some(range) = te_state.cursor.char_range() {
             let p = range.primary.index;
             let s = range.secondary.index;
-            let lo = p.min(s);
-            let hi = p.max(s);
-            (lo == 0 && hi == char_len, p == 0 && s == 0, p == char_len && s == char_len)
+            (p == 0 && s == 0, p == char_len && s == char_len)
         } else {
-            (true, true, true)
+            (true, true)
         }
     } else {
-        (true, true, true)
+        (true, true)
     };
 
     ctx.input_mut(|i| {
@@ -2455,10 +2488,10 @@ fn consume_curve_text_edit_nav_keys(
         if i.consume_key(none, Key::Tab) {
             return CurveEditNavAction::Move(CurveEditMove::Tab(true));
         }
-        if (all_sel || at_start) && i.consume_key(none, Key::ArrowLeft) {
+        if at_start && i.consume_key(none, Key::ArrowLeft) {
             return CurveEditNavAction::Move(CurveEditMove::Delta(0, -1));
         }
-        if (all_sel || at_end) && i.consume_key(none, Key::ArrowRight) {
+        if at_end && i.consume_key(none, Key::ArrowRight) {
             return CurveEditNavAction::Move(CurveEditMove::Delta(0, 1));
         }
         CurveEditNavAction::None
@@ -2551,7 +2584,7 @@ mod tests {
                 steps: steps.clone(),
                 raw: Default::default(),
             };
-            assert_eq!(curve_steps_sum(&data), (dx, dy), "closure failed for ({dx},{dy},{sx})");
+            assert_eq!(curve_steps_sum_slice(&data.steps), (dx, dy), "closure failed for ({dx},{dy},{sx})");
             assert!(
                 steps.first().unwrap().step_height >= steps.last().unwrap().step_height,
                 "reverse J must start steeper than it ends for ({dx},{dy},{sx}): {steps:?}"

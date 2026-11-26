@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-pub const CURRENT_VERSION: &str = "v1.0.0";
+pub const CURRENT_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
 pub const GITHUB_REPO_URL: &str = "https://github.com/gokhantr/Stoll-Kalip-Editoru";
 pub const GITHUB_API_URL: &str =
     "https://api.github.com/repos/gokhantr/Stoll-Kalip-Editoru/releases/latest";
@@ -56,11 +56,20 @@ where
             }
             Err(err) => UpdateStatus::Unavailable(err),
         };
-        if let Ok(mut guard) = status.lock() {
-            *guard = next;
-        }
+        let mut guard = match status.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = next;
+        drop(guard);
         on_done();
     });
+}
+
+/// Validate that a URL uses an explicit `https://` or `http://` scheme before invoking ShellExecuteW.
+pub fn is_safe_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://") || trimmed.starts_with("http://")
 }
 
 /// Fetch and parse GitHub latest release metadata using `GITHUB_API_URL`.
@@ -72,9 +81,63 @@ pub fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     parse_github_release_json(&body)
 }
 
+/// Format raw Markdown release notes from GitHub's `body` field into a clean, bounded summary.
+pub fn format_release_notes_summary(body: &str, max_lines: usize, max_chars: usize) -> String {
+    let normalized = body.replace("\r\n", "\n");
+    let mut cleaned = String::with_capacity(normalized.len());
+    let mut rest = normalized.as_str();
+    while let Some(start) = rest.find("<!--") {
+        cleaned.push_str(&rest[..start]);
+        if let Some(end_rel) = rest[start + 4..].find("-->") {
+            rest = &rest[start + 4 + end_rel + 3..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    cleaned.push_str(rest);
+
+    let mut lines: Vec<String> = Vec::new();
+    for raw_line in cleaned.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let line = if let Some(heading) = trimmed.strip_prefix("###") {
+            heading.trim().to_string()
+        } else if let Some(heading) = trimmed.strip_prefix("##") {
+            heading.trim().to_string()
+        } else if let Some(heading) = trimmed.strip_prefix('#') {
+            heading.trim().to_string()
+        } else if let Some(bullet) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            format!("• {}", bullet.trim())
+        } else {
+            trimmed.to_string()
+        };
+        let no_bold = line.replace("**", "");
+        if !no_bold.is_empty() {
+            lines.push(no_bold);
+            if lines.len() >= max_lines {
+                break;
+            }
+        }
+    }
+
+    let joined = lines.join("\n");
+    if joined.chars().count() <= max_chars {
+        return joined;
+    }
+    let mut out: String = joined.chars().take(max_chars.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
 /// Open a URL in the user's default browser without spawning a shell process.
 #[cfg(windows)]
 pub fn open_url_in_browser(url: &str) {
+    if !is_safe_http_url(url) {
+        return;
+    }
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteW(
@@ -162,6 +225,7 @@ pub fn parse_github_release_json(json: &str) -> Result<ReleaseInfo, String> {
             }
             b'{' => {
                 depth += 1;
+                pending_key = None;
                 expecting_value = false;
                 i += 1;
             }
@@ -239,13 +303,13 @@ pub fn parse_github_release_json(json: &str) -> Result<ReleaseInfo, String> {
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| "GitHub yanıtında sürüm etiketi (tag_name) bulunamadı.".to_string())?;
     let html = html_url
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty() && is_safe_http_url(s))
         .unwrap_or_else(|| GITHUB_REPO_URL.to_string());
     let exe_url = asset_urls
         .iter()
-        .find(|u| u.to_ascii_lowercase().ends_with(".exe"))
+        .find(|u| is_safe_http_url(u) && u.to_ascii_lowercase().ends_with(".exe"))
         .cloned()
-        .or_else(|| asset_urls.into_iter().next())
+        .or_else(|| asset_urls.into_iter().find(|u| is_safe_http_url(u)))
         .unwrap_or_else(|| html.clone());
 
     Ok(ReleaseInfo {
@@ -310,10 +374,28 @@ fn decode_json_string(json: &str, start_quote: usize) -> Result<(String, usize),
                         .ok_or_else(|| "Eksik \\uXXXX dizisi.".to_string())?;
                     let code = u16::from_str_radix(hex, 16)
                         .map_err(|_| "Geçersiz \\uXXXX dizisi.".to_string())?;
+                    i += 5;
+                    if (0xD800..=0xDBFF).contains(&code) {
+                        if json.as_bytes().get(i..i + 2) == Some(b"\\u") {
+                            if let Some(low_hex) = json.get(i + 2..i + 6) {
+                                if let Ok(low) = u16::from_str_radix(low_hex, 16) {
+                                    if (0xDC00..=0xDFFF).contains(&low) {
+                                        let cp = 0x10000
+                                            + (((code as u32 - 0xD800) << 10)
+                                                | (low as u32 - 0xDC00));
+                                        if let Some(ch) = char::from_u32(cp) {
+                                            out.push(ch);
+                                        }
+                                        i += 6;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some(ch) = char::from_u32(code as u32) {
                         out.push(ch);
                     }
-                    i += 5;
                 }
                 other => {
                     out.push(other as char);
@@ -613,5 +695,12 @@ mod tests {
             "https://github.com/gokhantr/Stoll-Kalip-Editoru/releases/download/v1.0.1/Stoll_Kalip_Editoru.exe"
         );
         assert!(parsed.body_notes.contains("Kavis ve kopyala"));
+
+        let summary = format_release_notes_summary(
+            "<!-- comment -->\r\n### Yenilikler\r\n- **Kavis** düzeltildi\r\n* İkon eklendi\r\n",
+            6,
+            200,
+        );
+        assert_eq!(summary, "Yenilikler\n• Kavis düzeltildi\n• İkon eklendi");
     }
 }

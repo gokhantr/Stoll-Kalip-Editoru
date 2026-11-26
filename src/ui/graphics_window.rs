@@ -497,8 +497,11 @@ impl GraphicsWindowState {
                         (base_color, 1.0_f32)
                     };
 
-                    for w in screen_pts.windows(2) {
-                        painter.line_segment([w[0], w[1]], Stroke::new(stroke_w, stroke_col));
+                    if screen_pts.len() >= 2 {
+                        painter.add(egui::Shape::line(
+                            screen_pts.clone(),
+                            Stroke::new(stroke_w, stroke_col),
+                        ));
                     }
 
                     // Endpoint dots on selected segment

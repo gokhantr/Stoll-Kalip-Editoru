@@ -93,6 +93,8 @@ pub fn copy_line(doc: &FormDocument, elem_idx: usize, side: LineSide, row_idx: u
 
 /// Paste/replace a line segment (`Çizgi Değiştir`, `Ctrl+V`, `50576`).
 /// Assigns fresh GUIDs & TagID so Stoll never encounters duplicate IDs.
+/// Protects `BaseLine` (`Temel`) invariant: refuses to overwrite a locked `Temel` row unless source is `BaseLine`,
+/// and remaps `BaseLine` -> `None` when pasting onto `row_idx > 0`.
 pub fn paste_line(
     doc: &mut FormDocument,
     elem_idx: usize,
@@ -101,15 +103,24 @@ pub fn paste_line(
     source: &LineSegment,
 ) -> bool {
     let endline_dists = snapshot_endline_distances(doc);
+    let Some(el_check) = doc.elements.get(elem_idx) else {
+        return false;
+    };
+    if row_idx >= el_check.lines(side).len() {
+        return false;
+    }
+    if el_check.is_base_line_row(side, row_idx) && source.function != LineFunction::BaseLine {
+        return false;
+    }
     let tag_id = doc.next_line_tag_id();
     let Some(el) = doc.elements.get_mut(elem_idx) else {
         return false;
     };
     let lines = el.lines_mut(side);
-    if row_idx >= lines.len() {
-        return false;
-    }
     let mut cloned = source.clone();
+    if row_idx > 0 && cloned.function == LineFunction::BaseLine {
+        cloned.function = LineFunction::None;
+    }
     cloned.tag_id = tag_id;
     cloned.guid_id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
     cloned.param_guid_id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
@@ -118,6 +129,43 @@ pub fn paste_line(
     sync_all_endline_elements(doc, &endline_dists);
     doc.dirty = true;
     true
+}
+
+/// Insert a cloned line segment BEFORE `row_idx` (`Ekle+Yapıştır`, `Ctrl+Shift+V`) with a single fresh `TagID` & GUIDs.
+pub fn paste_insert_line(
+    doc: &mut FormDocument,
+    elem_idx: usize,
+    side: LineSide,
+    row_idx: usize,
+    source: &LineSegment,
+) -> Option<usize> {
+    let endline_dists = snapshot_endline_distances(doc);
+    let tag_id = doc.next_line_tag_id();
+    let el = doc.elements.get_mut(elem_idx)?;
+    let is_cutout = matches!(
+        el.element_type(),
+        ElementType::Neckline | ElementType::Armhole | ElementType::Hole | ElementType::Opening
+    );
+    let lines = el.lines_mut(side);
+    let pos = row_idx.min(lines.len());
+    let mut cloned = source.clone();
+    if (pos > 0 || is_cutout) && cloned.function == LineFunction::BaseLine {
+        cloned.function = LineFunction::None;
+    }
+    cloned.tag_id = tag_id;
+    cloned.guid_id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    cloned.param_guid_id = format!("{{{}}}", uuid::Uuid::new_v4().to_string().to_uppercase());
+    cloned.index = (pos + 1) as i32;
+    lines.insert(pos, cloned);
+    if side == LineSide::Right {
+        el.has_right_lines_section = true;
+    } else {
+        el.has_left_lines_section = true;
+    }
+    el.renumber_lines(side);
+    sync_all_endline_elements(doc, &endline_dists);
+    doc.dirty = true;
+    Some(pos)
 }
 
 /// Add a new shape element (`Yeni Eleman`, `50560`) matching Stoll VecFormEditor 1:1 (`[ENG-03]`):
@@ -340,10 +388,24 @@ pub fn sync_mirrored_right_lines(doc: &mut FormDocument, elem_idx: usize) {
     el.has_right_lines_section = !el.right_lines.is_empty();
     el.renumber_lines(LineSide::Right);
 
-    // Also mirror standalone markers (`[PunkteLinks]` -> `[PunkteRechts]`)
+    // Also mirror standalone markers (`[PunkteLinks]` -> `[PunkteRechts]`), preserving/allocating unique PunktTagIds
+    let left_pt_count = doc.elements[elem_idx].left_points.len();
+    let mut new_pt_tag_ids = Vec::with_capacity(left_pt_count);
+    for i in 0..left_pt_count {
+        let existing_pt_tag = doc.elements[elem_idx]
+            .right_points
+            .get(i)
+            .map(|p| p.punkt_tag_id)
+            .filter(|&t| t > 0);
+        let tag = existing_pt_tag.unwrap_or_else(|| doc.next_point_tag_id());
+        new_pt_tag_ids.push(tag);
+    }
+
+    let el = &mut doc.elements[elem_idx];
     let mut mirrored_pts = Vec::with_capacity(el.left_points.len());
-    for pt in &el.left_points {
+    for (i, pt) in el.left_points.iter().enumerate() {
         let mut rpt = pt.clone();
+        rpt.punkt_tag_id = new_pt_tag_ids[i];
         for off in &mut rpt.offsets {
             off.x = -off.x;
         }
@@ -574,15 +636,19 @@ pub fn paste_replace_markers(
     start_row: usize,
     source: &[PointEntry],
 ) -> usize {
-    if source.is_empty() {
+    if source.is_empty() || elem_idx >= doc.elements.len() {
         return 0;
     }
+    let mut cloned_list: Vec<PointEntry> = Vec::with_capacity(source.len());
+    for src in source {
+        let mut pt = src.clone();
+        pt.punkt_tag_id = doc.next_point_tag_id();
+        cloned_list.push(pt);
+    }
     let is_mirrored;
-    let mut count = 0usize;
+    let count = cloned_list.len();
     {
-        let Some(el) = doc.elements.get_mut(elem_idx) else {
-            return 0;
-        };
+        let el = &mut doc.elements[elem_idx];
         is_mirrored = el.mirrored;
         let pts = match side {
             LineSide::Left => {
@@ -594,14 +660,13 @@ pub fn paste_replace_markers(
                 &mut el.right_points
             }
         };
-        for (i, src) in source.iter().enumerate() {
+        for (i, pt) in cloned_list.into_iter().enumerate() {
             let idx = start_row + i;
             if idx < pts.len() {
-                pts[idx] = src.clone();
+                pts[idx] = pt;
             } else {
-                pts.push(src.clone());
+                pts.push(pt);
             }
-            count += 1;
         }
         renumber_points(pts);
     }
@@ -620,15 +685,19 @@ pub fn paste_insert_markers(
     before_row: usize,
     source: &[PointEntry],
 ) -> usize {
-    if source.is_empty() {
+    if source.is_empty() || elem_idx >= doc.elements.len() {
         return 0;
     }
+    let mut cloned_list: Vec<PointEntry> = Vec::with_capacity(source.len());
+    for src in source {
+        let mut pt = src.clone();
+        pt.punkt_tag_id = doc.next_point_tag_id();
+        cloned_list.push(pt);
+    }
     let is_mirrored;
-    let mut count = 0usize;
+    let count = cloned_list.len();
     {
-        let Some(el) = doc.elements.get_mut(elem_idx) else {
-            return 0;
-        };
+        let el = &mut doc.elements[elem_idx];
         is_mirrored = el.mirrored;
         let pts = match side {
             LineSide::Left => {
@@ -641,9 +710,8 @@ pub fn paste_insert_markers(
             }
         };
         let base = before_row.min(pts.len());
-        for (i, src) in source.iter().enumerate() {
-            pts.insert(base + i, src.clone());
-            count += 1;
+        for (i, pt) in cloned_list.into_iter().enumerate() {
+            pts.insert(base + i, pt);
         }
         renumber_points(pts);
     }
@@ -683,9 +751,14 @@ pub fn parse_external_table_lines(
             continue;
         }
 
-        let parse_f = |s: &str| -> Option<f64> { s.replace(',', ".").parse::<f64>().ok() };
+        let parse_f = |s: &str| -> Option<f64> {
+            s.replace(',', ".")
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+        };
         let Some(boy_val) = parse_f(cols[0]) else {
-            continue; // skip header row
+            continue; // skip header or non-finite row
         };
         let Some(en_val) = parse_f(cols[1]) else {
             continue;
@@ -697,12 +770,12 @@ pub fn parse_external_table_lines(
         };
 
         if header.input_format == InputFormat::Mm {
-            seg.height_mm = boy_val;
-            seg.width_mm = en_val;
+            seg.height_mm = boy_val.clamp(-100_000.0, 100_000.0);
+            seg.width_mm = en_val.clamp(-100_000.0, 100_000.0);
             recalc_line_from_mm(&mut seg, header);
         } else {
-            seg.rows = boy_val.round() as i32;
-            seg.stitches = en_val.round() as i32;
+            seg.rows = boy_val.round().clamp(-100_000.0, 100_000.0) as i32;
+            seg.stitches = en_val.round().clamp(-100_000.0, 100_000.0) as i32;
             if cols.len() >= 5 {
                 if let (Some(sy), Some(sx)) = (
                     cols[2].parse::<i32>().ok(),
