@@ -9,21 +9,25 @@ use stoll_kalip_editoru::io::bitmap::{decode_muster_bitmap, render_muster_bitmap
 use stoll_kalip_editoru::io::parser::decode_form_utf16le;
 use stoll_kalip_editoru::io::serializer::{encode_form_utf16le, serialize_form_text};
 use stoll_kalip_editoru::io::{
-    load_curve_file, load_file, load_from_bytes, parse_dxf_contour, save_curve_file, save_file,
-    save_to_bytes, save_to_bytes_with_options, SaveOptions,
+    load_file, load_form_curve, load_form_curve_from_bytes, load_from_bytes, parse_dxf_contour,
+    save_file, save_form_curve, save_form_curve_to_bytes, save_to_bytes,
+    save_to_bytes_with_options, SaveOptions,
 };
 use stoll_kalip_editoru::math::{
     add_element, append_line, apply_curve_to_line, apply_directives_to_lines, apply_guidelines,
-    apply_standard_preset_to_line, auto_detect_line_function_for_element, calculate_and_set_stufung,
-    compute_range_summary, convert_input_format, copy_line, copy_markers, curve_steps_sum,
-    delete_element, delete_line, element_distance_from_top, evaluate_document_geometry,
-    generate_curve_steps, import_external_table_lines, insert_line_before, mm_to_rows,
-    mm_to_stitches, multiply_marking_points, paste_insert_markers, paste_line,
-    paste_replace_markers, recalc_document_for_density_change, recalc_line_from_mm,
+    apply_standard_preset_to_line, apply_standard_widths_to_all,
+    auto_detect_line_function_for_element, auto_sync_closing_lines, calculate_and_set_stufung,
+    check_curve_feasibility, closing_line_index, compute_range_summary, convert_input_format,
+    copy_line, copy_markers, curve_steps_sum, delete_element, delete_line,
+    detect_even_courses_from_steps, element_distance_from_top, evaluate_document_geometry,
+    expand_curve_steps, extract_curve_module_widths, generate_curve_steps,
+    import_external_table_lines, insert_line_before, mirror_curve_steps_single_system, mm_to_rows,
+    mm_to_stitches, multiply_marking_points, normalize_curve_groups, paste_insert_markers,
+    paste_line, paste_replace_markers, recalc_document_for_density_change, recalc_line_from_mm,
     recalc_line_from_step_edit, recalc_line_from_steps, recalc_line_from_stitches_and_rows,
-    resample_user_curve, rows_to_mm, set_element_distance_from_top, stitches_to_mm,
-    swap_left_right, sync_mirrored_right_lines, update_or_append_closing_line, validate_document,
-    CurveGenParams,
+    resample_user_curve, resolve_curve_module_widths, rows_to_mm, set_element_distance_from_top,
+    stitches_to_mm, swap_left_right, sync_mirrored_right_lines, update_or_append_closing_line,
+    validate_document, CourseParityMode, CurveGenParams, CurveStepDrive,
 };
 use stoll_kalip_editoru::model::{
     BindingOffProps, CurveData, CurveForm, ElementType, FormDocument, InputFormat, KanteChildSlot,
@@ -59,7 +63,8 @@ fn make_sample_rect_doc() -> FormDocument {
         stitches: 75,
         rows: 0,
         function: LineFunction::None,
-        last_line: 1,
+        last_line: 0,
+        default_widening: 1,
         ..Default::default()
     };
     recalc_line_from_stitches_and_rows(&mut l3, &hdr);
@@ -186,6 +191,7 @@ fn test_exact_disassembled_j_and_s_curves() {
         narrowing_width: 2,
         widening_width: 0,
         fade_out_width: 2,
+        ..Default::default()
     });
     let j_tuples: Vec<(i32, i32, i32)> = j_steps
         .iter()
@@ -205,6 +211,7 @@ fn test_exact_disassembled_j_and_s_curves() {
         narrowing_width: 6,
         widening_width: 0,
         fade_out_width: 2,
+        ..Default::default()
     });
     let s_tuples: Vec<(i32, i32, i32)> = s_steps
         .iter()
@@ -296,6 +303,7 @@ fn test_all_curve_forms_closure_and_resampling() {
             narrowing_width: 6,
             widening_width: 0,
             fade_out_width: 2,
+            ..Default::default()
         };
         let steps = generate_curve_steps(&params);
         assert!(!steps.is_empty(), "Curve steps must not be empty for {form:?}");
@@ -545,12 +553,13 @@ fn test_phase2_engine_parity_eng01_to_eng13() {
         assert_eq!(cat.bind_off_type_for_guid(&ra_list[0].guid), 1);
     }
 
-    // [ENG-10] .crv save & load round-trip
+    // [ENG-10] .FormCurve (OLE2 CFB v3) save & load round-trip
     let crv_steps = generate_curve_steps(&CurveGenParams {
         curve_form: CurveForm::JCurve,
         total_dx: 14,
         total_dy: 30,
         step_x: 2,
+        narrowing_width: 6,
         ..Default::default()
     });
     let crv = CurveData {
@@ -558,9 +567,9 @@ fn test_phase2_engine_parity_eng01_to_eng13() {
         steps: crv_steps,
         raw: Default::default(),
     };
-    let tmp_crv = std::env::temp_dir().join("kalipeditor_test_curve.crv");
-    save_curve_file(&crv, &tmp_crv).unwrap();
-    let loaded_crv = load_curve_file(&tmp_crv).unwrap();
+    let tmp_crv = std::env::temp_dir().join("kalipeditor_test_curve.FormCurve");
+    save_form_curve(&tmp_crv, &crv).unwrap();
+    let loaded_crv = load_form_curve(&tmp_crv).unwrap();
     let _ = std::fs::remove_file(&tmp_crv);
     assert_eq!(loaded_crv.function, CurveForm::JCurve.to_id());
     assert_eq!(curve_steps_sum(&loaded_crv), (14, 30));
@@ -885,6 +894,8 @@ fn test_5_fixes_axis_geometry_row1_closing_none_and_settings_bundle() {
         default_template_index: 0,
         auto_apply_default_template: true,
         snap_even_rows: true,
+        default_even_courses: true,
+        splitter_width: Some(540.0),
         show_dimensions: false,
         show_detail_columns: true,
         custom_stoll_defaultform_path: Some(Path::new(r"D:\Stoll\M1plus\8.0.010\ConfigData\defaultform.shp").to_path_buf()),
@@ -893,6 +904,7 @@ fn test_5_fixes_axis_geometry_row1_closing_none_and_settings_bundle() {
         window_w: Some(1400),
         window_h: Some(900),
         window_maximized: true,
+        always_on_top: true,
         ignored_update_version: Some("v1.0.1".to_string()),
     };
     let ini_path = src_dir.join("settings.ini");
@@ -1159,6 +1171,7 @@ fn test_audit_bug_fixes_elemanlar_math_and_ops() {
             narrowing_width: 1,
             widening_width: 0,
             fade_out_width: 0,
+            ..Default::default()
         }),
         ..Default::default()
     });
@@ -1548,4 +1561,502 @@ fn test_function_window_stoll_1to1_invariants() {
             .all(|m| !m.name.eq_ignore_ascii_case("Yeni modül grubu")
                 && !m.name.eq_ignore_ascii_case("Neue Modulgruppe")));
     }
+}
+
+#[test]
+fn test_big_polish_formcurve_grouping_parity_and_ops() {
+    // 1. Real Stoll .FormCurve & .shp reference files (CI-safe Path::exists() guard)
+    let real_fc = r"C:\Users\gokha\Desktop\Yeni klasör (7)\vecformeditor-satireditoru-kayitdosyasi.FormCurve";
+    if Path::new(real_fc).exists() {
+        let fc = load_form_curve(real_fc).unwrap();
+        assert_eq!(fc.function, 3);
+        assert_eq!(fc.steps.len(), 7);
+        assert_eq!(fc.steps[5].group_factor, 2);
+        assert_eq!(fc.steps[5].group_tag_id, 1);
+        assert_eq!(fc.steps[6].group_factor, 0);
+        assert_eq!(fc.steps[6].group_tag_id, 1);
+        assert!(fc.steps.iter().all(|s| s.narrowing_width == 6));
+        assert_eq!(curve_steps_sum(&fc), (26, 40));
+
+        // Round-trip .FormCurve bytes preserves grouping without flattening
+        let fc_bytes = save_form_curve_to_bytes(&fc).unwrap();
+        assert_eq!(u16::from_le_bytes([fc_bytes[26], fc_bytes[27]]), 3);
+        assert_eq!(u32::from_le_bytes([fc_bytes[40], fc_bytes[41], fc_bytes[42], fc_bytes[43]]), 0);
+        let fc_rt = load_form_curve_from_bytes(&fc_bytes).unwrap();
+        assert_eq!(fc_rt.steps.len(), 7);
+        assert_eq!(fc_rt.steps[5].group_factor, 2);
+        assert_eq!(fc_rt.steps[6].group_factor, 0);
+        assert_eq!(curve_steps_sum(&fc_rt), (26, 40));
+
+        let tmp_fc = std::env::temp_dir().join("kalipeditor_big_polish_rt.FormCurve");
+        save_form_curve(&tmp_fc, &fc).unwrap();
+        #[cfg(target_os = "windows")]
+        assert_windows_stg_open_storage_ok(&tmp_fc);
+        let _ = std::fs::remove_file(&tmp_fc);
+    }
+
+    let real_shp = r"C:\Users\gokha\Desktop\Yeni klasör (7)\test-vecformeditor.shp";
+    if Path::new(real_shp).exists() {
+        assert_lossless_roundtrip_file(real_shp);
+        let shp_doc = load_file(real_shp).unwrap();
+        let geom = evaluate_document_geometry(&shp_doc);
+        // Kante 4 (index 3) has grouped [KurvenLinie] rows 6..7 -> total expanded polyline must reach (dx=26, dy=40)
+        let k4_seg = &geom.elements[0].left_segments[3];
+        assert_eq!(k4_seg.delta_st, (26, 40));
+        assert!(k4_seg.polyline_st.len() > 14);
+    }
+
+    // 2. Grouping normalization & expansion
+    let mut g_steps = vec![
+        stoll_kalip_editoru::model::CurveStep {
+            step_width: 2,
+            step_height: 4,
+            group_tag_id: 1,
+            group_factor: 3,
+            factor: 1,
+            ..Default::default()
+        },
+        stoll_kalip_editoru::model::CurveStep {
+            step_width: 2,
+            step_height: 5,
+            group_tag_id: 1,
+            group_factor: 3,
+            factor: 1,
+            ..Default::default()
+        },
+    ];
+    normalize_curve_groups(&mut g_steps);
+    assert_eq!(g_steps[0].group_factor, 3);
+    assert_eq!(g_steps[1].group_factor, 0);
+    assert_eq!(expand_curve_steps(&g_steps).len(), 6);
+    assert_eq!(curve_steps_sum(&CurveData { function: 3, steps: g_steps, raw: Default::default() }), (12, 27));
+
+    // 3. MindernBreite / ZunehmenBreite / AusblendenBreite defaults (Reglan NEVER defaults to (0, 1))
+    let reglan_line = LineSegment {
+        function: LineFunction::Narrowing,
+        stitches: 14,
+        rows: 30,
+        ..Default::default()
+    };
+    assert_eq!(extract_curve_module_widths(&reglan_line), (6, 0, 0));
+    assert_eq!(resolve_curve_module_widths(&reglan_line, 4, 2, 1), (4, 0, 1));
+
+    let widen_line = LineSegment {
+        function: LineFunction::Widening,
+        stitches: -10,
+        rows: 30,
+        ..Default::default()
+    };
+    assert_eq!(extract_curve_module_widths(&widen_line), (0, 1, 0));
+
+    // 4. [Kante] default fields alignment on new LineSegment
+    let fresh_line = LineSegment::default();
+    assert_eq!(fresh_line.default_used, 0);
+    assert_eq!(fresh_line.start_ref_element, Some(1));
+    assert_eq!(fresh_line.border_filling, Some(0));
+    assert_eq!(fresh_line.fill_color, Some(255));
+    assert_eq!(fresh_line.border_option_inside, Some(1));
+    assert_eq!(fresh_line.border_option_color, Some(255));
+    let mut fresh_doc = make_sample_rect_doc();
+    let ser_txt = serialize_form_text(&fresh_doc);
+    assert!(ser_txt.contains("StartbezugElement = 1"));
+    assert!(ser_txt.contains("BorderFilling = 0"));
+    assert!(ser_txt.contains("FillColor = 255"));
+    assert!(ser_txt.contains("BorderOptionInside = 1"));
+    assert!(ser_txt.contains("BorderOptionColor = 255"));
+
+    // 5. auto_sync_closing_lines keeps user function and sum_x == 0
+    fresh_doc.elements[0].left_lines[2].function = LineFunction::BindOff;
+    fresh_doc.elements[0].left_lines[2].user_set_function = true;
+    fresh_doc.elements[0].left_lines[1].stitches = 15;
+    recalc_line_from_stitches_and_rows(&mut fresh_doc.elements[0].left_lines[1], &fresh_doc.header);
+    assert!(auto_sync_closing_lines(&mut fresh_doc));
+    assert_eq!(closing_line_index(&fresh_doc.elements[0], LineSide::Left), Some(2));
+    assert_eq!(fresh_doc.elements[0].left_lines[2].stitches, 60);
+    assert_eq!(fresh_doc.elements[0].left_lines[2].function, LineFunction::BindOff);
+    let sx_total: i32 = fresh_doc.elements[0].left_lines.iter().map(|l| l.stitches).sum();
+    assert_eq!(sx_total, 0);
+
+    // 6. apply_standard_widths_to_all updates lines + [KurvenLinie] widths
+    let mut std_doc = make_sample_rect_doc();
+    let hdr = std_doc.header.clone();
+    std_doc.elements[0].left_lines[1].function = LineFunction::Narrowing;
+    std_doc.elements[0].left_lines[1].stitches = 14;
+    std_doc.elements[0].left_lines[1].rows = 30;
+    let j_steps = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_x: 2,
+        ..Default::default()
+    });
+    apply_curve_to_line(&mut std_doc.elements[0].left_lines[1], &hdr, CurveForm::JCurve, j_steps);
+    let updated = apply_standard_widths_to_all(&mut std_doc, 6, 2, 4);
+    assert_eq!(updated, 1);
+    let k1 = &std_doc.elements[0].left_lines[1];
+    assert_eq!(k1.narrowing.as_ref().unwrap().modules[0].width, 6);
+    assert!(k1.curve.as_ref().unwrap().steps.iter().all(|s| s.narrowing_width == 6 && s.widening_width == 0));
+
+    // 7. Çift May, Tek Sistem (Right Even / Left Odd), and ByWidth vs ByHeight across all forms
+    for (form, rev_j) in [
+        (CurveForm::Line, false),
+        (CurveForm::JCurve, false),
+        (CurveForm::UserCurve, true),
+        (CurveForm::SCurve, false),
+    ] {
+        {
+            for drive in [CurveStepDrive::ByWidth, CurveStepDrive::ByHeight] {
+                let even_steps = generate_curve_steps(&CurveGenParams {
+                    curve_form: form,
+                    total_dx: 16,
+                    total_dy: 40,
+                    step_x: 2,
+                    step_y: 4,
+                    narrowing_width: 6,
+                    parity_mode: CourseParityMode::EvenCourses,
+                    step_drive: drive,
+                    reverse_j: rev_j,
+                    ..Default::default()
+                });
+                assert_eq!(
+                    curve_steps_sum(&CurveData {
+                        function: form.to_id(),
+                        steps: even_steps.clone(),
+                        raw: Default::default()
+                    }),
+                    (16, 40)
+                );
+                assert!(
+                    even_steps.iter().all(|s| s.step_height % 2 == 0),
+                    "EvenCourses step_height must be even for {form:?} {drive:?}"
+                );
+
+                let left_odd = generate_curve_steps(&CurveGenParams {
+                    curve_form: form,
+                    total_dx: 16,
+                    total_dy: 40,
+                    step_x: 2,
+                    step_y: 2,
+                    narrowing_width: 6,
+                    parity_mode: CourseParityMode::SingleSystemLeftOdd,
+                    step_drive: drive,
+                    reverse_j: rev_j,
+                    ..Default::default()
+                });
+                assert_eq!(
+                    curve_steps_sum(&CurveData {
+                        function: form.to_id(),
+                        steps: left_odd.clone(),
+                        raw: Default::default()
+                    }),
+                    (16, 40)
+                );
+                // First shaping step on Left odd starts on an odd course; all shaping cumulative rows are odd
+                let mut cum_y = 0i32;
+                for (dx_s, dy_s) in expand_curve_steps(&left_odd) {
+                    cum_y += dy_s;
+                    if dx_s != 0 {
+                        assert_eq!(cum_y % 2, 1, "Left Tek Sistem shaping must land on odd course, got {cum_y}");
+                    }
+                }
+
+                let right_mir = mirror_curve_steps_single_system(&left_odd, true);
+                assert_eq!(
+                    curve_steps_sum(&CurveData {
+                        function: form.to_id(),
+                        steps: right_mir.clone(),
+                        raw: Default::default()
+                    }),
+                    (-16, 40)
+                );
+                let mut r_cum = 0i32;
+                for (dx_s, dy_s) in expand_curve_steps(&right_mir) {
+                    r_cum += dy_s;
+                    if dx_s != 0 {
+                        assert_eq!(r_cum % 2, 0, "Right Tek Sistem shaping must land on even course, got {r_cum}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Also verify UserCurve + reverse_j explicitly in both ByWidth and ByHeight
+    let rj_w = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::UserCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_x: 2,
+        narrowing_width: 6,
+        parity_mode: CourseParityMode::EvenCourses,
+        step_drive: CurveStepDrive::ByWidth,
+        reverse_j: true,
+        ..Default::default()
+    });
+    assert_eq!(curve_steps_sum(&CurveData { function: 5, steps: rj_w.clone(), raw: Default::default() }), (14, 30));
+    assert!(rj_w.iter().all(|s| s.step_height % 2 == 0));
+
+    let rj_h = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::UserCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_y: 4,
+        narrowing_width: 6,
+        parity_mode: CourseParityMode::SingleSystemRightEven,
+        step_drive: CurveStepDrive::ByHeight,
+        reverse_j: true,
+        ..Default::default()
+    });
+    assert_eq!(curve_steps_sum(&CurveData { function: 5, steps: rj_h.clone(), raw: Default::default() }), (14, 30));
+    assert!(rj_h.iter().all(|s| s.step_height % 2 == 0));
+
+    // Verify sync_mirrored_right_lines preserves 1-course single-system offset when single_system_curve == true
+    let mut ss_doc = make_sample_rect_doc();
+    let ss_hdr = ss_doc.header.clone();
+    let left_ss = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_x: 2,
+        narrowing_width: 6,
+        parity_mode: CourseParityMode::SingleSystemLeftOdd,
+        ..Default::default()
+    });
+    ss_doc.elements[0].left_lines[1].function = LineFunction::Narrowing;
+    ss_doc.elements[0].left_lines[1].single_system_curve = true;
+    apply_curve_to_line(&mut ss_doc.elements[0].left_lines[1], &ss_hdr, CurveForm::JCurve, left_ss);
+    sync_mirrored_right_lines(&mut ss_doc, 0);
+    let r_curve = ss_doc.elements[0].right_lines[1].curve.as_ref().unwrap();
+    assert_eq!(curve_steps_sum(r_curve), (-14, 30));
+    let mut rc = 0i32;
+    for (dx_s, dy_s) in expand_curve_steps(&r_curve.steps) {
+        rc += dy_s;
+        if dx_s != 0 {
+            assert_eq!(rc % 2, 0);
+        }
+    }
+}
+
+#[test]
+fn test_min_may_strict_step_x_and_cift_may_detection() {
+    // 1. Feasible Min May: strictly preserves `step_x = 1` (NEVER merges into 2!) and guarantees `|dy| >= eff_min`
+    for (form, rev_j) in [
+        (CurveForm::Line, false),
+        (CurveForm::JCurve, false),
+        (CurveForm::SCurve, false),
+        (CurveForm::UserCurve, true),
+    ] {
+        for parity in [
+            CourseParityMode::Any,
+            CourseParityMode::EvenCourses,
+            CourseParityMode::SingleSystemRightEven,
+            CourseParityMode::SingleSystemLeftOdd,
+        ] {
+            let params = CurveGenParams {
+                curve_form: form,
+                total_dx: 10,
+                total_dy: 30,
+                step_x: 1,
+                narrowing_width: 6,
+                parity_mode: parity,
+                step_drive: CurveStepDrive::ByWidth,
+                reverse_j: rev_j,
+                min_step_height: 2,
+                ..Default::default()
+            };
+            let feas = check_curve_feasibility(&params);
+            assert!(feas.feasible, "Expected feasible for {form:?} {parity:?}: {feas:?}");
+            assert!(feas.warning_tr.is_none());
+
+            let steps = generate_curve_steps(&params);
+            assert_eq!(
+                curve_steps_sum(&CurveData {
+                    function: form.to_id(),
+                    steps: steps.clone(),
+                    raw: Default::default(),
+                }),
+                (10, 30),
+                "Closure failed for {form:?} {parity:?}"
+            );
+            let expanded = expand_curve_steps(&steps);
+            let mut cum_y = 0i32;
+            for &(dx_s, dy_s) in &expanded {
+                cum_y += dy_s;
+                if dx_s != 0 {
+                    assert_eq!(
+                        dx_s, 1,
+                        "En Basamağı = 1 must NEVER be merged for {form:?} {parity:?}, got {dx_s}"
+                    );
+                    assert!(
+                        dy_s.abs() >= feas.effective_min_height,
+                        "step_height {dy_s} < eff_min {} for {form:?} {parity:?}",
+                        feas.effective_min_height
+                    );
+                    if matches!(
+                        parity,
+                        CourseParityMode::EvenCourses | CourseParityMode::SingleSystemRightEven
+                    ) {
+                        assert_eq!(dy_s % 2, 0, "Expected even step_height for {form:?} {parity:?}");
+                    } else if parity == CourseParityMode::SingleSystemLeftOdd {
+                        assert_eq!(cum_y % 2, 1, "Expected odd cumulative y for Left Tek Sistem");
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Infeasible Min May: returns Turkish warning AND does NOT merge/corrupt `step_x = 1`
+    let infeas_params = CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 10,
+        total_dy: 16,
+        step_x: 1,
+        parity_mode: CourseParityMode::EvenCourses,
+        step_drive: CurveStepDrive::ByWidth,
+        min_step_height: 2,
+        ..Default::default()
+    };
+    let infeas = check_curve_feasibility(&infeas_params);
+    assert!(!infeas.feasible);
+    assert_eq!(infeas.required_min_dy, 20);
+    assert_eq!(infeas.actual_dy, 16);
+    let warn = infeas.warning_tr.expect("expected Turkish warning");
+    assert!(warn.contains("en az 20 may boy gerekir"), "got: {warn}");
+
+    let fallback_steps = generate_curve_steps(&infeas_params);
+    assert_eq!(
+        curve_steps_sum(&CurveData {
+            function: CurveForm::JCurve.to_id(),
+            steps: fallback_steps.clone(),
+            raw: Default::default(),
+        }),
+        (10, 16)
+    );
+    assert!(
+        fallback_steps.iter().all(|s| s.step_width == 1),
+        "Infeasible Min May must not merge step_x = 1: {fallback_steps:?}"
+    );
+
+    // 3. `Çift May` auto-detection on reopen (zero non-Stoll `.shp` fields)
+    let even_steps = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_x: 2,
+        parity_mode: CourseParityMode::EvenCourses,
+        ..Default::default()
+    });
+    assert!(detect_even_courses_from_steps(&even_steps, false));
+    assert!(!detect_even_courses_from_steps(&even_steps, true));
+
+    let mixed_steps = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 14,
+        total_dy: 30,
+        step_x: 2,
+        parity_mode: CourseParityMode::Any,
+        ..Default::default()
+    });
+    assert!(!detect_even_courses_from_steps(&mixed_steps, false));
+}
+
+#[test]
+fn test_orj_vs_biz_closing_row_parity() {
+    use stoll_kalip_editoru::math::ensure_all_closing_lines;
+
+    // If reference orj-test.shp exists on disk, verify 100% lossless roundtrip
+    let orj_path = r"C:\Users\gokha\Desktop\Yeni klasör (7)\orj-test.shp";
+    if Path::new(orj_path).exists() {
+        assert_lossless_roundtrip_file(orj_path);
+    }
+
+    // Build a brand-new 2-element shape (Primary + Neckline) matching orj-test.shp
+    let mut doc = FormDocument::new_default_template();
+    let hdr = doc.header.clone();
+
+    // Element 1: Base (-90, 0), Vertical (0, 120), Widening (-10, 20), J-Curve (+30, 60)
+    let r0 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+    doc.elements[0].left_lines[r0].stitches = -90;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[0].left_lines[r0], &hdr);
+
+    let r1 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+    doc.elements[0].left_lines[r1].rows = 120;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[0].left_lines[r1], &hdr);
+
+    let r2 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+    doc.elements[0].left_lines[r2].stitches = -10;
+    doc.elements[0].left_lines[r2].rows = 20;
+    doc.elements[0].left_lines[r2].function = LineFunction::Widening;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[0].left_lines[r2], &hdr);
+
+    let r3 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+    let j1 = generate_curve_steps(&CurveGenParams {
+        curve_form: CurveForm::JCurve,
+        total_dx: 30,
+        total_dy: 60,
+        step_x: 1,
+        narrowing_width: 6,
+        ..Default::default()
+    });
+    apply_curve_to_line(&mut doc.elements[0].left_lines[r3], &hdr, CurveForm::JCurve, j1);
+    doc.elements[0].left_lines[r3].function = LineFunction::Narrowing;
+
+    // Appending a blank row (0, 0) must NOT be hijacked by closing_line_index!
+    let neck_idx = add_element(&mut doc, ElementType::Neckline, None);
+    let n0 = append_line(&mut doc, neck_idx, LineSide::Left).unwrap();
+    doc.elements[neck_idx].left_lines[n0].stitches = -20;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[neck_idx].left_lines[n0], &hdr);
+
+    let n1 = append_line(&mut doc, neck_idx, LineSide::Left).unwrap();
+    doc.elements[neck_idx].left_lines[n1].stitches = -16;
+    doc.elements[neck_idx].left_lines[n1].rows = 30;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[neck_idx].left_lines[n1], &hdr);
+
+    let n2 = append_line(&mut doc, neck_idx, LineSide::Left).unwrap();
+    // Newly appended blank row (rows=0, stitches=0) must NOT be treated as a closing row
+    assert_eq!(closing_line_index(&doc.elements[neck_idx], LineSide::Left), None);
+    assert!(!auto_sync_closing_lines(&mut doc));
+    doc.elements[neck_idx].left_lines[n2].rows = 6;
+    recalc_line_from_stitches_and_rows(&mut doc.elements[neck_idx].left_lines[n2], &hdr);
+
+    // Apply directives & standard widths -> must NEVER set default_widening = 1 on Widening rows!
+    apply_directives_to_lines(&mut doc, 0, LineSide::Left, &[r2], 1, 1, 2);
+    apply_standard_widths_to_all(&mut doc, 6, 1, 2);
+    assert_eq!(doc.elements[0].left_lines[r2].default_widening, 0);
+
+    // Ensure closing lines on all elements (as done on save)
+    assert!(ensure_all_closing_lines(&mut doc));
+
+    for (ei, el) in doc.elements.iter().enumerate() {
+        let c_idx = closing_line_index(el, LineSide::Left)
+            .unwrap_or_else(|| panic!("Element {ei} missing closing line"));
+        for (li, l) in el.left_lines.iter().enumerate() {
+            assert_eq!(l.last_line, 0, "Element {ei} line {li} must have LastLine = 0");
+            if li == c_idx {
+                assert_eq!(l.default_widening, 1, "Closing row must have DefaultZunehmen = 1");
+                assert_eq!(l.default_used, 0, "Closing row must have DefaultUsed = 0");
+                assert!(l.comment.is_empty(), "Closing row must have no Kommentar");
+                assert!(l.fade_out.is_none());
+                assert!(l.narrowing.is_none());
+                assert!(l.widening.is_none());
+                assert!(l.binding_off.is_none());
+                assert!(l.connection_points.is_none());
+                assert!(l.child_order.is_empty());
+            } else {
+                assert_eq!(
+                    l.default_widening, 0,
+                    "Non-closing row Element {ei} line {li} must have DefaultZunehmen = 0"
+                );
+            }
+        }
+        let sum_x: i32 = el.left_lines.iter().map(|l| l.stitches).sum();
+        assert_eq!(sum_x, 0, "Element {ei} must close to 0");
+    }
+
+    // Roundtrip through OLE2 .shp bytes and verify Form stream text has no stale LastLine = 1
+    let bytes = save_to_bytes(&doc).unwrap();
+    let rt = load_from_bytes(&bytes).unwrap();
+    let form_txt = serialize_form_text(&rt);
+    assert!(!form_txt.contains("LastLine = 1"), "Brand-new .shp must never emit LastLine = 1");
+    assert!(form_txt.contains("DefaultZunehmen = 1"), "Closing rows must emit DefaultZunehmen = 1");
+    assert!(!form_txt.contains("[ConnectionPoints]"), "Standard new .shp must not emit empty [ConnectionPoints]");
 }

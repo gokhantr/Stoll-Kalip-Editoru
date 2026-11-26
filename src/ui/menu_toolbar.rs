@@ -291,7 +291,6 @@ pub fn show_menu_bar(
                     ui.separator();
                     ui.checkbox(&mut state.show_detail_columns, "Detay sütunları göster (14 sütun)");
                     ui.checkbox(&mut state.show_dimensions, "Kanvas ölçü etiketleri");
-                    ui.checkbox(&mut state.snap_even_rows, "Çift sıra yakalama (2'şer)");
                     ui.separator();
                     if ui
                         .checkbox(&mut state.show_status_bar, "Statü çubuğu")
@@ -466,21 +465,6 @@ pub fn show_toolbar(
     let elem = doc.elements.get(state.selected_elem);
     let mirrored = elem.map(|e| e.mirrored).unwrap_or(true);
     let in_markers = state.table_mode.is_markers();
-    let active_side = if mirrored {
-        LineSide::Left
-    } else {
-        state.active_table_side
-    };
-
-    // Closure status for active side's lines (dX=0 at end of contour)
-    let (sum_x, sum_y, line_count) = elem
-        .map(|e| {
-            let lines = e.lines(active_side);
-            let sx: i32 = lines.iter().map(|l| l.stitches).sum();
-            let sy: i32 = lines.iter().map(|l| l.rows).sum();
-            (sx, sy, lines.len())
-        })
-        .unwrap_or((0, 0, 0));
 
     Frame::NONE
         .fill(colors::CARD_BG)
@@ -491,24 +475,50 @@ pub fn show_toolbar(
             bottom: 5,
         })
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
 
-                // ── File actions ─────────────────────────────────────────────────
-                if studio_icon_chip(ui, ChipIcon::Bitmap(IconKind::NewFile), "Yeni", "Yeni Kalıp (Ctrl+N)", false, true) {
+                // ── Icon-Only File actions + Always-on-Top Pin ───────────────────
+                if studio_icon_only_btn(
+                    ui,
+                    ChipIcon::Glyph(StudioGlyph::NewFile),
+                    "Yeni Kalıp (Ctrl+N)",
+                    false,
+                    true,
+                ) {
                     actions.push(AppAction::NewFile);
                 }
-                if studio_icon_chip(ui, ChipIcon::Bitmap(IconKind::OpenShp), "Aç .shp", "İlmek Kalıbı (.shp) aç", false, true) {
+                if studio_icon_only_btn(
+                    ui,
+                    ChipIcon::Glyph(StudioGlyph::OpenFile),
+                    "Kalıp Aç (.shp / .shv) (Ctrl+O)",
+                    false,
+                    true,
+                ) {
                     actions.push(AppAction::OpenShp);
                 }
-                if studio_icon_chip(ui, ChipIcon::Bitmap(IconKind::OpenShv), "Aç .shv", "mm Kalıbı (.shv) aç (Ctrl+O)", false, true) {
-                    actions.push(AppAction::OpenShv);
-                }
-                if studio_icon_chip(ui, ChipIcon::Bitmap(IconKind::Save), "Kaydet", "Kalıbı kaydet (Ctrl+S)", false, true) {
+                if studio_icon_only_btn(
+                    ui,
+                    ChipIcon::Glyph(StudioGlyph::SaveFile),
+                    "Kalıbı Kaydet (Ctrl+S)",
+                    false,
+                    true,
+                ) {
                     actions.push(AppAction::Save);
                 }
-                if studio_icon_chip(ui, ChipIcon::None, "Farklı Kaydet", "Adıyla kaydet (F12)", false, true) {
-                    actions.push(AppAction::SaveAs);
+                if studio_icon_only_btn(
+                    ui,
+                    ChipIcon::Glyph(if state.always_on_top {
+                        StudioGlyph::PinActive
+                    } else {
+                        StudioGlyph::Pin
+                    }),
+                    "Her Zaman Üstte (Pencereyi sabitle)",
+                    state.always_on_top,
+                    true,
+                ) {
+                    state.always_on_top = !state.always_on_top;
+                    actions.push(AppAction::ToggleAlwaysOnTop);
                 }
 
                 tb_sep(ui);
@@ -630,8 +640,8 @@ pub fn show_toolbar(
                 if studio_icon_chip(
                     ui,
                     ChipIcon::Glyph(StudioGlyph::Settings),
-                    "Kalıp Ayarları",
-                    "Genel kesim verileri, Standart özellikler ve Yönergeler",
+                    "Ayarlar",
+                    "Genel kesim verileri, varsayılan yoğunluk ve şablon ayarları",
                     state.settings_popover_open,
                     true,
                 ) {
@@ -650,45 +660,10 @@ pub fn show_toolbar(
                 }
 
                 if let Some(tag) = available_update_tag {
-                    if studio_update_pill(ui, tag) {
+                    if studio_flashing_update_alert(ui, tag) {
                         actions.push(AppAction::ShowAbout);
                     }
                 }
-
-                // ── Right-aligned Live Closure Badge ────────────────────────────
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if line_count == 0 {
-                        studio_badge(
-                            ui,
-                            None,
-                            "Boş kalıp",
-                            colors::INPUT_DISABLED_BG,
-                            colors::TEXT_SECONDARY,
-                            colors::BORDER_MID,
-                        );
-                    } else if sum_x == 0 {
-                        studio_badge(
-                            ui,
-                            Some(StudioGlyph::Check),
-                            &format!("dX=0, Boy={sum_y}"),
-                            colors::CLOSING_ROW_GREEN,
-                            colors::CLOSING_ROW_TEXT,
-                            Color32::from_rgb(0x86, 0xEF, 0xAC),
-                        );
-                    } else if studio_fix_closure_button(
-                        ui,
-                        &format!("Kapanışı Düzelt (dX={sum_x})"),
-                        "Konturu merkez eksene (dX=0) kapatmak için bitiş çizgisini ayarla veya ekle",
-                    ) {
-                        state.active_table_side = active_side;
-                        state.table_mode = if active_side == LineSide::Left {
-                            TableMode::LeftLines
-                        } else {
-                            TableMode::RightLines
-                        };
-                        actions.push(AppAction::CreateClosingLine);
-                    }
-                });
             });
         });
 
@@ -705,7 +680,6 @@ pub fn show_toolbar(
 
 #[derive(Clone, Copy)]
 enum ChipIcon {
-    None,
     Bitmap(IconKind),
     Glyph(StudioGlyph),
 }
@@ -713,6 +687,60 @@ enum ChipIcon {
 fn toolbar_micro_icon(ui: &mut Ui, kind: IconKind, size: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     paint_icon(ui.painter(), rect, kind, true);
+}
+
+fn studio_icon_only_btn(
+    ui: &mut Ui,
+    icon: ChipIcon,
+    tooltip: &str,
+    active: bool,
+    enabled: bool,
+) -> bool {
+    let size = vec2(26.0, 24.0);
+    let sense = if enabled {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+
+    let (fill, border) = if !enabled {
+        (colors::INPUT_DISABLED_BG, colors::BORDER_LIGHT)
+    } else if active {
+        (colors::WIN_BLUE_FILL, colors::WIN_BLUE)
+    } else if resp.hovered() {
+        (colors::WIN_BLUE_HOVER, colors::WIN_BLUE)
+    } else {
+        (colors::CARD_BG, colors::BORDER_MID)
+    };
+    let glyph_col = if !enabled {
+        colors::TEXT_DISABLED
+    } else if active {
+        colors::WIN_BLUE
+    } else {
+        colors::TEXT_BLACK
+    };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(4), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(4),
+        Stroke::new(if active { 1.5_f32 } else { 1.0_f32 }, border),
+        egui::StrokeKind::Inside,
+    );
+
+    let ic_rect = Rect::from_center_size(rect.center(), vec2(16.0, 16.0));
+    match icon {
+        ChipIcon::Bitmap(ic) => paint_icon(painter, ic_rect, ic, enabled),
+        ChipIcon::Glyph(gl) => paint_studio_glyph(painter, ic_rect, gl, glyph_col),
+    }
+
+    let clicked = enabled && resp.clicked();
+    if !tooltip.is_empty() {
+        resp.on_hover_text(tooltip);
+    }
+    clicked
 }
 
 fn studio_icon_chip(
@@ -732,9 +760,7 @@ fn studio_icon_chip(
     };
     let font = if active { bold_font(11.0) } else { regular_font(11.0) };
     let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text_col);
-    let has_icon = !matches!(icon, ChipIcon::None);
-    let icon_w = if has_icon { 18.0 } else { 0.0 };
-    let w = (icon_w + galley.size().x + 14.0).max(32.0);
+    let w = (18.0 + galley.size().x + 14.0).max(32.0);
     let h = 24.0;
 
     let sense = if enabled {
@@ -763,16 +789,14 @@ fn studio_icon_chip(
         egui::StrokeKind::Inside,
     );
 
-    let mut text_x = rect.left() + 7.0;
-    match icon {
-        ChipIcon::None => {}
+    let text_x = match icon {
         ChipIcon::Bitmap(ic) => {
             let ic_rect = Rect::from_min_size(
                 egui::pos2(rect.left() + 6.0, rect.center().y - 7.0),
                 vec2(14.0, 14.0),
             );
             paint_icon(painter, ic_rect, ic, enabled);
-            text_x = ic_rect.right() + 4.0;
+            ic_rect.right() + 4.0
         }
         ChipIcon::Glyph(gl) => {
             let ic_rect = Rect::from_min_size(
@@ -780,9 +804,9 @@ fn studio_icon_chip(
                 vec2(14.0, 14.0),
             );
             paint_studio_glyph(painter, ic_rect, gl, text_col);
-            text_x = ic_rect.right() + 4.0;
+            ic_rect.right() + 4.0
         }
-    }
+    };
     painter.galley(
         egui::pos2(text_x, rect.center().y - galley.size().y * 0.5),
         galley,
@@ -796,35 +820,55 @@ fn studio_icon_chip(
     clicked
 }
 
-fn studio_update_pill(ui: &mut Ui, tag: &str) -> bool {
-    let text_col = Color32::from_rgb(0x03, 0x69, 0xA1);
+fn studio_flashing_update_alert(ui: &mut Ui, tag: &str) -> bool {
+    // Request periodic repaint ONLY while this update alert is visible (~2 Hz pulse).
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(250));
+    let t = ui.input(|i| i.time);
+    let pulse = ((t * std::f64::consts::TAU * 2.0).sin() * 0.5 + 0.5) as f32;
+
+    let label = format!("Yeni sürüm çıktı ({tag})");
+    let text_col = Color32::from_rgb(0x99, 0x1B, 0x1B);
     let galley = ui
         .painter()
-        .layout_no_wrap(tag.to_owned(), bold_font(10.5), text_col);
-    let arrow_w = 12.0;
-    let size = vec2(arrow_w + galley.size().x + 16.0, 22.0);
+        .layout_no_wrap(label, bold_font(11.0), text_col);
+    let arrow_w = 13.0;
+    let size = vec2(arrow_w + galley.size().x + 18.0, 24.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let (fill, border) = if resp.hovered() {
-        (Color32::from_rgb(0xBA, 0xE6, 0xFD), Color32::from_rgb(0x02, 0x84, 0xC7))
+
+    let fill = if resp.hovered() {
+        Color32::from_rgb(0xFE, 0xCA, 0xCA)
     } else {
-        (Color32::from_rgb(0xE0, 0xF2, 0xFE), Color32::from_rgb(0x38, 0xBD, 0xF8))
+        Color32::from_rgb(0xFE, 0xE2, 0xE2)
     };
+    let border_alpha = if resp.hovered() {
+        255
+    } else {
+        (90.0 + pulse * 165.0).round() as u8
+    };
+    let border = Color32::from_rgba_unmultiplied(0xDC, 0x26, 0x26, border_alpha);
+
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(11), fill);
+    painter.rect_filled(rect, CornerRadius::same(4), fill);
     painter.rect_stroke(
         rect,
-        CornerRadius::same(11),
-        Stroke::new(1.0_f32, border),
+        CornerRadius::same(4),
+        Stroke::new(2.0_f32, border),
         egui::StrokeKind::Inside,
     );
     let arrow_rect = Rect::from_min_size(
         egui::pos2(rect.left() + 6.0, rect.center().y - 5.5),
         vec2(11.0, 11.0),
     );
-    paint_studio_glyph(painter, arrow_rect, StudioGlyph::UpdateArrow, text_col);
+    paint_studio_glyph(
+        painter,
+        arrow_rect,
+        StudioGlyph::UpdateAlert,
+        Color32::from_rgb(0xDC, 0x26, 0x26),
+    );
     painter.galley(
         egui::pos2(
-            arrow_rect.right() + 3.0,
+            arrow_rect.right() + 4.0,
             rect.center().y - galley.size().y * 0.5,
         ),
         galley,
@@ -834,80 +878,8 @@ fn studio_update_pill(ui: &mut Ui, tag: &str) -> bool {
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    resp.on_hover_text("Yeni sürüm mevcut — detaylar için tıklayın");
+    resp.on_hover_text("Yeni sürüm mevcut — güncelleme detayları ve indirme için tıklayın");
     clicked
-}
-
-fn studio_fix_closure_button(ui: &mut Ui, text: &str, tooltip: &str) -> bool {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        bold_font(10.5),
-        colors::ACCENT_AMBER_TEXT,
-    );
-    let size = vec2(galley.size().x + 16.0, 22.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let (fill, border) = if resp.hovered() {
-        (Color32::from_rgb(0xFD, 0xE6, 0x8A), Color32::from_rgb(0xD9, 0x77, 0x06))
-    } else {
-        (colors::ACCENT_AMBER_BG, Color32::from_rgb(0xFC, 0xD3, 0x4D))
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(4), fill);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0_f32, border),
-        egui::StrokeKind::Inside,
-    );
-    painter.galley(
-        egui::pos2(
-            rect.center().x - galley.size().x * 0.5,
-            rect.center().y - galley.size().y * 0.5,
-        ),
-        galley,
-        colors::ACCENT_AMBER_TEXT,
-    );
-    let clicked = resp.clicked();
-    resp.on_hover_text(tooltip);
-    clicked
-}
-
-fn studio_badge(
-    ui: &mut Ui,
-    glyph: Option<StudioGlyph>,
-    text: &str,
-    fill: Color32,
-    text_col: Color32,
-    border_col: Color32,
-) {
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), bold_font(10.5), text_col);
-    let icon_w = if glyph.is_some() { 15.0 } else { 0.0 };
-    let size = vec2(icon_w + galley.size().x + 14.0, 22.0);
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(4), fill);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0_f32, border_col),
-        egui::StrokeKind::Inside,
-    );
-    let mut text_x = rect.left() + 7.0;
-    if let Some(gl) = glyph {
-        let ic_rect = Rect::from_min_size(
-            egui::pos2(rect.left() + 6.0, rect.center().y - 6.0),
-            vec2(12.0, 12.0),
-        );
-        paint_studio_glyph(painter, ic_rect, gl, text_col);
-        text_x = ic_rect.right() + 3.0;
-    }
-    painter.galley(
-        egui::pos2(text_x, rect.center().y - galley.size().y * 0.5),
-        galley,
-        text_col,
-    );
 }
 
 fn tb_sep(ui: &mut Ui) {

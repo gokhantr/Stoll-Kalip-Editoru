@@ -9,19 +9,22 @@ use stoll_kalip_editoru::catalog::{
     load_stoll_module_from_db, KnittingModuleInfo, ModuleCategory, StollCatalog,
     KNITTING_STRUCTURES,
 };
-use stoll_kalip_editoru::math::{apply_standard_preset_to_line, sync_mirrored_right_lines};
+use stoll_kalip_editoru::math::{
+    apply_standard_preset_to_line, auto_sync_closing_lines, sync_mirrored_right_lines,
+};
 use stoll_kalip_editoru::model::{
     ConnectPoint, FormDocument, KanteChildSlot, LineFunction, LineSegment, LineSide,
     ModuleAssignment, NarrowingProps, PointEntry, PointKind, PointOffset, ShapeCutType, UndoStack,
-    YReferenceLine,
 };
 
 use crate::ui::icons::{paint_icon, IconKind};
 use crate::ui::theme::{
     bold_font, colors, regular_font, win32_button, win32_checkbox, win32_combo_scope,
-    win32_group_box_on, win32_input_frame, win32_numeric_text_edit, win32_radio,
+    win32_group_box_on, win32_numeric_text_edit, win32_radio,
 };
-use crate::ui::{LinePropsRequest, UiState};
+use crate::ui::{
+    centered_modal_pos, modal_shadow, show_modal_backdrop, LinePropsRequest, UiState,
+};
 
 const TAB_PANE_BG: Color32 = Color32::from_rgb(0xF9, 0xF9, 0xF9);
 
@@ -170,8 +173,10 @@ impl LinePropsDialogState {
             .map(|e| e.is_base_line_row(req.side, req.line_idx))
             .unwrap_or(false);
 
-        // Initialize working clone whenever a new request opens
+        // Initialize working clone whenever a new request opens (preserving active tab if switching rows while open!)
         if self.active_req != Some(req) {
+            let was_already_open = self.active_req.is_some();
+            let prev_tab = self.active_tab;
             if let Some(line) = doc
                 .elements
                 .get(req.elem_idx)
@@ -180,7 +185,21 @@ impl LinePropsDialogState {
                 self.original = line.clone();
                 self.working = line.clone();
                 self.active_req = Some(req);
-                self.active_tab = if req.initial_tab == 7 && !is_kw {
+                let new_func = line.function;
+                let prev_tab_enabled = match prev_tab {
+                    0 | 4 | 5 | 6 => true,
+                    1 => matches!(new_func, LineFunction::Narrowing | LineFunction::NarrowingMulti),
+                    2 => new_func == LineFunction::Widening,
+                    3 => matches!(
+                        new_func,
+                        LineFunction::BindOff | LineFunction::NarrowingMulti
+                    ),
+                    7 => is_kw,
+                    _ => false,
+                };
+                self.active_tab = if was_already_open && prev_tab_enabled {
+                    prev_tab
+                } else if req.initial_tab == 7 && !is_kw {
                     0
                 } else {
                     req.initial_tab.min(7)
@@ -251,24 +270,37 @@ impl LinePropsDialogState {
 
         // Keyboard shortcuts (`DLG-09`): Esc = İptal, Enter (when not typing in a TextEdit) = Tamam
         if !self.help_popup_open && !ctx.wants_keyboard_input() {
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                do_close = true;
-            } else if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                do_apply = true;
-                do_close = true;
-            }
+            ctx.input_mut(|i| {
+                if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
+                    do_close = true;
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::Enter) {
+                    do_apply = true;
+                    do_close = true;
+                }
+            });
         }
+
+        // Keep table rows bright & clickable while LinePropsDialog is open so user can switch rows live!
+        let def_pos = if state.curve_editor_req.is_some() {
+            let sr = ctx.screen_rect();
+            let base = centered_modal_pos(ctx, vec2(560.0, 480.0));
+            pos2((base.x + 36.0).min(sr.right() - 570.0).max(sr.left() + 8.0), (base.y + 20.0).min(sr.bottom() - 490.0).max(sr.top() + 8.0))
+        } else {
+            centered_modal_pos(ctx, vec2(560.0, 480.0))
+        };
 
         egui::Window::new(&title)
             .id(egui::Id::new("line_props_modal"))
             .title_bar(false)
             .collapsible(false)
+            .movable(true)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_pos(def_pos)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                    .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                    .shadow(modal_shadow())
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {
@@ -375,12 +407,21 @@ impl LinePropsDialogState {
         // Contextual Help Popup
         if self.help_popup_open {
             let mut h_open = self.help_popup_open;
+            let help_pos = centered_modal_pos(ctx, vec2(360.0, 180.0));
             egui::Window::new(format!("Yardım — {}", TAB_LABELS[self.active_tab]))
                 .id(egui::Id::new("line_props_help_popup"))
                 .open(&mut h_open)
                 .collapsible(false)
+                .movable(true)
                 .resizable(false)
-                .anchor(Align2::CENTER_CENTER, vec2(40.0, 40.0))
+                .default_pos(pos2(help_pos.x + 30.0, help_pos.y + 30.0))
+                .frame(
+                    Frame::NONE
+                        .fill(colors::CARD_BG)
+                        .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                        .shadow(modal_shadow())
+                        .inner_margin(Margin::same(10)),
+                )
                 .show(ctx, |ui| {
                     ui.set_min_width(340.0);
                     ui.label(egui::RichText::new(TAB_LABELS[self.active_tab]).font(bold_font(12.0)));
@@ -408,6 +449,7 @@ impl LinePropsDialogState {
                         sync_mirrored_right_lines(doc, req.elem_idx);
                     }
                 }
+                auto_sync_closing_lines(doc);
                 self.original = self.working.clone();
                 state.set_status(
                     format!("{side_lbl} No.: {} güncellendi.", req.line_idx + 1),
@@ -2343,49 +2385,104 @@ fn tab_help_text_tr(tab: usize) -> &'static str {
     }
 }
 
-/// Dedicated `Yaka kesimi özellikleri` modal dialog (`50563`, `DLG-11`).
-#[derive(Debug, Clone)]
+/// Dedicated 1:1 original Stoll `Yaka kesim özellikleri Çizgi: 1, sol` modal dialog (`50563`, `DLG-11`).
+/// Edits the neckline element's Line 0 `[Start]` (`PointEntry` with `index = 0`, `punkt_art_tag_id = 1`).
+#[derive(Clone)]
 pub struct NecklinePropsDialogState {
     initialized_elem: Option<usize>,
-    name: String,
-    mirrored: bool,
-    orig_mirrored: bool,
-    y_ref_line: YReferenceLine,
-    imitated_neck: bool,
-    orig_imitated_neck: bool,
-    gore_knitting: bool,
-    orig_gore_knitting: bool,
-    gore_rows_additional: i32,
-    orig_gore_rows_additional: i32,
-    gore_rows_in_gore: i32,
-    orig_gore_rows_in_gore: i32,
-    gore_align_rows: i32,
-    orig_gore_align_rows: i32,
+    side: LineSide,
+    working_point: PointEntry,
+    orig_point: PointEntry,
+    selected_struct: usize,
+    show_help: bool,
+    resolved_cache: HashMap<String, Option<KnittingModuleInfo>>,
+    texture_cache: HashMap<String, Option<TextureHandle>>,
+    cached_cat_choices: Option<(i32, String, usize, Vec<(String, String)>)>,
 }
 
 impl Default for NecklinePropsDialogState {
     fn default() -> Self {
         Self {
             initialized_elem: None,
-            name: String::new(),
-            mirrored: true,
-            orig_mirrored: true,
-            y_ref_line: YReferenceLine::EndLine,
-            imitated_neck: false,
-            orig_imitated_neck: false,
-            gore_knitting: false,
-            orig_gore_knitting: false,
-            gore_rows_additional: 0,
-            orig_gore_rows_additional: 0,
-            gore_rows_in_gore: 0,
-            orig_gore_rows_in_gore: 0,
-            gore_align_rows: 0,
-            orig_gore_align_rows: 0,
+            side: LineSide::Left,
+            working_point: PointEntry {
+                index: 0,
+                punkt_art_tag_id: 3, // Stoll `Yaka kesimi alt orta` (verified in real Stoll V-neck .shv)
+                for_all_structures: ALL_STRUCTURES_NONE,
+                ..PointEntry::default()
+            },
+            orig_point: PointEntry::default(),
+            selected_struct: 0,
+            show_help: false,
+            resolved_cache: HashMap::new(),
+            texture_cache: HashMap::new(),
+            cached_cat_choices: None,
         }
     }
 }
 
 impl NecklinePropsDialogState {
+    fn resolve_display_name(&mut self, catalog: &StollCatalog, guid: &str) -> String {
+        let norm = normalize_guid(guid);
+        if norm.is_empty() || norm == ZERO_GUID {
+            return String::new();
+        }
+        if let Some(info) = catalog.modules_by_guid.get(&norm) {
+            return info.name.clone();
+        }
+        if !self.resolved_cache.contains_key(&norm) {
+            let loaded = catalog
+                .stoll_data_root
+                .as_deref()
+                .and_then(|root| load_stoll_module_from_db(root, &norm));
+            self.resolved_cache.insert(norm.clone(), loaded);
+        }
+        if let Some(Some(info)) = self.resolved_cache.get(&norm) {
+            return info.name.clone();
+        }
+        guid.to_string()
+    }
+
+    fn get_or_load_module_texture(
+        &mut self,
+        ctx: &egui::Context,
+        catalog: &StollCatalog,
+        guid: &str,
+    ) -> Option<TextureHandle> {
+        let norm = normalize_guid(guid);
+        if norm.is_empty() || norm == ZERO_GUID {
+            return None;
+        }
+        if let Some(cached) = self.texture_cache.get(&norm) {
+            return cached.clone();
+        }
+        let preview_img = catalog
+            .modules_by_guid
+            .get(&norm)
+            .and_then(|m| m.thumbnail.clone())
+            .or_else(|| {
+                if !self.resolved_cache.contains_key(&norm) {
+                    let loaded = catalog
+                        .stoll_data_root
+                        .as_deref()
+                        .and_then(|root| load_stoll_module_from_db(root, &norm));
+                    self.resolved_cache.insert(norm.clone(), loaded);
+                }
+                self.resolved_cache
+                    .get(&norm)
+                    .and_then(|opt| opt.as_ref())
+                    .and_then(|m| m.thumbnail.clone())
+            });
+        let handle = preview_img.map(|img| {
+            let w = img.width as usize;
+            let h = img.height as usize;
+            let color_img = ColorImage::from_rgba_unmultiplied([w, h], &img.rgba);
+            ctx.load_texture(format!("neck_mod_bmp_{norm}"), color_img, TextureOptions::NEAREST)
+        });
+        self.texture_cache.insert(norm, handle.clone());
+        handle
+    }
+
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -2393,9 +2490,11 @@ impl NecklinePropsDialogState {
         doc: &mut FormDocument,
         undo: &mut UndoStack,
         state: &mut UiState,
+        catalog: &StollCatalog,
     ) {
         if !*open {
             self.initialized_elem = None;
+            self.show_help = false;
             return;
         }
         let elem_idx = state.selected_elem;
@@ -2404,147 +2503,577 @@ impl NecklinePropsDialogState {
             self.initialized_elem = None;
             return;
         };
+
         if self.initialized_elem != Some(elem_idx) {
             self.initialized_elem = Some(elem_idx);
-            self.name = el.name.clone();
-            self.mirrored = el.mirrored;
-            self.orig_mirrored = el.mirrored;
-            self.y_ref_line = el.y_ref_line;
-            self.imitated_neck = el
-                .left_lines
-                .iter()
-                .any(|l| l.is_imitated_neck_processing.unwrap_or(0) != 0);
-            self.orig_imitated_neck = self.imitated_neck;
-            self.gore_knitting = el
-                .left_lines
-                .iter()
-                .any(|l| l.gore_knitting.unwrap_or(0) != 0);
-            self.orig_gore_knitting = self.gore_knitting;
-            self.gore_rows_additional = el
-                .left_lines
-                .iter()
-                .find_map(|l| l.gore_rows_additional)
-                .unwrap_or(0);
-            self.orig_gore_rows_additional = self.gore_rows_additional;
-            self.gore_rows_in_gore = el
-                .left_lines
-                .iter()
-                .find_map(|l| l.gore_rows_in_gore)
-                .unwrap_or(0);
-            self.orig_gore_rows_in_gore = self.gore_rows_in_gore;
-            self.gore_align_rows = el
-                .left_lines
-                .iter()
-                .find_map(|l| l.gore_align_rows)
-                .unwrap_or(0);
-            self.orig_gore_align_rows = self.gore_align_rows;
+            self.side = if el.mirrored {
+                LineSide::Left
+            } else {
+                state.active_table_side
+            };
+            self.show_help = false;
+            let existing = el
+                .lines(self.side)
+                .first()
+                .and_then(|l| l.points.iter().find(|p| p.index == 0))
+                .cloned();
+            let pt = existing.unwrap_or_else(|| PointEntry {
+                index: 0,
+                punkt_art_tag_id: 3, // Stoll `Yaka kesimi alt orta`
+                for_all_structures: ALL_STRUCTURES_NONE,
+                ..PointEntry::default()
+            });
+            self.selected_struct = if is_for_all_structures(pt.for_all_structures) {
+                (pt.for_all_structures as usize).min(11)
+            } else {
+                0
+            };
+            self.orig_point = pt.clone();
+            self.working_point = pt;
+            self.cached_cat_choices = None;
         }
+
+        let side_tr = match self.side {
+            LineSide::Left => "sol",
+            LineSide::Right => "sağ",
+        };
+        let title = format!("Yaka kesim özellikleri Çizgi: 1, {side_tr}");
+        let choices: Vec<(String, String)> = doc
+            .header
+            .external_local_modules
+            .iter()
+            .filter_map(|ext| {
+                let g = normalize_guid(&ext.guid);
+                if !g.is_empty() && g != ZERO_GUID {
+                    Some((g, ext.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let mut close =
             !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut commit = false;
 
-        egui::Window::new("Yaka kesimi özellikleri")
+        show_modal_backdrop(ctx, "neckline_props_backdrop", false);
+        let def_pos = centered_modal_pos(ctx, vec2(494.0, 504.0));
+
+        egui::Window::new(&title)
             .id(egui::Id::new("neckline_props_modal"))
             .title_bar(false)
             .collapsible(false)
+            .movable(true)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_pos(def_pos)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                    .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                    .shadow(modal_shadow())
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {
-                ui.set_min_width(360.0);
-                if paint_win32_dialog_titlebar(ui, "Yaka kesimi özellikleri", "neck_close_x") {
+                ui.set_min_width(488.0);
+                if paint_win32_dialog_titlebar(ui, &title, "neck_close_x") {
                     close = true;
                 }
+
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .inner_margin(Margin::same(10))
+                    .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
-                        win32_group_box_on(ui, "Yaka kesimi genel", colors::CHROME_BG, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Eleman adı:");
-                                ui.add_space(8.0);
-                                win32_input_frame(true).show(ui, |ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.name)
-                                            .desired_width(190.0)
-                                            .frame(false),
+                        // Single Win32 tab header: `Başlama`
+                        let tab_h = 22.0_f32;
+                        let tab_w = 62.0_f32;
+                        let (tab_bar_r, _) =
+                            ui.allocate_exact_size(vec2(ui.available_width(), tab_h), Sense::hover());
+                        let tab_r = Rect::from_min_size(tab_bar_r.min, vec2(tab_w, tab_h));
+                        let painter = ui.painter();
+                        // Bottom baseline to the right of active tab
+                        painter.line_segment(
+                            [
+                                pos2(tab_r.right(), tab_bar_r.bottom() - 0.5),
+                                pos2(tab_bar_r.right(), tab_bar_r.bottom() - 0.5),
+                            ],
+                            Stroke::new(1.0_f32, colors::BORDER_MID),
+                        );
+                        painter.rect_filled(tab_r, CornerRadius::ZERO, TAB_PANE_BG);
+                        painter.line_segment(
+                            [tab_r.left_top(), tab_r.right_top()],
+                            Stroke::new(1.0_f32, colors::BORDER_MID),
+                        );
+                        painter.line_segment(
+                            [tab_r.left_top(), tab_r.left_bottom()],
+                            Stroke::new(1.0_f32, colors::BORDER_MID),
+                        );
+                        painter.line_segment(
+                            [tab_r.right_top(), tab_r.right_bottom()],
+                            Stroke::new(1.0_f32, colors::BORDER_MID),
+                        );
+                        painter.text(
+                            tab_r.center(),
+                            Align2::CENTER_CENTER,
+                            "Başlama",
+                            regular_font(11.0),
+                            colors::WIN_BLUE,
+                        );
+
+                        // White Win32 tab body pane
+                        Frame::NONE
+                            .fill(TAB_PANE_BG)
+                            .stroke(Stroke::new(1.0_f32, colors::BORDER_MID))
+                            .inner_margin(Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_min_width(450.0);
+
+                                // 1. Genel
+                                win32_group_box_on(ui, "Genel", TAB_PANE_BG, |ui| {
+                                    win32_checkbox(
+                                        ui,
+                                        &mut self.working_point.use_module_color,
+                                        "Modül rengi kullan",
                                     );
                                 });
-                            });
-                            ui.add_space(4.0);
-                            win32_checkbox(ui, &mut self.mirrored, "Aynalama (simetrik yaka)");
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Y referansı:");
-                                win32_radio(
-                                    ui,
-                                    &mut self.y_ref_line,
-                                    YReferenceLine::BaseLine,
-                                    "Zemin çizgi",
-                                );
-                                win32_radio(
-                                    ui,
-                                    &mut self.y_ref_line,
-                                    YReferenceLine::EndLine,
-                                    "Bitiş çizgisi",
-                                );
-                            });
-                        });
 
-                        ui.add_space(6.0);
+                                ui.add_space(6.0);
 
-                        win32_group_box_on(ui, "Örme ve işleme seçenekleri", colors::CHROME_BG, |ui| {
-                            win32_checkbox(
-                                ui,
-                                &mut self.imitated_neck,
-                                "Taklit yaka işleme (IsImitatedNeckProcessing)",
-                            );
-                            win32_checkbox(
-                                ui,
-                                &mut self.gore_knitting,
-                                "Pens / Gore örme etkin (GoreKnitting)",
-                            );
-                            ui.add_enabled_ui(self.gore_knitting, |ui| {
-                                ui.add_space(4.0);
-                                ui.horizontal(|ui| {
-                                    ui.label("Ek sıra:");
-                                    win32_int_edit(
-                                        ui,
-                                        "neck_gore_add_rows",
-                                        &mut self.gore_rows_additional,
-                                        40.0,
-                                        0..=999,
+                                // 2. Fonksiyon: disabled `Yaka kesimi alt orta` + V neckline badge
+                                win32_group_box_on(ui, "Fonksiyon", TAB_PANE_BG, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.add_enabled_ui(false, |ui| {
+                                            win32_combo_scope(ui, |ui| {
+                                                egui::ComboBox::from_id_salt("neck_func_combo")
+                                                    .width(214.0)
+                                                    .selected_text("Yaka kesimi alt orta")
+                                                    .show_ui(ui, |_| {});
+                                            });
+                                        });
+                                        ui.add_space(28.0);
+                                        let (badge_r, _) = ui.allocate_exact_size(
+                                            vec2(64.0, 36.0),
+                                            Sense::hover(),
+                                        );
+                                        paint_vneck_graphic_badge(ui.painter(), badge_r);
+                                    });
+                                });
+
+                                ui.add_space(6.0);
+
+                                // 3. Modül düzeni (12-structure listbox + StartVneck module combo + 128x128 preview + Ofset)
+                                let mut for_all_flag =
+                                    is_for_all_structures(self.working_point.for_all_structures);
+                                if for_all_flag {
+                                    self.selected_struct =
+                                        (self.working_point.for_all_structures as usize).min(11);
+                                }
+                                let active_id = self.selected_struct as i32;
+                                let mut cur_guid = get_or_default_module(
+                                    &self.working_point.modules,
+                                    active_id,
+                                    for_all_flag,
+                                )
+                                .id;
+                                let mut off_xy = self
+                                    .working_point
+                                    .offsets
+                                    .first()
+                                    .map(|o| (o.x, o.y))
+                                    .unwrap_or((0, 0));
+                                let mut guid_changed = false;
+
+                                win32_group_box_on(ui, "Modül düzeni", TAB_PANE_BG, |ui| {
+                                    ui.horizontal_top(|ui| {
+                                        // Left column: structure icon + 12-item listbox + checkbox
+                                        ui.vertical(|ui| {
+                                            ui.set_width(188.0);
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(76.0);
+                                                let (icon_r, _) = ui.allocate_exact_size(
+                                                    vec2(24.0, 14.0),
+                                                    Sense::hover(),
+                                                );
+                                                paint_structure_badge_icon(ui.painter(), icon_r);
+                                            });
+
+                                            let list_h = 192.0;
+                                            Frame::NONE
+                                                .fill(if for_all_flag {
+                                                    Color32::BLACK
+                                                } else {
+                                                    colors::INPUT_BG
+                                                })
+                                                .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                                                .inner_margin(Margin::same(1))
+                                                .show(ui, |ui| {
+                                                    ui.set_width(184.0);
+                                                    ui.set_min_height(list_h);
+                                                    let row_h = list_h / 12.0;
+                                                    for (idx, ks) in
+                                                        KNITTING_STRUCTURES.iter().take(12).enumerate()
+                                                    {
+                                                        let (row_rect, resp) = ui
+                                                            .allocate_exact_size(
+                                                                vec2(182.0, row_h),
+                                                                Sense::click(),
+                                                            );
+                                                        let painter = ui.painter();
+                                                        if for_all_flag {
+                                                            if idx == self.selected_struct {
+                                                                let icon_rect = Rect::from_min_size(
+                                                                    row_rect.min,
+                                                                    vec2(16.0, row_rect.height()),
+                                                                );
+                                                                let label_rect = Rect::from_min_max(
+                                                                    pos2(
+                                                                        row_rect.left() + 16.0,
+                                                                        row_rect.top(),
+                                                                    ),
+                                                                    row_rect.max,
+                                                                );
+                                                                painter.rect_filled(
+                                                                    icon_rect,
+                                                                    CornerRadius::ZERO,
+                                                                    Color32::WHITE,
+                                                                );
+                                                                painter.rect_filled(
+                                                                    label_rect,
+                                                                    CornerRadius::ZERO,
+                                                                    colors::WIN_BLUE,
+                                                                );
+                                                                let c = icon_rect.center();
+                                                                let g_stroke = Stroke::new(
+                                                                    1.8_f32,
+                                                                    Color32::from_rgb(0x00, 0xA8, 0x00),
+                                                                );
+                                                                painter.line_segment(
+                                                                    [
+                                                                        pos2(c.x - 4.0, c.y),
+                                                                        pos2(c.x - 1.0, c.y + 3.5),
+                                                                    ],
+                                                                    g_stroke,
+                                                                );
+                                                                painter.line_segment(
+                                                                    [
+                                                                        pos2(c.x - 1.0, c.y + 3.5),
+                                                                        pos2(c.x + 4.5, c.y - 4.0),
+                                                                    ],
+                                                                    g_stroke,
+                                                                );
+                                                                painter.text(
+                                                                    pos2(
+                                                                        label_rect.left() + 3.0,
+                                                                        label_rect.center().y,
+                                                                    ),
+                                                                    Align2::LEFT_CENTER,
+                                                                    ks.name_tr,
+                                                                    regular_font(10.5),
+                                                                    Color32::WHITE,
+                                                                );
+                                                            } else {
+                                                                painter.rect_filled(
+                                                                    row_rect,
+                                                                    CornerRadius::ZERO,
+                                                                    Color32::BLACK,
+                                                                );
+                                                                let cx = row_rect.left() + 8.0;
+                                                                let cy = row_rect.center().y;
+                                                                let r_stroke = Stroke::new(
+                                                                    1.7_f32,
+                                                                    Color32::from_rgb(0xFF, 0x18, 0x18),
+                                                                );
+                                                                painter.line_segment(
+                                                                    [
+                                                                        pos2(cx - 4.0, cy - 4.0),
+                                                                        pos2(cx + 4.0, cy + 4.0),
+                                                                    ],
+                                                                    r_stroke,
+                                                                );
+                                                                painter.line_segment(
+                                                                    [
+                                                                        pos2(cx - 4.0, cy + 4.0),
+                                                                        pos2(cx + 4.0, cy - 4.0),
+                                                                    ],
+                                                                    r_stroke,
+                                                                );
+                                                            }
+                                                        } else {
+                                                            let is_sel =
+                                                                self.selected_struct == idx;
+                                                            let bg = if is_sel {
+                                                                colors::WIN_BLUE
+                                                            } else if resp.hovered() {
+                                                                colors::WIN_BLUE_HOVER
+                                                            } else {
+                                                                colors::INPUT_BG
+                                                            };
+                                                            let fg = if is_sel {
+                                                                Color32::WHITE
+                                                            } else {
+                                                                colors::TEXT_BLACK
+                                                            };
+                                                            painter.rect_filled(
+                                                                row_rect,
+                                                                CornerRadius::ZERO,
+                                                                bg,
+                                                            );
+                                                            painter.text(
+                                                                pos2(
+                                                                    row_rect.left() + 4.0,
+                                                                    row_rect.center().y,
+                                                                ),
+                                                                Align2::LEFT_CENTER,
+                                                                ks.name_tr,
+                                                                regular_font(10.5),
+                                                                fg,
+                                                            );
+                                                            if resp.clicked()
+                                                                && self.selected_struct != idx
+                                                            {
+                                                                self.selected_struct = idx;
+                                                                ctx.request_repaint();
+                                                            }
+                                                        }
+                                                    }
+                                                });
+
+                                            ui.add_space(5.0);
+                                            win32_checkbox(
+                                                ui,
+                                                &mut for_all_flag,
+                                                "Tüm örgü türleri için geçerlidir",
+                                            );
+                                        });
+
+                                        ui.add_space(14.0);
+
+                                        // Right column: Modül combo (StartVneck) + 128x128 preview + Ofset
+                                        ui.vertical(|ui| {
+                                            ui.set_min_width(230.0);
+                                            ui.label("Modül:");
+
+                                            let selected_label =
+                                                self.resolve_display_name(catalog, &cur_guid);
+                                            let eff_struct = self.selected_struct as i32;
+                                            let norm_cur = normalize_guid(&cur_guid);
+                                            let cat_choices = if let Some((
+                                                s_id,
+                                                ref g_key,
+                                                ch_len,
+                                                ref list,
+                                            )) = self.cached_cat_choices
+                                            {
+                                                if s_id == eff_struct
+                                                    && *g_key == norm_cur
+                                                    && ch_len == choices.len()
+                                                {
+                                                    list.clone()
+                                                } else {
+                                                    let built = collect_category_module_choices(
+                                                        catalog,
+                                                        ModuleCategory::StartVneck,
+                                                        eff_struct,
+                                                        &choices,
+                                                        &cur_guid,
+                                                        &self.resolved_cache,
+                                                    );
+                                                    self.cached_cat_choices = Some((
+                                                        eff_struct,
+                                                        norm_cur,
+                                                        choices.len(),
+                                                        built.clone(),
+                                                    ));
+                                                    built
+                                                }
+                                            } else {
+                                                let built = collect_category_module_choices(
+                                                    catalog,
+                                                    ModuleCategory::StartVneck,
+                                                    eff_struct,
+                                                    &choices,
+                                                    &cur_guid,
+                                                    &self.resolved_cache,
+                                                );
+                                                self.cached_cat_choices = Some((
+                                                    eff_struct,
+                                                    norm_cur,
+                                                    choices.len(),
+                                                    built.clone(),
+                                                ));
+                                                built
+                                            };
+
+                                            win32_combo_scope(ui, |ui| {
+                                                egui::ComboBox::from_id_salt(format!(
+                                                    "neck_mod_combo_{eff_struct}"
+                                                ))
+                                                .width(214.0)
+                                                .selected_text(&selected_label)
+                                                .show_ui(ui, |ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            cur_guid.is_empty()
+                                                                || cur_guid
+                                                                    .eq_ignore_ascii_case(ZERO_GUID),
+                                                            "(Modül yok)",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        cur_guid = ZERO_GUID.to_string();
+                                                        guid_changed = true;
+                                                    }
+                                                    for (guid, name) in &cat_choices {
+                                                        let is_sel =
+                                                            cur_guid.eq_ignore_ascii_case(guid);
+                                                        if ui.selectable_label(is_sel, name).clicked()
+                                                        {
+                                                            cur_guid = guid.clone();
+                                                            guid_changed = true;
+                                                        }
+                                                    }
+                                                });
+                                            });
+
+                                            ui.add_space(8.0);
+
+                                            // 128×128 bitmap preview
+                                            let preview_size = 114.0;
+                                            let tex = self.get_or_load_module_texture(
+                                                ctx, catalog, &cur_guid,
+                                            );
+                                            let (prev_rect, _) = ui.allocate_exact_size(
+                                                vec2(preview_size, preview_size),
+                                                Sense::hover(),
+                                            );
+                                            let painter = ui.painter();
+                                            painter.rect_filled(
+                                                prev_rect,
+                                                CornerRadius::ZERO,
+                                                Color32::WHITE,
+                                            );
+                                            if let Some(handle) = tex {
+                                                painter.image(
+                                                    handle.id(),
+                                                    prev_rect.shrink(1.0),
+                                                    Rect::from_min_max(
+                                                        pos2(0.0, 0.0),
+                                                        pos2(1.0, 1.0),
+                                                    ),
+                                                    Color32::WHITE,
+                                                );
+                                            } else if !cur_guid.is_empty()
+                                                && !cur_guid.eq_ignore_ascii_case(ZERO_GUID)
+                                            {
+                                                paint_schematic_module_preview(
+                                                    painter,
+                                                    prev_rect.shrink(1.0),
+                                                    PreviewCategory::PointStartVneck,
+                                                );
+                                            }
+                                            painter.rect_stroke(
+                                                prev_rect,
+                                                CornerRadius::ZERO,
+                                                Stroke::new(1.0_f32, colors::BORDER_MID),
+                                                StrokeKind::Inside,
+                                            );
+
+                                            // Ofset groupbox (`↔ 0` / `↕ 0`)
+                                            ui.add_space(6.0);
+                                            win32_group_box_on(ui, "Ofset", TAB_PANE_BG, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    let (irx, _) = ui.allocate_exact_size(
+                                                        vec2(14.0, 14.0),
+                                                        Sense::hover(),
+                                                    );
+                                                    paint_icon(
+                                                        ui.painter(),
+                                                        irx,
+                                                        IconKind::HorizontalArrow,
+                                                        true,
+                                                    );
+                                                    win32_int_edit(
+                                                        ui,
+                                                        "neck_pt_off_x",
+                                                        &mut off_xy.0,
+                                                        42.0,
+                                                        -999..=999,
+                                                    );
+                                                    ui.add_space(16.0);
+                                                    let (iry, _) = ui.allocate_exact_size(
+                                                        vec2(14.0, 14.0),
+                                                        Sense::hover(),
+                                                    );
+                                                    paint_icon(
+                                                        ui.painter(),
+                                                        iry,
+                                                        IconKind::VerticalArrow,
+                                                        true,
+                                                    );
+                                                    win32_int_edit(
+                                                        ui,
+                                                        "neck_pt_off_y",
+                                                        &mut off_xy.1,
+                                                        42.0,
+                                                        -999..=999,
+                                                    );
+                                                });
+                                            });
+                                        });
+                                    });
+                                });
+
+                                self.working_point.for_all_structures =
+                                    encode_for_all_structures(for_all_flag, self.selected_struct);
+                                if !self.working_point.offsets.is_empty() || off_xy != (0, 0) {
+                                    if self.working_point.offsets.is_empty() {
+                                        self.working_point.offsets.push(PointOffset::default());
+                                    }
+                                    self.working_point.offsets[0].x = off_xy.0;
+                                    self.working_point.offsets[0].y = off_xy.1;
+                                }
+                                let final_id = self.selected_struct as i32;
+                                if guid_changed
+                                    || (for_all_flag
+                                        && !self
+                                            .working_point
+                                            .modules
+                                            .iter()
+                                            .any(|m| m.module_art_id == final_id))
+                                {
+                                    let m = get_or_insert_module(
+                                        &mut self.working_point.modules,
+                                        final_id,
                                     );
-                                    ui.add_space(6.0);
-                                    ui.label("Gore sıra:");
-                                    win32_int_edit(
-                                        ui,
-                                        "neck_gore_in_rows",
-                                        &mut self.gore_rows_in_gore,
-                                        40.0,
-                                        0..=999,
-                                    );
-                                    ui.add_space(6.0);
-                                    ui.label("Hiza sıra:");
-                                    win32_int_edit(
-                                        ui,
-                                        "neck_gore_align_rows",
-                                        &mut self.gore_align_rows,
-                                        40.0,
-                                        0..=999,
+                                    if guid_changed {
+                                        m.id = cur_guid;
+                                    }
+                                }
+                            });
+
+                        if self.show_help {
+                            ui.add_space(6.0);
+                            Frame::NONE
+                                .fill(Color32::from_rgb(0xFF, 0xFF, 0xE6))
+                                .stroke(Stroke::new(1.0_f32, colors::BORDER_MID))
+                                .inner_margin(Margin::symmetric(8, 5))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Yaka kesimi alt orta başlangıç noktası (Çizgi 1) için örgü türüne göre başlama modülü ve X/Y ofset değerlerini ayarlar.",
+                                        )
+                                        .font(regular_font(10.5))
+                                        .color(colors::TEXT_BLACK),
                                     );
                                 });
-                            });
-                        });
+                        }
 
                         ui.add_space(8.0);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if win32_button(ui, "Yardım", vec2(74.0, 23.0), true).clicked() {
+                                self.show_help = !self.show_help;
+                            }
                             if win32_button(ui, "İptal", vec2(74.0, 23.0), true).clicked() {
                                 close = true;
                             }
@@ -2561,82 +3090,85 @@ impl NecklinePropsDialogState {
             });
 
         if commit {
-            undo.push("Yaka kesimi özellikleri", doc);
-            let mut needs_mirror_sync = false;
-            let mut ask_mirror_confirm = false;
-            if let Some(el) = doc.elements.get_mut(elem_idx) {
-                el.name = self.name.clone();
-                el.y_ref_line = self.y_ref_line;
-                if self.imitated_neck != self.orig_imitated_neck {
-                    let v = Some(if self.imitated_neck { 1 } else { 0 });
-                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                        l.is_imitated_neck_processing = v;
+            self.working_point.index = 0;
+            self.working_point.punkt_art_tag_id = 3; // Stoll `Yaka kesimi alt orta`
+            let has_line0 = doc
+                .elements
+                .get(elem_idx)
+                .and_then(|el| el.lines(self.side).first())
+                .is_some();
+            if !has_line0 {
+                state.set_status("Yaka kesiminde henüz başlangıç çizgisi yok.", true);
+            } else if self.working_point != self.orig_point {
+                undo.push("Yaka kesim özellikleri", doc);
+                let mut mirrored = false;
+                if let Some(el) = doc.elements.get_mut(elem_idx) {
+                    mirrored = el.mirrored;
+                    if let Some(line0) = el.lines_mut(self.side).first_mut() {
+                        if let Some(pos) = line0.points.iter().position(|p| p.index == 0) {
+                            line0.points[pos] = self.working_point.clone();
+                        } else {
+                            let new_idx = line0.points.len();
+                            line0.points.push(self.working_point.clone());
+                            line0.ensure_child_slot(KanteChildSlot::Point(new_idx));
+                        }
+                        doc.dirty = true;
                     }
                 }
-                if self.gore_knitting != self.orig_gore_knitting {
-                    let v = Some(if self.gore_knitting { 1 } else { 0 });
-                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                        l.gore_knitting = v;
-                    }
+                if mirrored {
+                    sync_mirrored_right_lines(doc, elem_idx);
                 }
-                if self.gore_rows_additional != self.orig_gore_rows_additional {
-                    let v = Some(self.gore_rows_additional);
-                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                        l.gore_rows_additional = v;
-                    }
-                }
-                if self.gore_rows_in_gore != self.orig_gore_rows_in_gore {
-                    let v = Some(self.gore_rows_in_gore);
-                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                        l.gore_rows_in_gore = v;
-                    }
-                }
-                if self.gore_align_rows != self.orig_gore_align_rows {
-                    let v = Some(self.gore_align_rows);
-                    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                        l.gore_align_rows = v;
-                    }
-                }
-                if !self.mirrored {
-                    if self.orig_mirrored && el.right_lines.is_empty() && !el.left_lines.is_empty() {
-                        el.mirrored = true;
-                        needs_mirror_sync = true;
-                    } else {
-                        el.mirrored = false;
-                    }
-                } else if !self.orig_mirrored && !el.right_lines.is_empty() {
-                    ask_mirror_confirm = true;
-                } else {
-                    el.mirrored = true;
-                    needs_mirror_sync = true;
-                }
-                doc.dirty = true;
+                state.set_status("Yaka kesim özellikleri güncellendi.", false);
             }
-            if needs_mirror_sync {
-                sync_mirrored_right_lines(doc, elem_idx);
-                if !self.mirrored {
-                    if let Some(el) = doc.elements.get_mut(elem_idx) {
-                        el.mirrored = false;
-                    }
-                }
-            }
-            if !self.mirrored && state.active_table_side == LineSide::Right {
-                // Keep side as-is; if mirrored turned ON, switch away from Right side.
-            } else if self.mirrored && !ask_mirror_confirm && state.active_table_side == LineSide::Right {
-                state.active_table_side = LineSide::Left;
-                state.table_mode = crate::ui::TableMode::LeftLines;
-            }
-            if ask_mirror_confirm {
-                state.pending_mirror_confirm = true;
-            }
-            state.set_status("Yaka kesimi özellikleri güncellendi.", false);
         }
 
         if close {
             *open = false;
             self.initialized_elem = None;
+            self.show_help = false;
         }
     }
+}
+
+/// Clean metallic oval + `V` neckline graphic badge matching original Stoll `Yaka kesim özellikleri`.
+fn paint_vneck_graphic_badge(painter: &egui::Painter, rect: Rect) {
+    let c = rect.center();
+    let rx = rect.width() * 0.46;
+    let ry = rect.height() * 0.44;
+    // Soft gray backdrop rectangle
+    painter.rect_filled(rect, CornerRadius::ZERO, Color32::from_rgb(0xD4, 0xD4, 0xD4));
+    // Layered elliptical shading to suggest Stoll's 3D silver oval
+    let steps = 28usize;
+    for (scale_f, col) in [
+        (1.0_f32, Color32::from_rgb(0x88, 0x88, 0x88)),
+        (0.92_f32, Color32::from_rgb(0xBC, 0xBC, 0xBC)),
+        (0.76_f32, Color32::from_rgb(0xE8, 0xE8, 0xE8)),
+        (0.55_f32, Color32::from_rgb(0xFA, 0xFA, 0xFA)),
+    ] {
+        let mut pts = Vec::with_capacity(steps);
+        for i in 0..steps {
+            let ang = (i as f32 / steps as f32) * std::f32::consts::TAU;
+            pts.push(pos2(
+                c.x + ang.cos() * rx * scale_f,
+                c.y + ang.sin() * ry * scale_f,
+            ));
+        }
+        painter.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+    }
+    // Crisp dark gray `V` neckline notch with horizontal shoulder arms
+    let v_stroke = Stroke::new(2.4_f32, Color32::from_rgb(0x52, 0x52, 0x52));
+    let y_top = c.y - ry * 0.42;
+    let y_bot = c.y + ry * 0.56;
+    let arm_out = rx * 0.70;
+    let arm_in = rx * 0.34;
+    let pts = vec![
+        pos2(c.x - arm_out, y_top),
+        pos2(c.x - arm_in, y_top),
+        pos2(c.x, y_bot),
+        pos2(c.x + arm_in, y_top),
+        pos2(c.x + arm_out, y_top),
+    ];
+    painter.add(egui::Shape::line(pts, v_stroke));
 }
 
 /// Dedicated `Referans çizgisi seçimi` modal dialog (`DIALOG 4274`, `DLG-12`):
@@ -2684,16 +3216,21 @@ impl RefLineSelectDialogState {
             !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut commit = false;
 
+        show_modal_backdrop(ctx, "ref_line_select_backdrop", false);
+        let def_pos = centered_modal_pos(ctx, vec2(360.0, 290.0));
+
         egui::Window::new("Referans çizgisi seçimi")
             .id(egui::Id::new("ref_line_select_modal"))
             .title_bar(false)
             .collapsible(false)
+            .movable(true)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_pos(def_pos)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                    .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                    .shadow(modal_shadow())
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {

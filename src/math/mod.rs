@@ -4,8 +4,12 @@ pub mod operations;
 pub mod units;
 
 pub use curves::{
-    apply_curve_to_line, compress_pairs_to_steps, curve_steps_sum, curve_steps_sum_slice,
-    extract_curve_module_widths, generate_curve_steps, resample_user_curve, CurveGenParams,
+    apply_curve_to_line, check_curve_feasibility, compress_pairs_to_steps, curve_steps_sum,
+    curve_steps_sum_slice, detect_even_courses_from_steps, expand_curve_steps,
+    extract_curve_module_widths, generate_curve_steps, mirror_curve_steps_single_system,
+    normalize_curve_groups, resample_user_curve, resolve_curve_module_widths, CourseParityMode,
+    CurveFeasibility, CurveGenParams, CurveStepDrive, DEFAULT_STD_FADEOUT_WIDTH,
+    DEFAULT_STD_NARROW_WIDTH, DEFAULT_STD_WIDEN_WIDTH,
 };
 pub use geometry::{
     compute_range_summary, element_distance_from_top, evaluate_document_geometry,
@@ -16,7 +20,9 @@ pub use geometry::{
 };
 pub use operations::{
     add_element, append_line, apply_directives_to_lines, apply_guidelines,
-    apply_standard_preset_to_line, copy_line, copy_markers, delete_element, delete_line,
+    apply_standard_preset_to_line, apply_standard_widths_to_all, auto_sync_closing_line_for_side,
+    auto_sync_closing_lines, closing_line_index, copy_line, copy_markers, delete_element,
+    delete_line, ensure_all_closing_lines, ensure_closing_line_for_side,
     import_external_table_lines, insert_line_before, multiply_marking_points,
     parse_external_table_lines, paste_insert_line, paste_insert_markers, paste_line,
     paste_replace_markers, renumber_points, swap_left_right, sync_all_mirrored_elements,

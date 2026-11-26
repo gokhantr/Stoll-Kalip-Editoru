@@ -158,6 +158,10 @@ pub struct LineSegment {
     pub border_option_color: Option<i32>,  // BorderOptionColor
     pub border_option_inside: Option<i32>, // BorderOptionInside
 
+    /// Runtime flag indicating this line's curve uses single-system (`Tek Sistem`) 1-course parity offset.
+    #[serde(skip)]
+    pub single_system_curve: bool,
+
     // Sub-sections (Line Properties tabs 2..8 + Curve steps)
     pub fade_out: Option<FadeOutProps>,
     pub narrowing: Option<NarrowingProps>,
@@ -216,19 +220,20 @@ impl Default for LineSegment {
             default_narrowing: false,
             default_widening: 0,
             default_height: 0,
-            start_ref_element: None,
-            fill_color: None,
-            border_filling: None,
-            border_option_color: None,
-            border_option_inside: None,
+            start_ref_element: Some(1),
+            fill_color: Some(255),
+            border_filling: Some(0),
+            border_option_color: Some(255),
+            border_option_inside: Some(1),
+            single_system_curve: false,
             fade_out: None,
             narrowing: None,
             widening: None,
             binding_off: None,
             points: Vec::new(),
             curve: None,
-            connection_points: Some(ConnectionPoints::default()),
-            child_order: vec![KanteChildSlot::ConnectionPoints],
+            connection_points: None,
+            child_order: Vec::new(),
             raw: RawSectionMeta::default(),
         }
     }
@@ -427,7 +432,7 @@ pub struct OlePreservedStreams {
     pub form_trailing_newline: bool,
 }
 
-/// Guidelines / Standards UI settings ("Yönergeler" in top panel).
+/// Guidelines / Standards UI settings ("Yönergeler" / "Standart özellikler").
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Guidelines {
     pub enabled: bool,
@@ -435,6 +440,12 @@ pub struct Guidelines {
     pub min_width_stitches: i32,
     pub max_narrowing_step: i32,
     pub prefer_even_rows: bool,
+    /// Document standard narrowing width (`MindernBreite`, default 6).
+    pub std_narrow_w: i32,
+    /// Document standard widening width (`ZunehmenBreite`, default 1).
+    pub std_widen_w: i32,
+    /// Document standard fade-out width (`AusblendenBreite`, default 0).
+    pub std_fadeout_w: i32,
 }
 
 impl Default for Guidelines {
@@ -445,6 +456,9 @@ impl Default for Guidelines {
             min_width_stitches: 4,
             max_narrowing_step: 4,
             prefer_even_rows: true,
+            std_narrow_w: 6,
+            std_widen_w: 1,
+            std_fadeout_w: 0,
         }
     }
 }

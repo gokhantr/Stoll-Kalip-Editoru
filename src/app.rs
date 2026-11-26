@@ -10,13 +10,14 @@ use stoll_kalip_editoru::catalog::{
 };
 use stoll_kalip_editoru::io::{import_dxf_file, load_file, save_file};
 use stoll_kalip_editoru::math::{
-    add_element, append_line, apply_directives_to_lines, apply_standard_preset_to_line,
+    add_element, append_line, apply_standard_preset_to_line, auto_sync_closing_lines,
     convert_input_format, copy_line, copy_markers, delete_element, delete_line,
-    evaluate_document_geometry, import_external_table_lines, insert_line_before, paste_insert_line,
-    paste_insert_markers, paste_line, paste_replace_markers, recalc_document_for_density_change,
+    ensure_all_closing_lines, ensure_closing_line_for_side, evaluate_document_geometry,
+    import_external_table_lines, insert_line_before, paste_insert_line, paste_insert_markers,
+    paste_line, paste_replace_markers, recalc_document_for_density_change,
     recalc_line_from_stitches_and_rows, renumber_points, snapshot_endline_distances,
     swap_left_right, sync_all_endline_elements, sync_all_mirrored_elements,
-    sync_mirrored_right_lines, update_or_append_closing_line, validate_document, DocumentGeometry,
+    sync_mirrored_right_lines, validate_document, DocumentGeometry,
 };
 use stoll_kalip_editoru::model::{
     ElementType, FormDocument, FormHeader, InputFormat, LineFunction, LineSide, PointEntry,
@@ -40,14 +41,12 @@ use crate::ui::line_props_dialog::{
 };
 use crate::ui::menu_toolbar::{show_menu_bar, show_toolbar};
 use crate::ui::point_multiply_dialog::PointMultiplyDialogState;
-use crate::ui::theme::{
-    apply_win32_theme, bold_font, colors, configure_fonts, regular_font, win32_button,
-    win32_window,
-};
+use crate::ui::theme::{apply_win32_theme, bold_font, colors, configure_fonts, regular_font, win32_button};
 use crate::ui::top_panel::{show_settings_popover, show_summary_strip};
 use crate::ui::{
-    AppAction, CurveEditorRequest, FormatConvertRequest, LinePropsRequest, PendingDirtyAction,
-    PointMultiplyRequest, TableMode, UiState,
+    show_modal_backdrop, show_studio_modal_window, AppAction, CurveEditorRequest,
+    FormatConvertRequest, LinePropsRequest, PendingDirtyAction, PointMultiplyRequest, TableMode,
+    UiState,
 };
 
 /// Automated OpenGL screenshot capture sequence gated by `KALIPEDITOR_CAPTURE_DIR` env var.
@@ -108,6 +107,14 @@ impl KalipEditorApp {
     ) -> Self {
         configure_fonts(&cc.egui_ctx);
         apply_win32_theme(&cc.egui_ctx);
+        let _keep_theme_fn: fn(&egui::Context, egui::Id, &str, &mut bool, Option<egui::Vec2>, bool, bool, fn(&mut egui::Ui)) =
+            crate::ui::theme::win32_window;
+        let _ = (
+            _keep_theme_fn,
+            colors::CLOSING_ROW_TEXT,
+            colors::ACCENT_AMBER_BG,
+            colors::ACCENT_AMBER_TEXT,
+        );
 
         let settings = UserSettings::load();
         let mut catalog = StollCatalog::load_with_autodetect();
@@ -118,12 +125,16 @@ impl KalipEditorApp {
 
         let mut state = UiState::default();
         state.recent_files = load_mru_files();
-        state.snap_even_rows = settings.snap_even_rows;
         state.show_dimensions = settings.show_dimensions;
         state.show_detail_columns = settings.show_detail_columns;
+        state.always_on_top = settings.always_on_top;
         state.preset_is_user = settings.default_template_is_user;
         state.selected_preset_idx = settings.default_template_index;
         state.user_settings = settings.clone();
+        if settings.always_on_top {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        }
 
         let make_blank_doc = |s: &UserSettings| -> FormDocument {
             let mut d = FormDocument::new_default_template();
@@ -151,6 +162,9 @@ impl KalipEditorApp {
         } else {
             make_blank_doc(&settings)
         };
+        state.directive_narrowing = doc.guidelines.std_narrow_w.clamp(1, 20);
+        state.directive_widening = doc.guidelines.std_widen_w.clamp(1, 20);
+        state.right_panel_collapsed = doc.elements.first().map(|e| e.mirrored).unwrap_or(true);
 
         let max_p = catalog.presets(state.preset_is_user).len();
         if max_p == 0 {
@@ -217,12 +231,16 @@ impl KalipEditorApp {
     }
 
     fn compute_window_title(&self) -> String {
-        let path_part = match &self.doc.file_path {
-            Some(p) => p.display().to_string(),
-            None => "Yeni".to_string(),
+        let file_part = match &self.doc.file_path {
+            Some(p) => p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| p.display().to_string()),
+            None => "Yeni Kalıp".to_string(),
         };
         let dirty_mark = if self.doc.dirty { "*" } else { "" };
-        format!("{path_part}{dirty_mark} - Stoll Kalıp Editörü")
+        format!("{file_part}{dirty_mark} — Stoll Kalıp Editörü {CURRENT_VERSION}")
     }
 
     fn sync_window_title(&mut self, ctx: &egui::Context) {
@@ -254,9 +272,17 @@ impl KalipEditorApp {
         self.state.external_import_open = false;
         self.state.settings_popover_open = false;
         self.state.selected_elem = 0;
-        self.state.all_elements_selected = false;
+        self.state.all_elements_selected = true;
         self.state.table_mode = TableMode::LeftLines;
         self.state.active_table_side = LineSide::Left;
+        self.state.right_panel_collapsed = self
+            .doc
+            .elements
+            .first()
+            .map(|e| e.mirrored)
+            .unwrap_or(true);
+        self.state.directive_narrowing = self.doc.guidelines.std_narrow_w.clamp(1, 20);
+        self.state.directive_widening = self.doc.guidelines.std_widen_w.clamp(1, 20);
         self.clamp_selection_after_doc_change();
         if let Some(el) = self.doc.elements.first() {
             if !el.left_lines.is_empty() {
@@ -338,6 +364,8 @@ impl KalipEditorApp {
             }
         }
 
+        // Auto-close any open contour before saving if the user hasn't added a closing line yet
+        ensure_all_closing_lines(&mut self.doc);
         let report = validate_document(&self.doc);
         match save_file(&self.doc, &path) {
             Ok(()) => {
@@ -411,7 +439,11 @@ impl KalipEditorApp {
             } else if i.key_pressed(Key::F1) {
                 actions.push(AppAction::ShowHelp);
             } else if !typing && i.modifiers == Modifiers::NONE {
-                if i.key_pressed(Key::Insert) {
+                if i.key_pressed(Key::Escape) {
+                    self.state.selected_rows.clear();
+                    self.state.row_select_anchor = None;
+                    self.state.focused_cell = None;
+                } else if i.key_pressed(Key::Insert) {
                     if self.state.table_mode.is_lines() {
                         actions.push(AppAction::InsertLineBefore);
                     } else {
@@ -606,6 +638,10 @@ impl KalipEditorApp {
                         egui::WindowLevel::Normal
                     };
                     ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+                    self.state.user_settings.always_on_top = self.state.always_on_top;
+                    if self.capture.is_none() {
+                        let _ = self.state.user_settings.save();
+                    }
                 }
                 AppAction::ToggleGraphics => {}
                 AppAction::SwapLeftRight => {
@@ -623,7 +659,6 @@ impl KalipEditorApp {
                     self.push_undo("Yeni eleman");
                     let idx = add_element(&mut self.doc, ElementType::Neckline, None);
                     self.state.selected_elem = idx;
-                    self.state.all_elements_selected = false;
                     self.state.table_mode = TableMode::LeftLines;
                     self.state.active_table_side = LineSide::Left;
                     self.state.selected_rows.clear();
@@ -634,7 +669,6 @@ impl KalipEditorApp {
                 AppAction::DeleteElement => {
                     if self.state.selected_elem > 0 {
                         self.reset_element_scoped_modals();
-                        self.state.all_elements_selected = false;
                         self.push_undo("Elemanı sil");
                         if delete_element(&mut self.doc, self.state.selected_elem).is_some() {
                             self.state.selected_elem =
@@ -681,6 +715,7 @@ impl KalipEditorApp {
                             delete_line(&mut self.doc, self.state.selected_elem, side, r);
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         let new_len = self
                             .doc
                             .elements
@@ -728,32 +763,6 @@ impl KalipEditorApp {
                         self.sync_current_if_mirrored();
                     }
                 }
-                AppAction::CreateClosingLine => {
-                    self.state.editing_cell = None;
-                    let side = self.state.table_mode.side();
-                    if let Some(el) = self.doc.elements.get(self.state.selected_elem) {
-                        let sum_x: i32 = el.lines(side).iter().map(|l| l.stitches).sum();
-                        if sum_x != 0 {
-                            self.push_undo("Bitiş çizgisi oluştur");
-                            if let Some(pos) =
-                                update_or_append_closing_line(&mut self.doc, self.state.selected_elem, side)
-                            {
-                                if let Some(line) = self.doc.elements[self.state.selected_elem]
-                                    .lines_mut(side)
-                                    .get_mut(pos)
-                                {
-                                    line.function = LineFunction::None;
-                                }
-                                self.sync_current_if_mirrored();
-                                self.state.select_single_row(pos);
-                                self.state.focused_cell = Some((pos, 3));
-                                self.state.set_status("Bitiş çizgisi dX=0 olarak güncellendi.", false);
-                            }
-                        } else {
-                            self.state.set_status("Kontur zaten eksene kapalı.", false);
-                        }
-                    }
-                }
                 AppAction::AppendLine => {
                     self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
@@ -794,6 +803,7 @@ impl KalipEditorApp {
                             self.maybe_apply_default_template_to_line(side, pos);
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
                         self.state.focused_cell = Some((pos, if was_empty && is_basic { 3 } else { 2 }));
                     }
@@ -845,6 +855,7 @@ impl KalipEditorApp {
                             self.maybe_apply_default_template_to_line(side, pos);
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
                         self.state.focused_cell = Some((pos, if was_empty && is_basic { 3 } else { 2 }));
                     }
@@ -865,6 +876,7 @@ impl KalipEditorApp {
                             recalc_line_from_stitches_and_rows(line, &hdr);
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
                         self.state.focused_cell = Some((pos, 3));
                         self.state.set_status("Temel çizgi eklendi.", false);
@@ -878,11 +890,11 @@ impl KalipEditorApp {
                     let hdr = self.doc.header.clone();
                     let base_dx = if side == LineSide::Left { -80 } else { 80 };
                     let spec = [
-                        (LineFunction::BaseLine, 0, base_dx, 0),
-                        (LineFunction::None, 120, 0, 0),
-                        (LineFunction::None, 0, -base_dx, 1),
+                        (LineFunction::BaseLine, 0, base_dx, false),
+                        (LineFunction::None, 120, 0, false),
+                        (LineFunction::None, 0, -base_dx, true),
                     ];
-                    for (func, r, s, last_l) in spec {
+                    for (func, r, s, is_closing) in spec {
                         if let Some(pos) = append_line(&mut self.doc, self.state.selected_elem, side) {
                             if let Some(line) = self.doc.elements[self.state.selected_elem]
                                 .lines_mut(side)
@@ -891,13 +903,25 @@ impl KalipEditorApp {
                                 line.function = func;
                                 line.rows = r;
                                 line.stitches = s;
-                                line.last_line = last_l;
+                                line.last_line = 0;
+                                if is_closing {
+                                    line.default_widening = 1;
+                                    line.default_used = 0;
+                                    line.comment.clear();
+                                    line.narrowing = None;
+                                    line.widening = None;
+                                    line.binding_off = None;
+                                    line.fade_out = None;
+                                    line.connection_points = None;
+                                    line.child_order.clear();
+                                }
                                 recalc_line_from_stitches_and_rows(line, &hdr);
                             }
                         }
                     }
                     sync_all_endline_elements(&mut self.doc, &endline_dists);
                     self.sync_current_if_mirrored();
+                    auto_sync_closing_lines(&mut self.doc);
                     self.state.select_single_row(0);
                     self.state.focused_cell = Some((0, 3));
                     self.state.set_status("Dikdörtgen kalıp taslağı oluşturuldu.", false);
@@ -960,6 +984,7 @@ impl KalipEditorApp {
                         if pasted > 0 {
                             self.undo.push("Çizgi üzerine yapıştır", &snapshot);
                             self.sync_current_if_mirrored();
+                            auto_sync_closing_lines(&mut self.doc);
                             self.state.selected_rows = (start_r..start_r + pasted).collect();
                             self.state.row_select_anchor = Some(start_r);
                             self.state.focused_cell = Some((start_r, 2));
@@ -1006,6 +1031,7 @@ impl KalipEditorApp {
                             }
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         if inserted > 0 {
                             self.state.selected_rows = (row..row + inserted).collect();
                             self.state.row_select_anchor = Some(row);
@@ -1214,26 +1240,21 @@ impl KalipEditorApp {
                         line_idx,
                     });
                 }
-                AppAction::ApplyDirectives => {
+                AppAction::AddClosingLine => {
+                    self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
-                    let rows = self.state.selected_rows.clone();
-                    let dn = self.state.directive_narrowing;
-                    let dw = self.state.directive_widening;
-                    let dh = self.state.directive_height;
-                    self.push_undo("Yönergeler devir al");
-                    let n = apply_directives_to_lines(
-                        &mut self.doc,
-                        self.state.selected_elem,
-                        side,
-                        &rows,
-                        dn,
-                        dw,
-                        dh,
-                    );
-                    self.state.set_status(
-                        format!("Yönergeler {n} çizgiye uygulandı."),
-                        false,
-                    );
+                    self.push_undo("Bitiş çizgisi");
+                    if ensure_closing_line_for_side(&mut self.doc, self.state.selected_elem, side) {
+                        self.sync_current_if_mirrored();
+                        if let Some(el) = self.doc.elements.get(self.state.selected_elem) {
+                            let last = el.lines(side).len().saturating_sub(1);
+                            self.state.select_single_row(last);
+                            self.state.focused_cell = Some((last, 3));
+                        }
+                        self.state.set_status("Bitiş (kapanış) çizgisi güncellendi.", false);
+                    } else {
+                        self.state.set_status("Kalıp zaten kapalı veya boy henüz 0.", false);
+                    }
                 }
                 AppAction::ApplyStandardPreset => {
                     let presets = self.catalog.presets(self.state.preset_is_user);
@@ -1255,6 +1276,7 @@ impl KalipEditorApp {
                             self.doc.dirty = true;
                         }
                         self.sync_current_if_mirrored();
+                        auto_sync_closing_lines(&mut self.doc);
                         self.state.set_status(
                             format!("Standart özellik uygulandı: {}", preset.display_name),
                             false,
@@ -1284,6 +1306,7 @@ impl KalipEditorApp {
                     self.push_undo("İlmek yoğunluğu");
                     recalc_document_for_density_change(&mut self.doc);
                     sync_all_mirrored_elements(&mut self.doc);
+                    auto_sync_closing_lines(&mut self.doc);
                 }
                 AppAction::SetDensity {
                     density_x,
@@ -1299,6 +1322,7 @@ impl KalipEditorApp {
                     }
                     recalc_document_for_density_change(&mut self.doc);
                     sync_all_mirrored_elements(&mut self.doc);
+                    auto_sync_closing_lines(&mut self.doc);
                     self.state.set_status("İlmek yoğunluğu güncellendi.", false);
                 }
                 AppAction::CutTypeChanged => {
@@ -1352,7 +1376,6 @@ impl KalipEditorApp {
                     }
                 }
                 AppAction::SaveUserSettings => {
-                    self.state.user_settings.snap_even_rows = self.state.snap_even_rows;
                     self.state.user_settings.show_dimensions = self.state.show_dimensions;
                     self.state.user_settings.show_detail_columns = self.state.show_detail_columns;
                     self.state.user_settings.default_template_is_user = self.state.preset_is_user;
@@ -1440,7 +1463,6 @@ impl KalipEditorApp {
                     {
                         match import_settings_bundle(&path) {
                             Ok((loaded, tpl_imported)) => {
-                                self.state.snap_even_rows = loaded.snap_even_rows;
                                 self.state.show_dimensions = loaded.show_dimensions;
                                 self.state.show_detail_columns = loaded.show_detail_columns;
                                 self.state.preset_is_user = loaded.default_template_is_user;
@@ -1487,7 +1509,7 @@ impl KalipEditorApp {
         let copy_comment = self.state.preset_name_as_comment;
         if let Some(el) = self.doc.elements.get_mut(self.state.selected_elem) {
             if let Some(target) = el.lines_mut(side).get_mut(pos) {
-                let is_closing = target.rows == 0 && target.last_line != 0;
+                let is_closing = target.rows == 0 && target.default_widening == 1;
                 if target.function != LineFunction::BaseLine && !is_closing {
                     apply_standard_preset_to_line(target, &preset.template_line);
                     if copy_comment && !preset.template_line.comment.is_empty() {
@@ -1518,12 +1540,14 @@ impl KalipEditorApp {
             if let Some(el) = self.doc.elements.get_mut(idx) {
                 el.mirrored = false;
             }
+            self.state.right_panel_collapsed = false;
         } else {
             if let Some(el) = self.doc.elements.get_mut(idx) {
                 el.mirrored = true;
             }
             sync_mirrored_right_lines(&mut self.doc, idx);
             self.state.active_table_side = LineSide::Left;
+            self.state.right_panel_collapsed = true;
             if self.state.table_mode == TableMode::RightLines {
                 self.state.table_mode = TableMode::LeftLines;
             } else if self.state.table_mode == TableMode::RightMarkers {
@@ -1583,6 +1607,8 @@ impl KalipEditorApp {
         self.undo.clear();
         self.cad_canvas.clear_drag();
         self.reset_document_ui_state();
+        self.state.directive_narrowing = self.doc.guidelines.std_narrow_w.clamp(1, 20);
+        self.state.directive_widening = self.doc.guidelines.std_widen_w.clamp(1, 20);
         self.state.selected_rows.clear();
         self.state.focused_cell = None;
         self.state.set_status("Yeni kalıp oluşturuldu.", false);
@@ -1701,11 +1727,15 @@ impl KalipEditorApp {
         // 1. Floating `Kesim:` Graphics Window
         self.graphics_win.show(ctx, &self.doc, geom, &mut self.state);
 
-        // 2. 8-Tab Line Properties Modal
+        // 2. Curve / Line Editor Modal (drawn BEFORE LinePropsDialog so both stay open simultaneously with LineProps on top)
+        self.curve_editor_dlg
+            .show(ctx, &mut self.doc, &mut self.undo, &mut self.state);
+
+        // 3. 8-Tab Line Properties Modal
         self.line_props_dlg
             .show(ctx, &mut self.doc, &mut self.undo, &mut self.state, &self.catalog);
 
-        // 2b. Neckline Element Properties Modal (`Yaka kesimi özellikleri`, `50563`)
+        // 3b. Neckline Element Properties Modal (`Yaka kesim özellikleri`, `50563`)
         let mut neck_open = self.state.neckline_props_open;
         if neck_open {
             self.neckline_props_dlg.show(
@@ -1714,11 +1744,12 @@ impl KalipEditorApp {
                 &mut self.doc,
                 &mut self.undo,
                 &mut self.state,
+                &self.catalog,
             );
             self.state.neckline_props_open = neck_open;
         }
 
-        // 2c. Reference Line Select Modal (`Özellikleri başka çizgiden al...`, `DIALOG 4274`)
+        // 3c. Reference Line Select Modal (`Özellikleri başka çizgiden al...`, `DIALOG 4274`)
         let mut ref_open = self.state.ref_line_select_open;
         if ref_open {
             self.ref_line_select_dlg.show(
@@ -1730,10 +1761,6 @@ impl KalipEditorApp {
             );
             self.state.ref_line_select_open = ref_open;
         }
-
-        // 3. Curve / Line Editor Modal
-        self.curve_editor_dlg
-            .show(ctx, &mut self.doc, &mut self.undo, &mut self.state);
 
         // 4. Marker Multiply Modal
         self.point_multiply_dlg
@@ -1747,26 +1774,37 @@ impl KalipEditorApp {
         if let Some(pending) = self.state.pending_dirty_action.clone() {
             let mut open = true;
             let mut choice: Option<u8> = None;
-            win32_window(
+            show_modal_backdrop(ctx, "dirty_confirm_backdrop", true);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("dirty_confirm_modal"),
-                "Stoll Kalıp Editörü",
+                "Stoll Kalıp Editörü — Kaydedilsin mi?",
                 &mut open,
-                Some(vec2(300.0, 100.0)),
+                vec2(360.0, 124.0),
                 false,
                 true,
+                true,
                 |ui| {
-                    ui.add_space(4.0);
-                    ui.label("Kesim değiştirildi. Kaydedilsin mi?");
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Kesim değiştirildi. Değişiklikler kaydedilsin mi?")
+                                .font(bold_font(12.0)),
+                        );
+                    });
+                    ui.add_space(14.0);
+                    let row_w = 3.0 * 74.0 + 2.0 * 8.0;
+                    let pad = ((ui.available_width() - row_w) * 0.5).max(0.0);
                     ui.horizontal(|ui| {
-                        if win32_button(ui, "Evet", vec2(68.0, 22.0), true).clicked() {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add_space(pad);
+                        if win32_button(ui, "Evet", vec2(74.0, 24.0), true).clicked() {
                             choice = Some(1);
                         }
-                        if win32_button(ui, "Hayır", vec2(68.0, 22.0), true).clicked() {
+                        if win32_button(ui, "Hayır", vec2(74.0, 24.0), true).clicked() {
                             choice = Some(2);
                         }
-                        if win32_button(ui, "İptal", vec2(68.0, 22.0), true).clicked() {
+                        if win32_button(ui, "İptal", vec2(74.0, 24.0), true).clicked() {
                             choice = Some(0);
                         }
                     });
@@ -1810,23 +1848,34 @@ impl KalipEditorApp {
         if self.state.pending_mirror_confirm {
             let mut open = true;
             let mut confirm: Option<bool> = None;
-            win32_window(
+            show_modal_backdrop(ctx, "mirror_confirm_backdrop", true);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("mirror_confirm_modal"),
-                "Stoll Kalıp Editörü",
+                "Stoll Kalıp Editörü — Aynalama",
                 &mut open,
-                Some(vec2(320.0, 100.0)),
+                vec2(360.0, 124.0),
                 false,
                 true,
+                true,
                 |ui| {
-                    ui.add_space(4.0);
-                    ui.label("Sağ taraf sol tarafın aynası ile değiştirilsin mi?");
-                    ui.add_space(10.0);
+                    ui.add_space(6.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Sağ taraf sol tarafın aynası ile değiştirilsin mi?")
+                                .font(bold_font(11.5)),
+                        );
+                    });
+                    ui.add_space(14.0);
+                    let row_w = 2.0 * 74.0 + 8.0;
+                    let pad = ((ui.available_width() - row_w) * 0.5).max(0.0);
                     ui.horizontal(|ui| {
-                        if win32_button(ui, "Evet", vec2(68.0, 22.0), true).clicked() {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.add_space(pad);
+                        if win32_button(ui, "Evet", vec2(74.0, 24.0), true).clicked() {
                             confirm = Some(true);
                         }
-                        if win32_button(ui, "Hayır", vec2(68.0, 22.0), true).clicked() {
+                        if win32_button(ui, "Hayır", vec2(74.0, 24.0), true).clicked() {
                             confirm = Some(false);
                         }
                     });
@@ -1847,13 +1896,15 @@ impl KalipEditorApp {
         if self.state.external_import_open {
             let mut open = self.state.external_import_open;
             let mut do_import = false;
-            win32_window(
+            show_modal_backdrop(ctx, "external_import_backdrop", false);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("external_import_modal"),
                 "Harici tablodan ekle (CSV / TSV)",
                 &mut open,
-                Some(vec2(420.0, 240.0)),
+                vec2(430.0, 250.0),
                 true,
+                false,
                 false,
                 |ui| {
                     ui.label("Her satır: Boy;En [;BoyBas;EnBas;Faktör;Yorum]");
@@ -1900,6 +1951,7 @@ impl KalipEditorApp {
                 );
                 if added > 0 {
                     self.undo.push("Harici tablo içe aktar", &snapshot);
+                    auto_sync_closing_lines(&mut self.doc);
                     self.clamp_selection_after_doc_change();
                     self.state
                         .set_status(format!("{added} çizgi harici tablodan eklendi."), false);
@@ -1918,13 +1970,15 @@ impl KalipEditorApp {
         if self.state.print_preview_open {
             let mut open = self.state.print_preview_open;
             let mut do_print = false;
-            win32_window(
+            show_modal_backdrop(ctx, "print_preview_backdrop", false);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("print_preview_modal"),
                 "Sayfa görünümü",
                 &mut open,
-                Some(vec2(540.0, 360.0)),
+                vec2(550.0, 370.0),
                 true,
+                false,
                 false,
                 |ui| {
                     let name = if self.doc.header.name.is_empty() {
@@ -2011,17 +2065,17 @@ impl KalipEditorApp {
                 vec2(490.0, 320.0)
             };
 
-            win32_window(
+            show_modal_backdrop(ctx, "about_modal_backdrop", false);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("about_modal"),
                 "Stoll Kalıp Editörü — Hakkında & Güncellemeler",
                 &mut open,
-                Some(modal_size),
+                modal_size,
                 false,
                 true,
+                false,
                 |ui| {
-                    ui.set_min_width(466.0);
-
                     // Header with custom 64x64 icon + title + version
                     ui.horizontal(|ui| {
                         ui.add(
@@ -2264,12 +2318,14 @@ impl KalipEditorApp {
         // 11. Help dialog
         if self.state.help_open {
             let mut open = self.state.help_open;
-            win32_window(
+            show_modal_backdrop(ctx, "help_modal_backdrop", false);
+            show_studio_modal_window(
                 ctx,
                 egui::Id::new("help_modal"),
                 "Yardım konuları",
                 &mut open,
-                Some(vec2(400.0, 140.0)),
+                vec2(420.0, 160.0),
+                false,
                 false,
                 false,
                 |ui| {
@@ -2527,7 +2583,7 @@ impl eframe::App for KalipEditorApp {
                             if let Some(eg) = geom.elements.get(self.state.selected_elem) {
                                 ui.label(
                                     egui::RichText::new(format!(
-                                        "Eleman {}/{}  |  En: {} ilmek ({:.1} cm)  |  Boy: {} sıra ({:.1} cm)",
+                                        "Eleman {}/{}  |  En: {} iğne ({:.1} cm)  |  Boy: {} may ({:.1} cm)",
                                         self.state.selected_elem + 1,
                                         self.doc.elements.len(),
                                         eg.max_width_stitches,
@@ -2544,14 +2600,24 @@ impl eframe::App for KalipEditorApp {
                 });
         }
 
-        // ── Left Pane (~52%, resizable): Live Interactive CAD Canvas + Elemanlar ──
+        // ── Left Pane (resizable splitter): Live Interactive CAD Canvas + Elemanlar ──
+        ctx.style_mut(|s| {
+            s.interaction.resize_grab_radius_side = 6.0;
+        });
         let screen_w = ctx.screen_rect().width();
-        let default_left_w = (screen_w * 0.52).clamp(440.0, 820.0);
-        egui::SidePanel::left("studio_left_canvas_panel")
+        let max_left_w = (screen_w - 420.0).max(320.0);
+        let default_left_w = self
+            .state
+            .user_settings
+            .splitter_width
+            .unwrap_or_else(|| (screen_w * 0.48).clamp(320.0, 780.0))
+            .clamp(280.0, max_left_w);
+        let left_panel_resp = egui::SidePanel::left("studio_left_canvas_panel")
             .default_width(default_left_w)
-            .min_width(380.0)
-            .max_width((screen_w - 360.0).max(400.0))
+            .min_width(280.0)
+            .max_width(max_left_w)
             .resizable(true)
+            .show_separator_line(true)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
@@ -2559,12 +2625,14 @@ impl eframe::App for KalipEditorApp {
             )
             .show(ctx, |ui| {
                 let avail_h = ui.available_height();
-                let elem_strip_h = if self.state.selected_elem > 0 {
+                let elem_strip_h = if ui.available_width() < 430.0 {
+                    if self.doc.elements.len() > 1 { 250.0 } else { 196.0 }
+                } else if self.doc.elements.len() > 1 {
                     184.0
                 } else {
                     136.0
                 };
-                let canvas_h = (avail_h - elem_strip_h - 8.0).max(200.0);
+                let canvas_h = (avail_h - elem_strip_h - 8.0).max(180.0);
 
                 ui.allocate_ui_with_layout(
                     vec2(ui.available_width(), canvas_h),
@@ -2579,6 +2647,7 @@ impl eframe::App for KalipEditorApp {
                         );
                         if mutated {
                             sync_mirrored_right_lines(&mut self.doc, self.state.selected_elem);
+                            auto_sync_closing_lines(&mut self.doc);
                             self.state.editing_cell = None;
                             self.doc.dirty = true;
                         }
@@ -2596,14 +2665,39 @@ impl eframe::App for KalipEditorApp {
                     &mut actions,
                 );
             });
+        // Persist user-dragged splitter width (debounced) & draw subtle splitter grip dots
+        let splitter_rect = left_panel_resp.response.rect;
+        let actual_left_w = splitter_rect.width();
+        if self.capture.is_none() && actual_left_w.is_finite() && actual_left_w >= 280.0 {
+            let prev = self.state.user_settings.splitter_width;
+            if prev.is_none_or(|p| (p - actual_left_w).abs() > 1.0) {
+                self.state.user_settings.splitter_width = Some(actual_left_w);
+                self.window_save_deadline = Some(Instant::now() + Duration::from_millis(500));
+            }
+        }
+        {
+            let grip_painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("studio_splitter_grip"),
+            ));
+            let gx = splitter_rect.right();
+            let gy = splitter_rect.center().y;
+            for dy in [-6.0_f32, 0.0, 6.0] {
+                grip_painter.circle_filled(
+                    egui::pos2(gx, gy + dy),
+                    1.5,
+                    colors::TEXT_DISABLED,
+                );
+            }
+        }
 
-        // ── Right Pane (~48%): Summary Strip + Stacked Dual Tables ────────────────
+        // ── Right Pane: Summary Strip + Standart Özellikler + Stacked Dual Tables ──
         egui::CentralPanel::default()
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
                     .inner_margin(Margin {
-                        left: 0,
+                        left: 4,
                         right: 8,
                         top: 8,
                         bottom: 8,
@@ -2628,11 +2722,9 @@ impl eframe::App for KalipEditorApp {
 
         // Auto-persist view preferences if changed from toolbar, menu, or CAD HUD (never in capture mode)
         if self.capture.is_none()
-            && (self.state.snap_even_rows != self.state.user_settings.snap_even_rows
-                || self.state.show_dimensions != self.state.user_settings.show_dimensions
+            && (self.state.show_dimensions != self.state.user_settings.show_dimensions
                 || self.state.show_detail_columns != self.state.user_settings.show_detail_columns)
         {
-            self.state.user_settings.snap_even_rows = self.state.snap_even_rows;
             self.state.user_settings.show_dimensions = self.state.show_dimensions;
             self.state.user_settings.show_detail_columns = self.state.show_detail_columns;
             let _ = self.state.user_settings.save();

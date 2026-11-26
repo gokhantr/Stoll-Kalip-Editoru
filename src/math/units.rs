@@ -146,7 +146,7 @@ pub fn auto_detect_line_function_for_element(
         line.function = LineFunction::BindOff;
         return;
     }
-    if !is_first_row && line.rows == 0 && line.last_line != 0 {
+    if !is_first_row && line.rows == 0 && line.default_widening == 1 {
         line.function = LineFunction::None;
         return;
     }
@@ -235,6 +235,7 @@ pub fn recalc_line_from_stitches_and_rows(line: &mut LineSegment, header: &FormH
                     narrowing_width: nw,
                     widening_width: ww,
                     fade_out_width: fw,
+                    ..Default::default()
                 })
             };
             if let Some(ref mut c) = line.curve {

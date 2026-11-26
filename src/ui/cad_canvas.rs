@@ -4,9 +4,10 @@ use egui::{
 };
 
 use stoll_kalip_editoru::math::{
-    auto_detect_line_function_in_context, element_distance_from_top, mm_to_rows, mm_to_stitches,
-    recalc_line_from_stitches_and_rows, rows_to_mm, stitches_to_mm, sync_endline_element_y,
-    sync_mirrored_right_lines, DocumentGeometry, SegmentSpan,
+    auto_detect_line_function_in_context, auto_sync_closing_line_for_side,
+    element_distance_from_top, mm_to_rows, mm_to_stitches, recalc_line_from_stitches_and_rows,
+    rows_to_mm, stitches_to_mm, sync_endline_element_y, sync_mirrored_right_lines,
+    DocumentGeometry, SegmentSpan,
 };
 use stoll_kalip_editoru::model::{
     ElementType, FormDocument, LineSegment, LineSide, UndoStack, YReferenceLine,
@@ -90,6 +91,9 @@ pub struct CadCanvasState {
     hovered_target: Option<HoverTarget>,
     drag_state: Option<DragState>,
     measure_world: Option<((f64, f64), (f64, f64))>,
+    dragging_measure_end: Option<usize>,
+    crosshair_world: Option<(f64, f64)>,
+    dragging_crosshair: bool,
 }
 
 impl Default for CadCanvasState {
@@ -104,6 +108,9 @@ impl Default for CadCanvasState {
             hovered_target: None,
             drag_state: None,
             measure_world: None,
+            dragging_measure_end: None,
+            crosshair_world: None,
+            dragging_crosshair: false,
         }
     }
 }
@@ -113,11 +120,16 @@ impl CadCanvasState {
         self.zoom = 1.0;
         self.pan_px = egui::Vec2::ZERO;
         self.measure_world = None;
+        self.dragging_measure_end = None;
+        self.crosshair_world = None;
+        self.dragging_crosshair = false;
     }
 
     pub fn clear_drag(&mut self) {
         self.drag_state = None;
         self.hovered_target = None;
+        self.dragging_measure_end = None;
+        self.dragging_crosshair = false;
     }
 
     /// Render the interactive CAD canvas inside the given `ui`.
@@ -155,11 +167,11 @@ impl CadCanvasState {
         min_y_mm = min_y_mm.min(0.0);
         max_y_mm = max_y_mm.max(120.0);
 
-        // Leave generous margins for top HUD strip, bottom width dimension, and right height dimension pill
-        let pad_left = 56.0;
-        let pad_right = 118.0;
-        let pad_top = 52.0;
-        let pad_bottom = 54.0;
+        // Balanced margins so the garment sits dead-center in the left CAD canvas
+        let pad_left = 44.0;
+        let pad_right = 44.0;
+        let pad_top = 48.0;
+        let pad_bottom = 44.0;
 
         let plot_rect = Rect::from_min_max(
             pos2(rect.left() + pad_left, rect.top() + pad_top),
@@ -388,11 +400,38 @@ impl CadCanvasState {
             self.hovered_target = best_handle.or(best_edge).map(|(_, t)| t);
         }
 
-        // ── 3. Interactive Vertex/Midpoint Dragging (Seçenek 1: Komşu Korumalı) ──
+        // ── 3. Interactive Vertex/Midpoint Dragging, Crosshair Drag & Measure Ruler ──
         if !modal_open && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.measure_world = None;
+            self.dragging_measure_end = None;
+            self.crosshair_world = None;
+            self.dragging_crosshair = false;
             self.drag_state = None;
         }
+
+        // Check hover over crosshair center handle or measure ruler endpoints
+        let hover_crosshair_center = !modal_open
+            && hover_pos.is_some()
+            && self.crosshair_world.is_some_and(|(cx, cy)| {
+                hover_pos.unwrap().distance(world_to_screen(cx, cy)) <= 10.0
+            });
+        let hover_measure_end: Option<usize> = if !modal_open {
+            if let (Some(hp), Some(((ax, ay), (bx, by)))) = (hover_pos, self.measure_world) {
+                let da = hp.distance(world_to_screen(ax, ay));
+                let db = hp.distance(world_to_screen(bx, by));
+                if da <= 10.0 && da <= db {
+                    Some(0)
+                } else if db <= 10.0 {
+                    Some(1)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if !modal_open && response.hovered() {
             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -409,57 +448,78 @@ impl CadCanvasState {
             }
         }
 
-        if !modal_open && self.drag_state.is_none() && shift_held && response.drag_started_by(PointerButton::Primary) {
-            if let Some(hp) = response.interact_pointer_pos() {
-                let w = screen_to_world_mm(hp);
-                self.measure_world = Some((w, w));
-            }
-        } else if !modal_open && self.drag_state.is_none() && shift_held && response.dragged_by(PointerButton::Primary) {
-            if let (Some((start, _)), Some(hp)) =
-                (self.measure_world, response.interact_pointer_pos())
-            {
-                self.measure_world = Some((start, screen_to_world_mm(hp)));
-            }
-        } else if !modal_open && response.drag_started_by(PointerButton::Primary) && !shift_held {
-            if let Some(target) = self.hovered_target {
-                if matches!(target.kind, HandleKind::VertexEnd | HandleKind::Midpoint) {
-                    let is_mirrored = doc
-                        .elements
-                        .get(target.elem_idx)
-                        .map(|e| e.mirrored)
-                        .unwrap_or(true);
-                    let effective_side = if is_mirrored {
-                        LineSide::Left
-                    } else {
-                        target.side
-                    };
-                    if let Some(line) = doc
-                        .elements
-                        .get(target.elem_idx)
-                        .and_then(|e| e.lines(effective_side).get(target.line_idx))
-                    {
-                        let start_pos = response
-                            .interact_pointer_pos()
-                            .or(hover_pos)
-                            .unwrap_or(plot_rect.center());
-                        self.drag_state = Some(DragState {
-                            elem_idx: target.elem_idx,
-                            side: target.side,
-                            line_idx: target.line_idx,
-                            orig_line: line.clone(),
-                            start_pointer_pos: start_pos,
-                            undo_pushed: false,
-                        });
-                        // Select dragged segment in table
-                        state.selected_elem = target.elem_idx;
-                        state.active_table_side = effective_side;
-                        state.table_mode = match effective_side {
-                            LineSide::Left => TableMode::LeftLines,
-                            LineSide::Right => TableMode::RightLines,
-                        };
-                        state.select_single_row(target.line_idx);
-                        state.focused_cell = Some((target.line_idx, 2));
-                        state.editing_cell = None;
+        if !modal_open && self.drag_state.is_none() && response.drag_started_by(PointerButton::Primary) {
+            let press_pos = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if shift_held {
+                // Start Shift+Drag measure ruler at the EXACT initial press origin (zero jump!)
+                if let Some(p0) = press_pos {
+                    let w0 = screen_to_world_mm(p0);
+                    let w1 = response
+                        .interact_pointer_pos()
+                        .map(&screen_to_world_mm)
+                        .unwrap_or(w0);
+                    self.measure_world = Some((w0, w1));
+                    self.dragging_measure_end = Some(1);
+                }
+            } else if let Some(p0) = press_pos {
+                // Priority 1: Drag crosshair center handle
+                if let Some((cx, cy)) = self.crosshair_world {
+                    if p0.distance(world_to_screen(cx, cy)) <= 12.0 {
+                        self.dragging_crosshair = true;
+                    }
+                }
+                // Priority 2: Drag either endpoint of existing measure ruler
+                if !self.dragging_crosshair {
+                    if let Some(((ax, ay), (bx, by))) = self.measure_world {
+                        let da = p0.distance(world_to_screen(ax, ay));
+                        let db = p0.distance(world_to_screen(bx, by));
+                        if da <= 12.0 && da <= db {
+                            self.dragging_measure_end = Some(0);
+                        } else if db <= 12.0 {
+                            self.dragging_measure_end = Some(1);
+                        }
+                    }
+                }
+                // Priority 3: Vertex / midpoint handle drag
+                if !self.dragging_crosshair && self.dragging_measure_end.is_none() {
+                    if let Some(target) = self.hovered_target {
+                        if matches!(target.kind, HandleKind::VertexEnd | HandleKind::Midpoint) {
+                            let is_mirrored = doc
+                                .elements
+                                .get(target.elem_idx)
+                                .map(|e| e.mirrored)
+                                .unwrap_or(true);
+                            let effective_side = if is_mirrored {
+                                LineSide::Left
+                            } else {
+                                target.side
+                            };
+                            if let Some(line) = doc
+                                .elements
+                                .get(target.elem_idx)
+                                .and_then(|e| e.lines(effective_side).get(target.line_idx))
+                            {
+                                self.drag_state = Some(DragState {
+                                    elem_idx: target.elem_idx,
+                                    side: target.side,
+                                    line_idx: target.line_idx,
+                                    orig_line: line.clone(),
+                                    start_pointer_pos: p0,
+                                    undo_pushed: false,
+                                });
+                                state.selected_elem = target.elem_idx;
+                                state.active_table_side = effective_side;
+                                state.table_mode = match effective_side {
+                                    LineSide::Left => TableMode::LeftLines,
+                                    LineSide::Right => TableMode::RightLines,
+                                };
+                                state.select_single_row(target.line_idx);
+                                state.focused_cell = Some((target.line_idx, 2));
+                                state.editing_cell = None;
+                            }
+                        }
                     }
                 }
             }
@@ -468,7 +528,21 @@ impl CadCanvasState {
         let mut active_drag_pill: Option<(Pos2, String)> = None;
 
         if response.dragged_by(PointerButton::Primary) {
-            if let Some(ref mut ds) = self.drag_state {
+            if self.dragging_crosshair {
+                if let Some(hp) = response.interact_pointer_pos() {
+                    let w = screen_to_world_mm(hp);
+                    if compute_crosshair_spans(geom, w.0, w.1).is_some() {
+                        self.crosshair_world = Some(w);
+                    }
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else if let Some(end_idx) = self.dragging_measure_end {
+                if let (Some((a, b)), Some(hp)) = (self.measure_world, response.interact_pointer_pos()) {
+                    let w = screen_to_world_mm(hp);
+                    self.measure_world = Some(if end_idx == 0 { (w, b) } else { (a, w) });
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            } else if let Some(ref mut ds) = self.drag_state {
                 if let Some(cur_pos) = response.interact_pointer_pos() {
                     let delta_px = cur_pos - ds.start_pointer_pos;
                     let mut dx_mm = (delta_px.x as f64) / scale;
@@ -482,12 +556,8 @@ impl CadCanvasState {
                         }
                     }
 
-                    let mut dx_st = mm_to_stitches(dx_mm, &doc.header);
-                    let mut dy_st = mm_to_rows(dy_mm, &doc.header);
-
-                    if state.snap_even_rows && dy_st != 0 {
-                        dy_st = ((dy_st as f64 / 2.0).round() as i32) * 2;
-                    }
+                    let dx_st = mm_to_stitches(dx_mm, &doc.header);
+                    let dy_st = mm_to_rows(dy_mm, &doc.header);
 
                     let is_mirrored = doc
                         .elements
@@ -499,17 +569,20 @@ impl CadCanvasState {
                     } else {
                         ds.side
                     };
-                    if is_mirrored && ds.side == LineSide::Right {
-                        dx_st = -dx_st;
-                    }
+                    let dx_st = if is_mirrored && ds.side == LineSide::Right {
+                        -dx_st
+                    } else {
+                        dx_st
+                    };
 
                     let is_base_row = doc
                         .elements
                         .get(ds.elem_idx)
                         .map(|e| e.is_base_line_row(effective_side, ds.line_idx))
                         .unwrap_or(ds.line_idx == 0);
-                    let lock_rows = is_base_row
-                        || (ds.orig_line.last_line != 0 && ds.orig_line.rows == 0);
+                    let is_orig_closing =
+                        ds.orig_line.rows == 0 && ds.orig_line.default_widening == 1;
+                    let lock_rows = is_base_row || is_orig_closing;
                     let new_stitches = ds.orig_line.stitches + dx_st;
                     let new_rows = if lock_rows {
                         ds.orig_line.rows
@@ -539,8 +612,7 @@ impl CadCanvasState {
                             let line_count = el.lines(effective_side).len();
                             let was_closing = ds.line_idx > 0
                                 && ds.line_idx + 1 == line_count
-                                && ds.orig_line.rows == 0
-                                && ds.orig_line.last_line != 0;
+                                && is_orig_closing;
                             if let Some(line) = el.lines_mut(effective_side).get_mut(ds.line_idx) {
                                 *line = ds.orig_line.clone();
                                 line.stitches = new_stitches;
@@ -557,6 +629,7 @@ impl CadCanvasState {
                             }
                         }
                         if doc_mutated {
+                            auto_sync_closing_line_for_side(doc, ds.elem_idx, effective_side);
                             for (ei, dist_top) in endline_dists {
                                 sync_endline_element_y(doc, ei, dist_top);
                             }
@@ -580,7 +653,7 @@ impl CadCanvasState {
                         let h_cm = rows_to_mm(line.rows, &header_copy) / 10.0;
                         let lock_hint = if shift_held { " [Eksen Kilit]" } else { "" };
                         pill_label = Some(format!(
-                            "Satır {}{}{} | Boy: {} sıra ({:.1} cm) | En: {:+} ilmek ({:+.1} cm)",
+                            "Satır {}{}{} | Boy: {} may ({:.1} cm) | En: {:+} iğne ({:+.1} cm)",
                             ds.line_idx + 1,
                             func_part,
                             lock_hint,
@@ -595,13 +668,18 @@ impl CadCanvasState {
                     }
                 }
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
-            } else if !shift_held {
-                // Pan on empty canvas drag
+            } else if !shift_held
+                && self.hovered_target.is_none()
+                && state.selected_rows.is_empty()
+            {
+                // Pan only when no line or handle is selected/hovered (prevents accidental pan while dragging handles)
                 self.pan_px += response.drag_delta();
                 ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
             }
-        } else if response.dragged_by(PointerButton::Middle)
-            || response.dragged_by(PointerButton::Secondary)
+        } else if (response.dragged_by(PointerButton::Middle)
+            || response.dragged_by(PointerButton::Secondary))
+            && self.drag_state.is_none()
+            && self.hovered_target.is_none()
         {
             self.pan_px += response.drag_delta();
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
@@ -613,11 +691,15 @@ impl CadCanvasState {
 
         if response.drag_stopped() {
             self.drag_state = None;
+            self.dragging_crosshair = false;
+            self.dragging_measure_end = None;
         }
 
-        if response.hovered() && self.drag_state.is_none() {
+        if response.hovered() && self.drag_state.is_none() && !self.dragging_crosshair && self.dragging_measure_end.is_none() {
             if shift_held {
                 ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+            } else if hover_crosshair_center || hover_measure_end.is_some() {
+                ui.ctx().set_cursor_icon(CursorIcon::Grab);
             } else if let Some(t) = self.hovered_target {
                 match t.kind {
                     HandleKind::VertexEnd | HandleKind::Midpoint => {
@@ -634,6 +716,10 @@ impl CadCanvasState {
         let mut placed_num_rects: Vec<Rect> = Vec::new();
         for (ei, eg) in geom.elements.iter().enumerate() {
             if eg.hidden {
+                continue;
+            }
+            if !state.all_elements_selected && ei != active_elem && geom.elements.len() > 1 {
+                // Single-element view when user clicked an element thumbnail (shows only selected element)
                 continue;
             }
 
@@ -689,8 +775,6 @@ impl CadCanvasState {
 
                     let (stroke_col, stroke_w) = if is_selected {
                         (studio::SELECTED_BLUE, 3.0_f32)
-                    } else if state.all_elements_selected {
-                        (studio::SELECTED_BLUE, 2.2_f32)
                     } else if is_hovered {
                         (studio::HOVER_RED, 2.5_f32)
                     } else {
@@ -852,8 +936,8 @@ impl CadCanvasState {
             );
         }
 
-        // ── 6. Click / Double-click Selection & Dialog Launch ────────────────────
-        if response.double_clicked() {
+        // ── 6. Click / Double-click Selection, Crosshair & Dialog Launch ─────────
+        if !modal_open && response.double_clicked() {
             if let Some(t) = self.hovered_target {
                 let is_mirrored = doc
                     .elements
@@ -866,7 +950,6 @@ impl CadCanvasState {
                     t.side
                 };
                 state.selected_elem = t.elem_idx;
-                state.all_elements_selected = false;
                 state.active_table_side = effective_side;
                 state.table_mode = match effective_side {
                     LineSide::Left => TableMode::LeftLines,
@@ -899,7 +982,7 @@ impl CadCanvasState {
             } else {
                 self.reset_view();
             }
-        } else if response.clicked() {
+        } else if !modal_open && response.clicked() {
             if let Some(t) = self.hovered_target {
                 let is_mirrored = doc
                     .elements
@@ -911,26 +994,55 @@ impl CadCanvasState {
                 } else {
                     t.side
                 };
-                state.selected_elem = t.elem_idx;
-                state.all_elements_selected = false;
-                state.active_table_side = effective_side;
-                state.table_mode = match effective_side {
-                    LineSide::Left => TableMode::LeftLines,
-                    LineSide::Right => TableMode::RightLines,
-                };
-                state.select_single_row(t.line_idx);
-                state.focused_cell = Some((t.line_idx, 2));
-                state.editing_cell = None;
+                let already_selected = state.selected_elem == t.elem_idx
+                    && state.active_table_side == effective_side
+                    && state.selected_rows.contains(&t.line_idx);
+
+                if already_selected {
+                    state.selected_rows.clear();
+                    state.row_select_anchor = None;
+                    state.focused_cell = None;
+                    state.editing_cell = None;
+                } else {
+                    state.selected_elem = t.elem_idx;
+                    state.active_table_side = effective_side;
+                    state.table_mode = match effective_side {
+                        LineSide::Left => TableMode::LeftLines,
+                        LineSide::Right => TableMode::RightLines,
+                    };
+                    state.select_single_row(t.line_idx);
+                    state.focused_cell = Some((t.line_idx, 2));
+                    state.editing_cell = None;
+                }
+            } else if !shift_held {
+                if let Some(click_pos) = response.interact_pointer_pos() {
+                    let (wx_mm, wy_mm) = screen_to_world_mm(click_pos);
+                    let on_crosshair_center = self.crosshair_world.is_some_and(|(cx, cy)| {
+                        click_pos.distance(world_to_screen(cx, cy)) <= 12.0
+                    });
+                    if on_crosshair_center {
+                        self.crosshair_world = None;
+                    } else if compute_crosshair_spans(geom, wx_mm, wy_mm).is_some() {
+                        if self.crosshair_world.is_some() {
+                            self.crosshair_world = None;
+                        } else {
+                            self.crosshair_world = Some((wx_mm, wy_mm));
+                        }
+                    }
+                }
             }
         }
 
-        // ── 7. Shift+Drag Measure Ruler Overlay ──────────────────────────────────
+        // ── 7. Shift+Drag Measure Ruler & Click-Inside `+` Crosshair Overlay ─────
         if let Some(((ax, ay), (bx, by))) = self.measure_world {
             let pa = world_to_screen(ax, ay);
             let pb = world_to_screen(bx, by);
-            draw_dashed_segment(&painter, pa, pb, Stroke::new(1.5_f32, studio::RULER_COLOR));
-            for p in [pa, pb] {
-                painter.circle_filled(p, 3.5, studio::RULER_COLOR);
+            draw_dashed_segment(&painter, pa, pb, Stroke::new(1.8_f32, studio::RULER_COLOR));
+            for (idx, p) in [pa, pb].into_iter().enumerate() {
+                let hot = self.dragging_measure_end == Some(idx) || hover_measure_end == Some(idx);
+                let col = if hot { studio::HOVER_RED } else { studio::RULER_COLOR };
+                painter.circle_filled(p, 5.0, Color32::WHITE);
+                painter.circle_stroke(p, 5.0, Stroke::new(2.0_f32, col));
             }
             let dmx = bx - ax;
             let dmy = by - ay;
@@ -938,7 +1050,7 @@ impl CadCanvasState {
             let drw = mm_to_rows(dmy, &doc.header);
             let dist_cm = (dmx * dmx + dmy * dmy).sqrt() / 10.0;
             let lbl = format!(
-                "Ölçüm: dX={} ilm ({:.1} cm) | dY={} sıra ({:.1} cm) | L={:.1} cm",
+                "Ölçüm: dX={} iğne ({:.1} cm) | dY={} may ({:.1} cm) | L={:.1} cm",
                 dst,
                 dmx / 10.0,
                 drw,
@@ -952,6 +1064,19 @@ impl CadCanvasState {
                 studio::HUD_TEXT,
                 studio::DIM_PILL_BG,
                 studio::RULER_COLOR,
+                rect,
+            );
+        }
+
+        if let Some((cx_mm, cy_mm)) = self.crosshair_world {
+            paint_inside_crosshair_ruler(
+                &painter,
+                doc,
+                geom,
+                cx_mm,
+                cy_mm,
+                hover_crosshair_center || self.dragging_crosshair,
+                &world_to_screen,
                 rect,
             );
         }
@@ -979,14 +1104,16 @@ impl CadCanvasState {
                 self.reset_view();
                 ui.close_menu();
             }
-            if self.measure_world.is_some() && ui.button("Ölçümü temizle").clicked() {
+            if (self.measure_world.is_some() || self.crosshair_world.is_some())
+                && ui.button("Ölçümü / Artı cetvelini temizle").clicked()
+            {
                 self.measure_world = None;
+                self.crosshair_world = None;
                 ui.close_menu();
             }
             ui.separator();
             ui.checkbox(&mut self.show_grid, "Izgara");
-            ui.checkbox(&mut state.show_dimensions, "Ölçüler (İlmek + cm)");
-            ui.checkbox(&mut state.snap_even_rows, "Çift May Snap (2, 4, 6...)");
+            ui.checkbox(&mut state.show_dimensions, "Ölçüler (İğne + cm)");
             ui.checkbox(&mut self.show_line_numbers, "Çizgi numaraları");
             ui.checkbox(&mut self.show_markers, "İşaretler");
             ui.checkbox(&mut self.show_mirror_axis, "Orta eksen (X=0)");
@@ -1041,9 +1168,6 @@ impl CadCanvasState {
                 if hud_chip_button(ui, "Ölçüler", state.show_dimensions).clicked() {
                     state.show_dimensions = !state.show_dimensions;
                 }
-                if hud_chip_button(ui, "Çift May Snap", state.snap_even_rows).clicked() {
-                    state.snap_even_rows = !state.snap_even_rows;
-                }
             });
 
         // Top-right live cursor readout (drops onto second row on narrow left pane so HUD never collides)
@@ -1053,7 +1177,7 @@ impl CadCanvasState {
                 let st_x = mm_to_stitches(wx_mm, &doc.header);
                 let st_y = mm_to_rows(wy_mm, &doc.header);
                 let readout = format!(
-                    "X: {} ilm / {:.1} cm   Y: {} sıra / {:.1} cm",
+                    "X: {} iğne / {:.1} cm   Y: {} may / {:.1} cm",
                     st_x,
                     wx_mm / 10.0,
                     st_y,
@@ -1116,36 +1240,41 @@ fn paint_cad_dimensions(
     world_to_screen: &impl Fn(f64, f64) -> Pos2,
     canvas_rect: Rect,
 ) {
-    let Some(eg) = geom.elements.get(state.selected_elem).or_else(|| geom.elements.first()) else {
+    // Show clean dimensions ONLY for the selected element: Başlangıç Eni, Bitiş Eni, Toplam Boy
+    let Some(eg) = geom
+        .elements
+        .get(state.selected_elem)
+        .filter(|e| !e.hidden && e.bounds.0.is_finite())
+        .or_else(|| geom.elements.first().filter(|e| !e.hidden && e.bounds.0.is_finite()))
+    else {
         return;
     };
-    if !eg.bounds.0.is_finite() {
-        return;
-    }
 
     let (min_x_mm, max_x_mm, min_y_mm, max_y_mm) = eg.bounds;
-    let total_w_st = eg.max_width_stitches;
-    let total_w_cm = eg.max_width_mm / 10.0;
     let total_h_rows = eg.total_height_rows;
     let total_h_cm = eg.total_height_mm / 10.0;
+    let poly = build_element_polygon_mm(eg);
 
     let dim_stroke = Stroke::new(1.2_f32, studio::DIM_LINE);
     let mut placed_dim_rects: Vec<Rect> = Vec::new();
-    // Reserve top HUD strip & top-right readout band so pills never collide with top HUD
     let safe_dim_rect = Rect::from_min_max(
         pos2(canvas_rect.left() + 4.0, canvas_rect.top() + 42.0),
         pos2(canvas_rect.right() - 4.0, canvas_rect.bottom() - 4.0),
     );
 
-    // 1. Bottom total width dimension line
-    let bl = world_to_screen(min_x_mm, min_y_mm);
-    let br = world_to_screen(max_x_mm, min_y_mm);
-    let y_dim = (bl.y.max(br.y) + 22.0).min(canvas_rect.bottom() - 18.0);
-    if (br.x - bl.x).abs() > 16.0 {
+    // 1. Başlangıç Eni (bottom width at min_y)
+    let (bot_l_mm, bot_r_mm) = horizontal_outer_span_near_y(&poly, min_y_mm + 0.5)
+        .unwrap_or((min_x_mm, max_x_mm));
+    let bot_w_mm = (bot_r_mm - bot_l_mm).abs();
+    let bot_w_st = mm_to_stitches(bot_w_mm, &doc.header);
+    let bl = world_to_screen(bot_l_mm, min_y_mm);
+    let br = world_to_screen(bot_r_mm, min_y_mm);
+    let y_dim = (bl.y.max(br.y) + 20.0).min(canvas_rect.bottom() - 16.0);
+    if (br.x - bl.x).abs() > 14.0 && bot_w_st > 0 {
         painter.line_segment([pos2(bl.x, y_dim), pos2(br.x, y_dim)], dim_stroke);
         painter.line_segment([pos2(bl.x, y_dim - 5.0), pos2(bl.x, y_dim + 5.0)], dim_stroke);
         painter.line_segment([pos2(br.x, y_dim - 5.0), pos2(br.x, y_dim + 5.0)], dim_stroke);
-        let w_lbl = format!("En: {} ilmek | {:.1} cm", total_w_st, total_w_cm);
+        let w_lbl = format!("Başlangıç Eni: {} iğne | {:.1} cm", bot_w_st, bot_w_mm / 10.0);
         let r = paint_pill_label(
             painter,
             pos2((bl.x + br.x) * 0.5, y_dim),
@@ -1158,15 +1287,47 @@ fn paint_cad_dimensions(
         placed_dim_rects.push(r);
     }
 
-    // 2. Right total height dimension line (pill sits strictly to the right of x_dim so it never touches contour)
+    // 2. Bitiş Eni (top width at max_y)
+    let (top_l_mm, top_r_mm) = horizontal_outer_span_near_y(&poly, max_y_mm - 0.5)
+        .unwrap_or((min_x_mm, max_x_mm));
+    let top_w_mm = (top_r_mm - top_l_mm).abs();
+    let top_w_st = mm_to_stitches(top_w_mm, &doc.header);
+    if top_w_st > 0 {
+        let tl = world_to_screen(top_l_mm, max_y_mm);
+        let tr = world_to_screen(top_r_mm, max_y_mm);
+        let y_top_dim = (tl.y.min(tr.y) - 16.0).max(safe_dim_rect.top() + 12.0);
+        if (tr.x - tl.x).abs() > 14.0 {
+            painter.line_segment([pos2(tl.x, y_top_dim), pos2(tr.x, y_top_dim)], dim_stroke);
+            painter.line_segment([pos2(tl.x, y_top_dim - 4.0), pos2(tl.x, y_top_dim + 4.0)], dim_stroke);
+            painter.line_segment([pos2(tr.x, y_top_dim - 4.0), pos2(tr.x, y_top_dim + 4.0)], dim_stroke);
+            let lbl = format!("Bitiş Eni: {} iğne | {:.1} cm", top_w_st, top_w_mm / 10.0);
+            let r = place_non_overlapping_pill(
+                painter,
+                &[
+                    pos2((tl.x + tr.x) * 0.5, y_top_dim - 12.0),
+                    pos2((tl.x + tr.x) * 0.5, y_top_dim),
+                    pos2((tl.x + tr.x) * 0.5, y_top_dim + 16.0),
+                ],
+                &lbl,
+                studio::HUD_TEXT,
+                studio::DIM_PILL_BG,
+                studio::DIM_PILL_BORDER,
+                safe_dim_rect,
+                &placed_dim_rects,
+            );
+            placed_dim_rects.push(r);
+        }
+    }
+
+    // 3. Toplam Boy (right vertical height)
     let rt = world_to_screen(max_x_mm, max_y_mm);
     let rb = world_to_screen(max_x_mm, min_y_mm);
-    let x_dim = (rt.x.max(rb.x) + 18.0).min(canvas_rect.right() - 98.0);
-    if (rb.y - rt.y).abs() > 16.0 {
+    let x_dim = (rt.x.max(rb.x) + 16.0).min(canvas_rect.right() - 14.0);
+    if (rb.y - rt.y).abs() > 14.0 {
         painter.line_segment([pos2(x_dim, rt.y), pos2(x_dim, rb.y)], dim_stroke);
         painter.line_segment([pos2(x_dim - 5.0, rt.y), pos2(x_dim + 5.0, rt.y)], dim_stroke);
         painter.line_segment([pos2(x_dim - 5.0, rb.y), pos2(x_dim + 5.0, rb.y)], dim_stroke);
-        let h_lbl = format!("Boy: {} sıra\n{:.1} cm", total_h_rows, total_h_cm);
+        let h_lbl = format!("Toplam Boy: {} may\n{:.1} cm", total_h_rows, total_h_cm);
         let galley = painter.layout_no_wrap(h_lbl, bold_font(10.5), studio::HUD_TEXT);
         let sz = galley.size() + vec2(10.0, 5.0);
         let pill_cx = (x_dim + 8.0 + sz.x * 0.5)
@@ -1183,79 +1344,291 @@ fn paint_cad_dimensions(
             StrokeKind::Inside,
         );
         painter.galley(brect.min + vec2(5.0, 2.5), galley, studio::HUD_TEXT);
-        placed_dim_rects.push(brect);
+        let _ = placed_dim_rects;
+    }
+}
+
+fn place_non_overlapping_pill(
+    painter: &egui::Painter,
+    candidates: &[Pos2],
+    text: &str,
+    text_color: Color32,
+    bg_color: Color32,
+    border_color: Color32,
+    clamp_rect: Rect,
+    placed: &[Rect],
+) -> Rect {
+    let galley = painter.layout_no_wrap(text.to_string(), bold_font(10.5), text_color);
+    let sz = galley.size() + vec2(10.0, 5.0);
+    let mut chosen = candidates.first().copied().unwrap_or(clamp_rect.center());
+    for &c in candidates {
+        let cx = c
+            .x
+            .clamp(clamp_rect.left() + sz.x * 0.5 + 4.0, clamp_rect.right() - sz.x * 0.5 - 4.0);
+        let cy = c
+            .y
+            .clamp(clamp_rect.top() + sz.y * 0.5 + 4.0, clamp_rect.bottom() - sz.y * 0.5 - 4.0);
+        let probe = Rect::from_center_size(pos2(cx, cy), sz);
+        if !placed.iter().any(|p| p.intersects(probe)) {
+            chosen = pos2(cx, cy);
+            break;
+        }
+    }
+    paint_pill_label(
+        painter,
+        chosen,
+        text,
+        text_color,
+        bg_color,
+        border_color,
+        clamp_rect,
+    )
+}
+
+/// Compute element-aware horizontal `(x_left, x_right)` and vertical `(y_bot, y_top)` spans
+/// for a crosshair at `(cx_mm, cy_mm)`:
+/// - If `(cx_mm, cy_mm)` lies inside a secondary element (e.g. Neckline/Hole), measures strictly inside it.
+/// - If inside Element 0 (`Ana Kesim`) outside secondary elements, clips rays at any secondary element boundary
+///   so the ruler stops at cutouts instead of passing through them.
+fn compute_crosshair_spans(
+    geom: &DocumentGeometry,
+    cx_mm: f64,
+    cy_mm: f64,
+) -> Option<((f64, f64), (f64, f64))> {
+    // 1. Check secondary elements first (innermost cutout wins)
+    for eg in geom.elements.iter().skip(1) {
+        if eg.hidden {
+            continue;
+        }
+        let poly = build_element_polygon_mm(eg);
+        if poly.len() >= 3 && point_in_poly_mm(cx_mm, cy_mm, &poly) {
+            let hx = horizontal_span_at_y(cx_mm, cy_mm, &poly)?;
+            let vy = vertical_span_at_x(cx_mm, cy_mm, &poly)?;
+            return Some((hx, vy));
+        }
     }
 
-    // 3. Selected segment callout with collision avoidance against contour hem & other pills
-    let segs = match state.active_table_side {
-        LineSide::Left => &eg.left_segments,
-        LineSide::Right => &eg.right_segments,
-    };
-    if let Some(&row_idx) = state.selected_rows.first() {
-        if let Some(seg) = segs.iter().find(|s| s.line_index == row_idx) {
-            if seg.polyline_mm.len() >= 2 {
-                let screen_pts: Vec<Pos2> = seg
-                    .polyline_mm
-                    .iter()
-                    .map(|p| world_to_screen(p.x, p.y))
-                    .collect();
-                let mid = polyline_midpoint(&screen_pts);
-                let w_st = seg.delta_st.0;
-                let h_rows = seg.delta_st.1;
-                let w_cm = stitches_to_mm(w_st, &doc.header) / 10.0;
-                let h_cm = rows_to_mm(h_rows, &doc.header) / 10.0;
-                let callout = format!(
-                    "#{}: {} sıra ({:.1} cm) x {} ilm ({:.1} cm)",
-                    seg.line_index + 1,
-                    h_rows,
-                    h_cm,
-                    w_st,
-                    w_cm
-                );
-                let is_bottom_horiz =
-                    h_rows == 0 && (seg.start_mm.y - min_y_mm).abs() < 2.0;
-                let offset_x = if is_bottom_horiz {
-                    0.0
-                } else if state.active_table_side == LineSide::Left {
-                    -14.0
-                } else {
-                    14.0
-                };
-                let candidates = if is_bottom_horiz {
-                    [
-                        pos2(mid.x + offset_x, mid.y - 26.0),
-                        pos2(mid.x + offset_x, y_dim - 24.0),
-                        pos2(mid.x + offset_x, mid.y - 46.0),
-                    ]
-                } else {
-                    [
-                        pos2(mid.x + offset_x, mid.y - 22.0),
-                        pos2(mid.x + offset_x, mid.y + 22.0),
-                        pos2(mid.x + offset_x, mid.y - 44.0),
-                    ]
-                };
-                let mut chosen = candidates[0];
-                let galley_probe =
-                    painter.layout_no_wrap(callout.clone(), bold_font(10.5), studio::SELECTED_BLUE);
-                let probe_sz = galley_probe.size() + vec2(10.0, 5.0);
-                for c in candidates {
-                    let r = Rect::from_center_size(c, probe_sz);
-                    if !placed_dim_rects.iter().any(|p| p.intersects(r)) {
-                        chosen = c;
-                        break;
-                    }
-                }
-                paint_pill_label(
-                    painter,
-                    chosen,
-                    &callout,
-                    studio::SELECTED_BLUE,
-                    studio::DIM_PILL_BG,
-                    studio::SELECTED_BLUE,
-                    safe_dim_rect,
-                );
+    // 2. Otherwise check primary Element 0 and clip against any secondary element boundaries
+    let eg0 = geom.elements.first().filter(|e| !e.hidden)?;
+    let poly0 = build_element_polygon_mm(eg0);
+    if poly0.len() < 3 || !point_in_poly_mm(cx_mm, cy_mm, &poly0) {
+        return None;
+    }
+    let (mut x_left, mut x_right) = horizontal_span_at_y(cx_mm, cy_mm, &poly0)?;
+    let (mut y_bot, mut y_top) = vertical_span_at_x(cx_mm, cy_mm, &poly0)?;
+
+    for sec_eg in geom.elements.iter().skip(1) {
+        if sec_eg.hidden {
+            continue;
+        }
+        let sec_poly = build_element_polygon_mm(sec_eg);
+        if sec_poly.len() < 3 {
+            continue;
+        }
+        for x in ray_crossings_horizontal(cy_mm, &sec_poly) {
+            if x >= x_left && x < cx_mm {
+                x_left = x_left.max(x);
+            } else if x > cx_mm && x <= x_right {
+                x_right = x_right.min(x);
             }
         }
+        for y in ray_crossings_vertical(cx_mm, &sec_poly) {
+            if y >= y_bot && y < cy_mm {
+                y_bot = y_bot.max(y);
+            } else if y > cy_mm && y <= y_top {
+                y_top = y_top.min(y);
+            }
+        }
+    }
+
+    Some(((x_left, x_right), (y_bot, y_top)))
+}
+
+fn paint_inside_crosshair_ruler(
+    painter: &egui::Painter,
+    doc: &FormDocument,
+    geom: &DocumentGeometry,
+    cx_mm: f64,
+    cy_mm: f64,
+    center_hot: bool,
+    world_to_screen: &impl Fn(f64, f64) -> Pos2,
+    canvas_rect: Rect,
+) {
+    let Some(((x_left, x_right), (y_bot, y_top))) = compute_crosshair_spans(geom, cx_mm, cy_mm) else {
+        return;
+    };
+
+    let cross_col = Color32::from_rgb(0x02, 0x84, 0xC7);
+    let stroke = Stroke::new(1.5_f32, cross_col);
+
+    let p_left = world_to_screen(x_left, cy_mm);
+    let p_right = world_to_screen(x_right, cy_mm);
+    let p_bot = world_to_screen(cx_mm, y_bot);
+    let p_top = world_to_screen(cx_mm, y_top);
+    let p_center = world_to_screen(cx_mm, cy_mm);
+
+    // Horizontal & vertical crosshair lines spanning the shape (clipped at element boundaries)
+    painter.line_segment([p_left, p_right], stroke);
+    painter.line_segment([p_bot, p_top], stroke);
+
+    // End ticks on shape boundary
+    painter.line_segment([pos2(p_left.x, p_left.y - 4.0), pos2(p_left.x, p_left.y + 4.0)], stroke);
+    painter.line_segment([pos2(p_right.x, p_right.y - 4.0), pos2(p_right.x, p_right.y + 4.0)], stroke);
+    painter.line_segment([pos2(p_bot.x - 4.0, p_bot.y), pos2(p_bot.x + 4.0, p_bot.y)], stroke);
+    painter.line_segment([pos2(p_top.x - 4.0, p_top.y), pos2(p_top.x + 4.0, p_top.y)], stroke);
+
+    // Draggable `+` center handle
+    let handle_col = if center_hot { studio::HOVER_RED } else { cross_col };
+    painter.circle_filled(p_center, 5.5, Color32::WHITE);
+    painter.circle_stroke(p_center, 5.5, Stroke::new(2.0_f32, handle_col));
+
+    let safe_rect = Rect::from_min_max(
+        pos2(canvas_rect.left() + 6.0, canvas_rect.top() + 44.0),
+        pos2(canvas_rect.right() - 6.0, canvas_rect.bottom() - 6.0),
+    );
+
+    let width_mm = (x_right - x_left).abs();
+    let width_st = mm_to_stitches(width_mm, &doc.header);
+    let w_lbl = format!("En: {} iğne ({:.1} cm)", width_st, width_mm / 10.0);
+
+    // Full vertical span height from bottom boundary to top boundary (clipped at secondary elements)
+    let height_mm = (y_top - y_bot).abs();
+    let height_rows = mm_to_rows(height_mm, &doc.header);
+    let h_lbl = format!("Boy: {} may ({:.1} cm)", height_rows, height_mm / 10.0);
+
+    let w_mid_x = (p_left.x + p_right.x) * 0.5;
+    let w_rect = place_non_overlapping_pill(
+        painter,
+        &[
+            pos2(w_mid_x, p_center.y - 18.0),
+            pos2(w_mid_x, p_center.y + 18.0),
+            pos2(p_right.x - 56.0, p_center.y - 18.0),
+        ],
+        &w_lbl,
+        cross_col,
+        studio::DIM_PILL_BG,
+        cross_col,
+        safe_rect,
+        &[],
+    );
+
+    let h_mid_y = (p_top.y + p_bot.y) * 0.5;
+    let _ = place_non_overlapping_pill(
+        painter,
+        &[
+            pos2(p_center.x + 68.0, h_mid_y),
+            pos2(p_center.x - 68.0, h_mid_y),
+            pos2(p_center.x + 68.0, p_center.y + 22.0),
+            pos2(p_center.x - 68.0, p_center.y + 22.0),
+        ],
+        &h_lbl,
+        cross_col,
+        studio::DIM_PILL_BG,
+        cross_col,
+        safe_rect,
+        &[w_rect],
+    );
+}
+
+fn build_element_polygon_mm(eg: &stoll_kalip_editoru::math::ElementGeometry) -> Vec<(f64, f64)> {
+    if eg.left_polyline.is_empty() || eg.right_polyline.is_empty() {
+        return Vec::new();
+    }
+    let mut poly: Vec<(f64, f64)> = eg.left_polyline.iter().map(|p| (p.x, p.y)).collect();
+    for p in eg.right_polyline.iter().rev() {
+        poly.push((p.x, p.y));
+    }
+    poly
+}
+
+fn point_in_poly_mm(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        let intersects = ((yi > y) != (yj > y))
+            && (x < (xj - xi) * (y - yi) / ((yj - yi) + 1e-18) + xi);
+        if intersects {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+fn ray_crossings_horizontal(y: f64, poly: &[(f64, f64)]) -> Vec<f64> {
+    let n = poly.len();
+    let mut xs = Vec::new();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi <= y && yj > y) || (yj <= y && yi > y) {
+            let t = (y - yi) / (yj - yi);
+            xs.push(xi + t * (xj - xi));
+        }
+        j = i;
+    }
+    xs.sort_by(|a, b| a.total_cmp(b));
+    xs
+}
+
+fn horizontal_span_at_y(x: f64, y: f64, poly: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let xs = ray_crossings_horizontal(y, poly);
+    for pair in xs.chunks_exact(2) {
+        if x >= pair[0] - 1e-4 && x <= pair[1] + 1e-4 {
+            return Some((pair[0], pair[1]));
+        }
+    }
+    if xs.len() >= 2 {
+        Some((xs[0], *xs.last().unwrap()))
+    } else {
+        None
+    }
+}
+
+fn horizontal_outer_span_near_y(poly: &[(f64, f64)], y: f64) -> Option<(f64, f64)> {
+    let xs = ray_crossings_horizontal(y, poly);
+    if xs.len() >= 2 {
+        Some((xs[0], *xs.last().unwrap()))
+    } else {
+        None
+    }
+}
+
+fn ray_crossings_vertical(x: f64, poly: &[(f64, f64)]) -> Vec<f64> {
+    let n = poly.len();
+    let mut ys = Vec::new();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (xi <= x && xj > x) || (xj <= x && xi > x) {
+            let t = (x - xi) / (xj - xi);
+            ys.push(yi + t * (yj - yi));
+        }
+        j = i;
+    }
+    ys.sort_by(|a, b| a.total_cmp(b));
+    ys
+}
+
+fn vertical_span_at_x(x: f64, y: f64, poly: &[(f64, f64)]) -> Option<(f64, f64)> {
+    let ys = ray_crossings_vertical(x, poly);
+    for pair in ys.chunks_exact(2) {
+        if y >= pair[0] - 1e-4 && y <= pair[1] + 1e-4 {
+            return Some((pair[0], pair[1]));
+        }
+    }
+    if ys.len() >= 2 {
+        Some((ys[0], *ys.last().unwrap()))
+    } else {
+        None
     }
 }
 
@@ -1518,4 +1891,34 @@ fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     let t = ((p - a).dot(ab) / len_sq).clamp(0.0, 1.0);
     let proj = a + ab * t;
     p.distance(proj)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crosshair_polygon_spans_are_exact() {
+        // Symmetric sweater body: width 400mm at y=0..200, narrowing to 240mm at y=400
+        let poly = vec![
+            (-200.0, 0.0),
+            (-200.0, 200.0),
+            (-120.0, 400.0),
+            (120.0, 400.0),
+            (200.0, 200.0),
+            (200.0, 0.0),
+        ];
+        assert!(point_in_poly_mm(0.0, 100.0, &poly));
+        assert!(point_in_poly_mm(-50.0, 300.0, &poly));
+        assert!(!point_in_poly_mm(-190.0, 350.0, &poly));
+
+        let (xl, xr) = horizontal_span_at_y(0.0, 100.0, &poly).unwrap();
+        assert!((xl - (-200.0)).abs() < 1e-6 && (xr - 200.0).abs() < 1e-6);
+
+        let (xl2, xr2) = horizontal_span_at_y(10.0, 300.0, &poly).unwrap();
+        assert!((xl2 - (-160.0)).abs() < 1e-6 && (xr2 - 160.0).abs() < 1e-6);
+
+        let (yb, yt) = vertical_span_at_x(0.0, 150.0, &poly).unwrap();
+        assert!(yb.abs() < 1e-6 && (yt - 400.0).abs() < 1e-6);
+    }
 }

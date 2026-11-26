@@ -194,33 +194,72 @@ pub fn save_to_bytes_with_options(
     Ok(bytes)
 }
 
-/// Save a standalone curve (`[Kurve]` + `[KurvenLinie]` blocks) to a `.crv` file in Stoll UTF-16LE format.
-pub fn save_curve_file(curve: &crate::model::CurveData, path: impl AsRef<Path>) -> Result<(), IoError> {
+/// Serialize a standalone `[Kurve]` + `[KurvenLinie]` curve into an OLE2 CFB v3 `.FormCurve` byte vector
+/// containing a single UTF-16LE (no BOM) + CRLF `Form` stream matching Stoll M1plus 1:1.
+pub fn save_form_curve_to_bytes(curve: &crate::model::CurveData) -> Result<Vec<u8>, IoError> {
+    let cursor = Cursor::new(Vec::new());
+    let mut comp = cfb::CompoundFile::create_with_version(cfb::Version::V3, cursor)
+        .map_err(|e| IoError::Ole(e.to_string()))?;
+
     let text = crate::io::serializer::serialize_curve_text(curve);
-    let bytes = encode_form_utf16le(&text, false);
-    std::fs::write(path.as_ref(), bytes)?;
+    let form_bytes = encode_form_utf16le(&text, false);
+    {
+        let mut s = comp
+            .create_stream(STREAM_FORM)
+            .map_err(|e| IoError::Ole(e.to_string()))?;
+        s.write_all(&form_bytes)?;
+    }
+
+    comp.flush().map_err(|e| IoError::Ole(e.to_string()))?;
+    let mut bytes = comp.into_inner().into_inner();
+    if bytes.len() >= 512 && u16::from_le_bytes([bytes[26], bytes[27]]) == 3 {
+        bytes[40..44].copy_from_slice(&0u32.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+/// Save a standalone curve (`[Kurve]` + `[KurvenLinie]` blocks) to a Stoll `.FormCurve` OLE2 CFB v3 file.
+pub fn save_form_curve(path: impl AsRef<Path>, curve: &crate::model::CurveData) -> Result<(), IoError> {
+    let bytes = save_form_curve_to_bytes(curve)?;
+    let mut f = File::create(path.as_ref())?;
+    f.write_all(&bytes)?;
     Ok(())
 }
 
-/// Load a standalone curve (`.crv` or plain text `[Kurve]`/`[KurvenLinie]` file) in UTF-16LE (with/without BOM) or UTF-8.
-pub fn load_curve_file(path: impl AsRef<Path>) -> Result<crate::model::CurveData, IoError> {
+/// Load a standalone Stoll `.FormCurve` OLE2 CFB v3 file from disk into `CurveData`.
+pub fn load_form_curve(path: impl AsRef<Path>) -> Result<crate::model::CurveData, IoError> {
     let bytes = std::fs::read(path.as_ref())?;
-    parse_curve_bytes(&bytes)
+    load_form_curve_from_bytes(&bytes)
 }
 
-/// Parse curve bytes (UTF-16LE or UTF-8) into `CurveData`.
-pub fn parse_curve_bytes(bytes: &[u8]) -> Result<crate::model::CurveData, IoError> {
-    let text = if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        decode_form_utf16le(bytes).map_err(IoError::Parse)?.0
-    } else if bytes.len() >= 4
-        && bytes.len() % 2 == 0
-        && bytes[1] == 0
-        && bytes[3] == 0
-    {
-        decode_form_utf16le(bytes).map_err(IoError::Parse)?.0
-    } else {
-        String::from_utf8_lossy(bytes).into_owned()
-    };
+/// Load a standalone Stoll `.FormCurve` OLE2 CFB v3 file from an in-memory byte slice into `CurveData`.
+pub fn load_form_curve_from_bytes(bytes: &[u8]) -> Result<crate::model::CurveData, IoError> {
+    let cursor = Cursor::new(bytes);
+    let mut comp = cfb::CompoundFile::open(cursor).map_err(|e| IoError::Ole(e.to_string()))?;
+
+    let mut form_bytes: Option<Vec<u8>> = None;
+    let stream_paths: Vec<String> = comp
+        .walk()
+        .filter(|e| e.is_stream())
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+    for sp in stream_paths {
+        let norm = sp.replace('\\', "/");
+        if norm == "/Form" || norm == "Form" {
+            let mut s = comp
+                .open_stream(&sp)
+                .map_err(|e| IoError::Ole(format!("{sp}: {e}")))?;
+            let mut data = Vec::new();
+            s.read_to_end(&mut data)?;
+            form_bytes = Some(data);
+            break;
+        }
+    }
+
+    let raw_form = form_bytes
+        .ok_or_else(|| IoError::Parse("FormCurve dosyasında 'Form' akışı bulunamadı.".into()))?;
+    let (text, _had_bom, _trailing_nl) =
+        decode_form_utf16le(&raw_form).map_err(IoError::Parse)?;
 
     // Wrap into a minimal synthetic Form stream and reuse the lossless parser
     let wrapped = format!(
@@ -233,9 +272,11 @@ pub fn parse_curve_bytes(bytes: &[u8]) -> Result<crate::model::CurveData, IoErro
         .next()
         .and_then(|e| e.left_lines.into_iter().next())
         .and_then(|l| l.curve)
-        .ok_or_else(|| IoError::Parse("Eğri dosyasında [Kurve] / [KurvenLinie] bölümü bulunamadı.".into()))?;
+        .ok_or_else(|| {
+            IoError::Parse("FormCurve dosyasında [Kurve] / [KurvenLinie] bölümü bulunamadı.".into())
+        })?;
     if curve.steps.is_empty() {
-        return Err(IoError::Parse("Eğri dosyası hiç basamak içermiyor.".into()));
+        return Err(IoError::Parse("FormCurve dosyası hiç basamak içermiyor.".into()));
     }
     Ok(curve)
 }
@@ -419,7 +460,10 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
         ));
     }
     if let Some(last) = kantes.last_mut() {
-        last.last_line = 1;
+        if last.rows == 0 && last.function != crate::model::LineFunction::BaseLine {
+            last.last_line = 0;
+            last.default_widening = 1;
+        }
     }
 
     let el = &mut doc.elements[0];

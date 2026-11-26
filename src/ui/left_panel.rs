@@ -6,7 +6,6 @@ use stoll_kalip_editoru::math::{
 };
 use stoll_kalip_editoru::model::{FormDocument, InputFormat, LineSide, UndoStack, YReferenceLine};
 
-use crate::ui::icons::{paint_studio_glyph, StudioGlyph};
 use crate::ui::menu_toolbar::paint_shape_thumbnail;
 use crate::ui::theme::{
     bold_font, colors, regular_font, studio_card_frame, win32_button, win32_checkbox,
@@ -59,35 +58,27 @@ pub fn show_elements_strip(
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 6.0;
 
-            // ── Header Bar: `Elemanlar (1/3)` | Actions | `Aynalama` ─────────────
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
+            // ── Header Bar: `Elemanlar (1/3)` | Actions | `Aynalama` (wraps cleanly on narrow panes) ──
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
                 ui.label(
                     egui::RichText::new(format!("Elemanlar ({}/{})", elem_idx + 1, elem_count))
                         .font(bold_font(11.5))
                         .color(colors::TEXT_BLACK),
                 );
-                if win32_button(ui, "+ Ekle", vec2(54.0, 20.0), true).clicked() {
+                if win32_button(ui, "+ Ekle", vec2(52.0, 20.0), true).clicked() {
                     actions.push(AppAction::AddElement);
                 }
-                if win32_button(ui, "Sil", vec2(38.0, 20.0), is_secondary).clicked() {
+                if win32_button(ui, "Sil", vec2(36.0, 20.0), is_secondary).clicked() {
                     actions.push(AppAction::DeleteElement);
                 }
-                if toggle_pill_button(ui, "Tümü", state.all_elements_selected, elem_count > 1)
-                    .clicked()
-                {
-                    actions.push(AppAction::SelectAllElements);
-                }
-                if is_neckline && win32_button(ui, "Yaka Öz.", vec2(60.0, 20.0), true).clicked() {
+                if is_neckline && win32_button(ui, "Yaka Öz.", vec2(58.0, 20.0), true).clicked() {
                     actions.push(AppAction::OpenNecklineProps);
                 }
-
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let mut m = cur_mirrored;
-                    if win32_checkbox(ui, &mut m, "Aynalama").changed() {
-                        actions.push(AppAction::MirrorToggled(m));
-                    }
-                });
+                let mut m = cur_mirrored;
+                if win32_checkbox(ui, &mut m, "Aynalama").changed() {
+                    actions.push(AppAction::MirrorToggled(m));
+                }
             });
 
             // Thin header divider
@@ -101,172 +92,200 @@ pub fn show_elements_strip(
             );
             ui.add_space(2.0);
 
-            // ── Left-to-Right Split: Thumbnail Strip | Form Grid ───────────────────
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-
-                // Left: Scrollable `48×54` element thumbnail cards (fits 2–3 cards cleanly)
-                let strip_max_w = if elem_count >= 3 { 164.0 } else { 108.0 };
-                egui::ScrollArea::horizontal()
+            // ── Responsive Split: 3×2 Thumbnail Grid | Form Grid (stacks cleanly on narrow splitter) ──
+            let panel_w = ui.available_width();
+            let narrow_stack = panel_w < 430.0;
+            let strip_max_w = if narrow_stack {
+                panel_w
+            } else if elem_count > 6 {
+                168.0
+            } else {
+                156.0
+            };
+            let show_thumbs = |ui: &mut Ui, doc: &mut FormDocument, undo: &mut UndoStack, state: &mut UiState| {
+                egui::ScrollArea::vertical()
                     .id_salt("elem_thumbs_scroll_studio")
                     .max_width(strip_max_w)
-                    .max_height(66.0)
+                    .max_height(114.0)
+                    .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            for i in 0..doc.elements.len() {
-                                let selected =
-                                    state.all_elements_selected || state.selected_elem == i;
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(vec2(48.0, 54.0), Sense::click());
-
-                                let thumb_rect = Rect::from_min_max(
-                                    rect.min,
-                                    egui::pos2(rect.right(), rect.bottom() - 15.0),
-                                );
-                                let badge_rect = Rect::from_min_max(
-                                    egui::pos2(rect.left(), rect.bottom() - 15.0),
-                                    rect.max,
-                                );
-
-                                if let Some(eg) = geom.elements.get(i) {
-                                    let mut lines: Vec<(&[stoll_kalip_editoru::math::Vec2], Color32, f32)> =
-                                        Vec::new();
-                                    if !eg.left_polyline.is_empty() {
-                                        lines.push((
-                                            &eg.left_polyline,
-                                            colors::CONTOUR_GREEN,
-                                            1.0,
-                                        ));
-                                    }
-                                    if !eg.right_polyline.is_empty() {
-                                        lines.push((
-                                            &eg.right_polyline,
-                                            colors::CONTOUR_GREEN,
-                                            1.0,
-                                        ));
-                                    }
-                                    let b = if eg.bounds.0.is_finite() {
-                                        eg.bounds
-                                    } else {
-                                        (-100.0, 100.0, 0.0, 200.0)
-                                    };
-                                    paint_shape_thumbnail(
-                                        ui.painter(),
-                                        thumb_rect,
-                                        &lines,
-                                        b,
-                                        true,
-                                        None,
-                                    );
-                                } else {
-                                    paint_shape_thumbnail(
-                                        ui.painter(),
-                                        thumb_rect,
-                                        &[],
-                                        (-100.0, 100.0, 0.0, 200.0),
-                                        true,
-                                        None,
-                                    );
-                                }
-
-                                let badge_bg = if selected {
-                                    colors::WIN_BLUE_FILL
-                                } else {
-                                    colors::INPUT_DISABLED_BG
-                                };
-                                let badge_fg = if selected {
-                                    colors::WIN_BLUE
-                                } else {
-                                    colors::TEXT_BLACK
-                                };
-                                ui.painter().rect_filled(badge_rect, CornerRadius::ZERO, badge_bg);
-                                ui.painter().text(
-                                    badge_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    format!("{}·{}", i + 1, element_short_tag_tr(doc.elements[i].art_tag_id)),
-                                    if selected { bold_font(9.5) } else { regular_font(9.5) },
-                                    badge_fg,
-                                );
-
-                                let (border_col, border_w) = if selected {
-                                    (colors::WIN_BLUE, 2.0_f32)
-                                } else if resp.hovered() {
-                                    (colors::WIN_BLUE, 1.2_f32)
-                                } else {
-                                    (colors::BORDER_DARK, 1.0_f32)
-                                };
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    CornerRadius::same(4),
-                                    Stroke::new(border_w, border_col),
-                                    StrokeKind::Inside,
-                                );
-
-                                if resp.clicked() {
-                                    if state.selected_elem != i {
-                                        crate::ui::grid_table::flush_active_grid_edit(doc, undo, state);
-                                        let old_idx = state.selected_elem;
-                                        ui.ctx().data_mut(|d| {
-                                            d.remove::<String>(ui.make_persistent_id(("studio_elem_name", old_idx)));
-                                        });
-                                    }
-                                    state.selected_elem = i;
-                                    state.all_elements_selected = false;
-                                    state.editing_cell = None;
-                                    if doc.elements[i].mirrored {
-                                        state.active_table_side = LineSide::Left;
-                                        if matches!(
-                                            state.table_mode,
-                                            TableMode::RightLines | TableMode::RightMarkers
-                                        ) {
-                                            state.table_mode = TableMode::LeftLines;
+                        let cols = 3usize;
+                        let total = doc.elements.len();
+                        let rows = total.div_ceil(cols).max(1);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 5.0;
+                            for row in 0..rows {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    for col in 0..cols {
+                                        let i = row * cols + col;
+                                        if i >= total {
+                                            break;
                                         }
-                                    }
-                                    let active_len = if state.table_mode.is_markers() {
-                                        match state.table_mode.side() {
-                                            LineSide::Left => doc.elements[i].left_points.len(),
-                                            LineSide::Right => doc.elements[i].right_points.len(),
+                                        let is_active = state.selected_elem == i;
+                                        let is_visible = state.all_elements_selected || is_active;
+                                        let (rect, resp) =
+                                            ui.allocate_exact_size(vec2(48.0, 52.0), Sense::click());
+
+                                        let thumb_rect = Rect::from_min_max(
+                                            rect.min,
+                                            egui::pos2(rect.right(), rect.bottom() - 15.0),
+                                        );
+                                        let badge_rect = Rect::from_min_max(
+                                            egui::pos2(rect.left(), rect.bottom() - 15.0),
+                                            rect.max,
+                                        );
+
+                                        if let Some(eg) = geom.elements.get(i) {
+                                            let mut lines: Vec<(&[stoll_kalip_editoru::math::Vec2], Color32, f32)> =
+                                                Vec::new();
+                                            if !eg.left_polyline.is_empty() {
+                                                lines.push((
+                                                    &eg.left_polyline,
+                                                    colors::CONTOUR_GREEN,
+                                                    1.0,
+                                                ));
+                                            }
+                                            if !eg.right_polyline.is_empty() {
+                                                lines.push((
+                                                    &eg.right_polyline,
+                                                    colors::CONTOUR_GREEN,
+                                                    1.0,
+                                                ));
+                                            }
+                                            let b = if eg.bounds.0.is_finite() {
+                                                eg.bounds
+                                            } else {
+                                                (-100.0, 100.0, 0.0, 200.0)
+                                            };
+                                            paint_shape_thumbnail(
+                                                ui.painter(),
+                                                thumb_rect,
+                                                &lines,
+                                                b,
+                                                true,
+                                                None,
+                                            );
+                                        } else {
+                                            paint_shape_thumbnail(
+                                                ui.painter(),
+                                                thumb_rect,
+                                                &[],
+                                                (-100.0, 100.0, 0.0, 200.0),
+                                                true,
+                                                None,
+                                            );
                                         }
-                                    } else {
-                                        doc.elements[i].lines(state.table_mode.side()).len()
-                                    };
-                                    if active_len > 0 {
-                                        state.select_single_row(0);
-                                        state.focused_cell = Some((0, 2));
-                                    } else {
-                                        state.selected_rows.clear();
-                                        state.focused_cell = None;
+
+                                        let badge_bg = if is_active {
+                                            colors::WIN_BLUE_FILL
+                                        } else if is_visible {
+                                            Color32::from_rgb(0xEE, 0xF5, 0xFF)
+                                        } else {
+                                            colors::INPUT_DISABLED_BG
+                                        };
+                                        let badge_fg = if is_active {
+                                            colors::WIN_BLUE
+                                        } else if is_visible {
+                                            Color32::from_rgb(0x1E, 0x40, 0xAF)
+                                        } else {
+                                            colors::TEXT_BLACK
+                                        };
+                                        ui.painter().rect_filled(badge_rect, CornerRadius::ZERO, badge_bg);
+                                        ui.painter().text(
+                                            badge_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            format!("{}·{}", i + 1, element_short_tag_tr(doc.elements[i].art_tag_id)),
+                                            if is_active { bold_font(9.5) } else { regular_font(9.5) },
+                                            badge_fg,
+                                        );
+
+                                        let (border_col, border_w) = if is_active {
+                                            (colors::WIN_BLUE, 2.0_f32)
+                                        } else if resp.hovered() {
+                                            (colors::WIN_BLUE, 1.3_f32)
+                                        } else if is_visible {
+                                            (Color32::from_rgb(0x93, 0xC5, 0xFD), 1.2_f32)
+                                        } else {
+                                            (colors::BORDER_DARK, 1.0_f32)
+                                        };
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            CornerRadius::same(4),
+                                            Stroke::new(border_w, border_col),
+                                            StrokeKind::Inside,
+                                        );
+
+                                        if resp.clicked() {
+                                            if state.selected_elem == i && elem_count > 1 {
+                                                // Toggle between single selected element and all elements visible
+                                                state.all_elements_selected = !state.all_elements_selected;
+                                            } else {
+                                                if state.selected_elem != i {
+                                                    crate::ui::grid_table::flush_active_grid_edit(doc, undo, state);
+                                                    let old_idx = state.selected_elem;
+                                                    ui.ctx().data_mut(|d| {
+                                                        d.remove::<String>(ui.make_persistent_id(("studio_elem_name", old_idx)));
+                                                    });
+                                                }
+                                                state.selected_elem = i;
+                                                state.all_elements_selected = false;
+                                                state.editing_cell = None;
+                                                if doc.elements[i].mirrored {
+                                                    state.active_table_side = LineSide::Left;
+                                                    state.right_panel_collapsed = true;
+                                                    if matches!(
+                                                        state.table_mode,
+                                                        TableMode::RightLines | TableMode::RightMarkers
+                                                    ) {
+                                                        state.table_mode = TableMode::LeftLines;
+                                                    }
+                                                } else {
+                                                    state.right_panel_collapsed = false;
+                                                }
+                                                let active_len = if state.table_mode.is_markers() {
+                                                    match state.table_mode.side() {
+                                                        LineSide::Left => doc.elements[i].left_points.len(),
+                                                        LineSide::Right => doc.elements[i].right_points.len(),
+                                                    }
+                                                } else {
+                                                    doc.elements[i].lines(state.table_mode.side()).len()
+                                                };
+                                                if active_len > 0 {
+                                                    state.select_single_row(0);
+                                                    state.focused_cell = Some((0, 2));
+                                                } else {
+                                                    state.selected_rows.clear();
+                                                    state.focused_cell = None;
+                                                }
+                                            }
+                                        }
+                                        let mut tip = if doc.elements[i].name.trim().is_empty() {
+                                            format!(
+                                                "{}: {}",
+                                                i + 1,
+                                                element_art_label_tr(doc.elements[i].art_tag_id)
+                                            )
+                                        } else {
+                                            format!(
+                                                "{}: {} ({})",
+                                                i + 1,
+                                                element_art_label_tr(doc.elements[i].art_tag_id),
+                                                doc.elements[i].name.trim()
+                                            )
+                                        };
+                                        if elem_count > 1 {
+                                            tip.push_str("\n(Seçili iken tekrar tıklayarak tek/tüm eleman görünümü değiştir)");
+                                        }
+                                        resp.on_hover_text(tip);
                                     }
-                                }
-                                let tip = if doc.elements[i].name.trim().is_empty() {
-                                    format!(
-                                        "{}: {}",
-                                        i + 1,
-                                        element_art_label_tr(doc.elements[i].art_tag_id)
-                                    )
-                                } else {
-                                    format!(
-                                        "{}: {} ({})",
-                                        i + 1,
-                                        element_art_label_tr(doc.elements[i].art_tag_id),
-                                        doc.elements[i].name.trim()
-                                    )
-                                };
-                                resp.on_hover_text(tip);
+                                });
                             }
                         });
                     });
+            };
 
-                // Subtle vertical divider between strip and form grid
-                let sep_top = ui.cursor().min;
-                let sep_h = if is_secondary { 118.0 } else { 72.0 };
-                let (_, _) = ui.allocate_exact_size(vec2(1.0, sep_h), Sense::hover());
-                ui.painter().line_segment(
-                    [sep_top, egui::pos2(sep_top.x, sep_top.y + sep_h)],
-                    Stroke::new(1.0_f32, colors::BORDER_LIGHT),
-                );
-
+            let show_form = |ui: &mut Ui, doc: &mut FormDocument, undo: &mut UndoStack, state: &mut UiState| {
                 // Right: Structured 2-Row Form Grid
                 let is_mm_mode = doc.header.input_format == InputFormat::Mm;
                 let hdr = doc.header.clone();
@@ -300,8 +319,8 @@ pub fn show_elements_strip(
                         };
                         let sw_w = if compact_row { 40.0 } else { 46.0 };
 
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = if compact_row { 4.0 } else { 6.0 };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing = vec2(if compact_row { 4.0 } else { 6.0 }, 4.0);
                             ui.label(
                                 egui::RichText::new("Tür:")
                                     .font(regular_font(10.5))
@@ -438,8 +457,8 @@ pub fn show_elements_strip(
                         } else {
                             format!("{:.0}", el.offset_x_stitches_base)
                         };
-                        let x_unit = if is_mm_mode { "mm" } else { "ilmek" };
-                        let y_unit = if is_mm_mode { "mm" } else { "sıra" };
+                        let x_unit = if is_mm_mode { "mm" } else { "iğne" };
+                        let y_unit = if is_mm_mode { "mm" } else { "may" };
 
                         if is_secondary {
                             ui.columns(2, |cols| {
@@ -730,7 +749,28 @@ pub fn show_elements_strip(
                         Err(e) => state.set_status(e, true),
                     }
                 }
-            });
+            };
+
+            if narrow_stack {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    show_thumbs(ui, doc, undo, state);
+                    show_form(ui, doc, undo, state);
+                });
+            } else {
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    show_thumbs(ui, doc, undo, state);
+                    let sep_top = ui.cursor().min;
+                    let sep_h = if is_secondary { 118.0 } else { 112.0 };
+                    let (_, _) = ui.allocate_exact_size(vec2(1.0, sep_h), Sense::hover());
+                    ui.painter().line_segment(
+                        [sep_top, egui::pos2(sep_top.x, sep_top.y + sep_h)],
+                        Stroke::new(1.0_f32, colors::BORDER_LIGHT),
+                    );
+                    show_form(ui, doc, undo, state);
+                });
+            }
         });
 }
 
@@ -755,60 +795,4 @@ fn unit_badge(ui: &mut Ui, unit: &str) {
         galley,
         colors::TEXT_SECONDARY,
     );
-}
-
-fn toggle_pill_button(ui: &mut Ui, label: &str, active: bool, enabled: bool) -> egui::Response {
-    let text_col = if !enabled {
-        colors::TEXT_DISABLED
-    } else if active {
-        colors::WIN_BLUE
-    } else {
-        colors::TEXT_BLACK
-    };
-    let font = if active {
-        bold_font(10.5)
-    } else {
-        regular_font(10.5)
-    };
-    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, text_col);
-    let icon_w = if active { 14.0 } else { 0.0 };
-    let size = vec2((icon_w + galley.size().x + 14.0).max(52.0), 20.0);
-    let sense = if enabled {
-        Sense::click()
-    } else {
-        Sense::hover()
-    };
-    let (rect, resp) = ui.allocate_exact_size(size, sense);
-    let (fill, border) = if !enabled {
-        (colors::INPUT_DISABLED_BG, colors::BORDER_LIGHT)
-    } else if active {
-        (colors::WIN_BLUE_FILL, colors::WIN_BLUE)
-    } else if resp.hovered() {
-        (colors::WIN_BLUE_HOVER, colors::WIN_BLUE)
-    } else {
-        (colors::CARD_BG, colors::BORDER_DARK)
-    };
-    let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(4), fill);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(4),
-        Stroke::new(1.0_f32, border),
-        StrokeKind::Inside,
-    );
-    let mut text_x = rect.center().x - galley.size().x * 0.5;
-    if active {
-        let ic_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + 5.0, rect.center().y - 5.5),
-            vec2(11.0, 11.0),
-        );
-        paint_studio_glyph(painter, ic_rect, StudioGlyph::Check, text_col);
-        text_x = ic_rect.right() + 3.0;
-    }
-    painter.galley(
-        egui::pos2(text_x, rect.center().y - galley.size().y * 0.5),
-        galley,
-        text_col,
-    );
-    resp
 }

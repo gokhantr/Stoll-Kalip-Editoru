@@ -3,12 +3,14 @@ use egui::{
     Sense, Stroke, StrokeKind, Ui,
 };
 
-use stoll_kalip_editoru::io::{load_curve_file, save_curve_file};
+use stoll_kalip_editoru::io::{load_form_curve, save_form_curve};
 use stoll_kalip_editoru::math::{
-    apply_curve_to_line, auto_detect_line_function_in_context, compress_pairs_to_steps,
-    curve_steps_sum_slice, element_distance_from_top, extract_curve_module_widths,
-    generate_curve_steps, recalc_line_from_stitches_and_rows, resample_user_curve, stoll_round,
-    sync_endline_element_y, sync_mirrored_right_lines, CurveGenParams,
+    apply_curve_to_line, auto_detect_line_function_in_context, auto_sync_closing_line_for_side,
+    check_curve_feasibility, curve_steps_sum_slice, detect_even_courses_from_steps,
+    element_distance_from_top, generate_curve_steps, normalize_curve_groups,
+    recalc_line_from_stitches_and_rows, resample_user_curve, resolve_curve_module_widths,
+    sync_endline_element_y, sync_mirrored_right_lines, CourseParityMode, CurveGenParams,
+    CurveStepDrive,
 };
 use stoll_kalip_editoru::model::{
     CurveData, CurveForm, CurveStep, FormDocument, KanteChildSlot, LineFunction, LineSide,
@@ -17,14 +19,21 @@ use stoll_kalip_editoru::model::{
 
 use crate::ui::icons::{paint_icon, IconKind};
 use crate::ui::theme::{
-    apply_pristine_zero_guard, bold_font, colors, regular_font, win32_button,
-    win32_numeric_text_edit,
+    apply_pristine_zero_guard, bold_font, colors, regular_font, win32_button, win32_checkbox,
+    win32_combo_scope, win32_numeric_text_edit, win32_radio,
 };
 use crate::ui::{CurveEditorRequest, LinePropsRequest, UiState};
 
+/// Active step-driving axis in Curve Editor (`En basamak` vs `Boy basamak`, mutually exclusive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepAxisMode {
+    Width,
+    Height,
+}
+
 /// Modal `Çizgi editörü` (`DIALOG 4265`) for editing `[Kurve]` / `[KurvenLinie]` curve steps
 /// with exact Stoll formulas (`Line`, `J-Curve`, `S-Curve`, `Reverse J-Curve`, `User Curve`),
-/// `.crv` load/save (`ENG-10`), multi-row grouping (`DLG-10`), and live 2D staircase plot.
+/// `.FormCurve` load/save, multi-row grouping, and live 2D staircase plot.
 #[derive(Debug, Clone)]
 pub struct CurveEditorDialogState {
     active_req: Option<CurveEditorRequest>,
@@ -33,14 +42,29 @@ pub struct CurveEditorDialogState {
     pub curve_form: CurveForm,
     /// Active UI preset state for `Ters J eğrisi` (stored as `UserCurve` for Stoll `.shp` parity).
     pub reverse_j_active: bool,
+    /// False when opened on a line that has NO `[Kurve]` yet until user clicks a formula or edits steps.
+    pub has_chosen_formula: bool,
+    /// True when the line already had a non-empty `[Kurve]` when the dialog opened (or after committing).
+    had_initial_curve: bool,
     pub steps: Vec<CurveStep>,
     /// Target `(NadelZahl, Reihen)` of the parent `[Kante]`.
     pub target_dx: i32,
     pub target_dy: i32,
     /// Whether the parent line is a widening line (controls whether `En ---` edits `widening_width`).
     pub is_widening: bool,
-    /// Horizontal step magnitude (`1..=99`) used when regenerating formula curves.
+    /// Mutually exclusive step-axis selector (`En basamak` vs `Boy basamak`).
+    step_axis_mode: StepAxisMode,
+    /// Horizontal step magnitude (`1..=99`) used when `step_axis_mode == StepAxisMode::Width`.
     pub step_x_mag: i32,
+    /// Vertical step magnitude (`1..=99`) used when `step_axis_mode == StepAxisMode::Height`.
+    pub step_y_mag: i32,
+    /// `☑ Çift May` — even-course curve stepping (default from `UserSettings.default_even_courses`).
+    pub even_courses: bool,
+    /// `☑ Tek Sistem` — right side even courses, left side odd courses (1 course offset).
+    pub single_system: bool,
+    /// `Min May` (`0` = `-` disabled, `1..=9` = minimum vertical step height).
+    pub min_step_height: i32,
+    orig_single_system: bool,
     /// Preserved step-level module widths `(MindernBreite, ZunehmenBreite, AusblendenBreite)`.
     pub default_widths: (i32, i32, i32),
     /// Multi-row selection (`0`-based, sorted & deduplicated) for Delete / Copy / Group (`DLG-10`).
@@ -68,6 +92,8 @@ pub struct CurveEditorDialogState {
     open_gen: u64,
     /// Incremented whenever `steps` are replaced/reordered outside cell editing (prevents stale egui IDs).
     table_gen: u64,
+    /// Tracks whether `LinePropsDialog` was open on the previous frame so closing it refreshes `default_widths`.
+    prev_line_props_open: bool,
 }
 
 impl Default for CurveEditorDialogState {
@@ -78,11 +104,19 @@ impl Default for CurveEditorDialogState {
             orig_steps: Vec::new(),
             curve_form: CurveForm::Line,
             reverse_j_active: false,
+            has_chosen_formula: false,
+            had_initial_curve: false,
             steps: Vec::new(),
             target_dx: 0,
             target_dy: 0,
             is_widening: false,
+            step_axis_mode: StepAxisMode::Width,
             step_x_mag: 1,
+            step_y_mag: 2,
+            even_courses: false,
+            single_system: false,
+            min_step_height: 0,
+            orig_single_system: false,
             default_widths: (0, 0, 0),
             selected_steps: Vec::new(),
             anchor_step: None,
@@ -97,6 +131,7 @@ impl Default for CurveEditorDialogState {
             notice: None,
             open_gen: 0,
             table_gen: 0,
+            prev_line_props_open: false,
         }
     }
 }
@@ -125,10 +160,36 @@ impl CurveEditorDialogState {
     }
 
     fn active_curve_label(&self) -> &'static str {
-        if self.reverse_j_active {
+        if !self.has_chosen_formula {
+            "Seçilmedi"
+        } else if self.reverse_j_active {
             "Ters J-eğrisi"
         } else {
             self.curve_form.label_tr()
+        }
+    }
+
+    fn effective_stoll_curve_form(&self) -> CurveForm {
+        let uses_custom_stepping = self.reverse_j_active
+            || self.even_courses
+            || self.single_system
+            || self.min_step_height > 0
+            || self.step_axis_mode == StepAxisMode::Height
+            || self.step_x_mag != 1;
+        if uses_custom_stepping {
+            CurveForm::UserCurve
+        } else {
+            self.curve_form
+        }
+    }
+
+    fn has_pending_changes(&self) -> bool {
+        if !self.had_initial_curve {
+            self.has_chosen_formula
+        } else {
+            self.effective_stoll_curve_form() != self.orig_form
+                || self.steps != self.orig_steps
+                || self.single_system != self.orig_single_system
         }
     }
 
@@ -150,18 +211,29 @@ impl CurveEditorDialogState {
         let mut changed = false;
         match col_i {
             1 => {
-                // Faktör Gruplandırılmış (`group_factor`)
+                // Faktör Gruplandırılmış (`group_factor` stored on first row of group; `0` on continuation rows)
                 let v = parsed.clamp(1, 99);
-                if self.steps[row_i].group_factor != v {
-                    let gid = self.steps[row_i].group_tag_id;
-                    self.steps[row_i].group_factor = v;
-                    if gid > 0 {
+                let gid = self.steps[row_i].group_tag_id;
+                if gid > 0 {
+                    let cur_gf = self
+                        .steps
+                        .iter()
+                        .filter(|s| s.group_tag_id == gid)
+                        .map(|s| s.group_factor)
+                        .max()
+                        .unwrap_or(1);
+                    if cur_gf != v {
+                        let mut first = true;
                         for s in &mut self.steps {
                             if s.group_tag_id == gid {
-                                s.group_factor = v;
+                                s.group_factor = if first { v } else { 0 };
+                                first = false;
                             }
                         }
+                        changed = true;
                     }
+                } else if self.steps[row_i].group_factor != v {
+                    self.steps[row_i].group_factor = v;
                     changed = true;
                 }
             }
@@ -181,10 +253,11 @@ impl CurveEditorDialogState {
                             .map(|(_, s)| s.group_factor)
                             .max();
                         if let Some(gf) = existing_gf {
-                            self.steps[row_i].group_factor = gf.max(1);
+                            self.steps[row_i].group_factor = gf.max(2);
                         } else {
                             self.steps[row_i].group_factor = self.steps[row_i].group_factor.max(2);
                         }
+                        normalize_curve_groups(&mut self.steps);
                     }
                     changed = true;
                 }
@@ -237,6 +310,7 @@ impl CurveEditorDialogState {
             _ => {}
         }
         if changed {
+            self.has_chosen_formula = true;
             self.curve_form = CurveForm::UserCurve;
             self.reverse_j_active = false;
         }
@@ -248,7 +322,13 @@ impl CurveEditorDialogState {
         };
         match col_i {
             0 => format!("{}", row_i + 1),
-            1 => st.group_factor.to_string(),
+            1 => {
+                if st.group_tag_id > 0 && st.group_factor == 0 {
+                    String::new()
+                } else {
+                    st.group_factor.to_string()
+                }
+            }
             2 => st.group_tag_id.to_string(),
             3 => st.step_height.to_string(),
             4 => st.step_width.to_string(),
@@ -290,7 +370,18 @@ impl CurveEditorDialogState {
                 self.target_dx = line.stitches;
                 self.target_dy = line.rows;
                 self.is_widening = line.function == LineFunction::Widening;
-                self.default_widths = extract_curve_module_widths(line);
+                self.default_widths = resolve_curve_module_widths(
+                    line,
+                    doc.guidelines.std_narrow_w,
+                    doc.guidelines.std_widen_w,
+                    doc.guidelines.std_fadeout_w,
+                );
+                self.even_courses = state.user_settings.default_even_courses;
+                self.single_system = line.single_system_curve;
+                self.min_step_height = 0;
+                self.orig_single_system = self.single_system;
+                self.step_axis_mode = StepAxisMode::Width;
+                self.step_y_mag = if self.even_courses { 2 } else { 1 };
                 self.reverse_j_active = false;
                 self.editing_cell = None;
                 self.editing_pristine = false;
@@ -301,8 +392,15 @@ impl CurveEditorDialogState {
                 self.notice = None;
 
                 if let Some(ref c) = line.curve.as_ref().filter(|c| !c.steps.is_empty()) {
+                    self.had_initial_curve = true;
+                    self.has_chosen_formula = true;
                     self.curve_form = CurveForm::from_id(c.function);
                     self.steps = c.steps.clone();
+                    normalize_curve_groups(&mut self.steps);
+                    // Auto-detect `Çift May` from existing step heights (zero non-Stoll `.shp` fields)
+                    self.even_courses =
+                        detect_even_courses_from_steps(&self.steps, self.single_system);
+                    self.step_y_mag = if self.even_courses { 2 } else { 1 };
                     self.step_x_mag = c
                         .steps
                         .iter()
@@ -317,26 +415,38 @@ impl CurveEditorDialogState {
                             self.step_x_mag
                         };
                         let (nw, ww, fw) = self.default_widths;
-                        let rj = generate_reverse_j_steps(
-                            line.stitches,
-                            line.rows,
-                            sx_signed,
-                            nw,
-                            ww,
-                            fw,
-                        );
-                        if !rj.is_empty()
-                            && rj.len() == c.steps.len()
-                            && rj.iter().zip(c.steps.iter()).all(|(a, b)| {
-                                a.step_width == b.step_width
-                                    && a.step_height == b.step_height
-                                    && a.factor == b.factor
-                            })
-                        {
-                            self.reverse_j_active = true;
+                        let parity_candidates = [self.parity_mode(req.side), CourseParityMode::Any];
+                        for pm in parity_candidates {
+                            let rj = generate_curve_steps(&CurveGenParams {
+                                curve_form: CurveForm::JCurve,
+                                total_dx: line.stitches,
+                                total_dy: line.rows,
+                                step_x: sx_signed,
+                                step_y: 0,
+                                narrowing_width: nw,
+                                widening_width: ww,
+                                fade_out_width: fw,
+                                parity_mode: pm,
+                                step_drive: CurveStepDrive::ByWidth,
+                                reverse_j: true,
+                                min_step_height: 0,
+                            });
+                            if !rj.is_empty()
+                                && rj.len() == c.steps.len()
+                                && rj.iter().zip(c.steps.iter()).all(|(a, b)| {
+                                    a.step_width == b.step_width
+                                        && a.step_height == b.step_height
+                                        && a.factor == b.factor
+                                })
+                            {
+                                self.reverse_j_active = true;
+                                break;
+                            }
                         }
                     }
                 } else {
+                    self.had_initial_curve = false;
+                    self.has_chosen_formula = false;
                     self.curve_form = line
                         .curve
                         .as_ref()
@@ -359,10 +469,18 @@ impl CurveEditorDialogState {
                         } else {
                             self.step_x_mag
                         },
-                        step_y: 0,
+                        step_y: if self.target_dy < 0 {
+                            -self.step_y_mag
+                        } else {
+                            self.step_y_mag
+                        },
                         narrowing_width: nw,
                         widening_width: ww,
                         fade_out_width: fw,
+                        parity_mode: self.parity_mode(req.side),
+                        step_drive: self.step_drive(),
+                        reverse_j: false,
+                        min_step_height: self.min_step_height,
                     });
                 }
                 self.orig_form = self.curve_form;
@@ -383,6 +501,24 @@ impl CurveEditorDialogState {
             }
         }
 
+        let line_props_open_now = state.line_props_req.is_some();
+        if self.prev_line_props_open && !line_props_open_now {
+            if let Some(line) = doc
+                .elements
+                .get(req.elem_idx)
+                .and_then(|e| e.lines(req.side).get(req.line_idx))
+            {
+                self.is_widening = line.function == LineFunction::Widening;
+                self.default_widths = resolve_curve_module_widths(
+                    line,
+                    doc.guidelines.std_narrow_w,
+                    doc.guidelines.std_widen_w,
+                    doc.guidelines.std_fadeout_w,
+                );
+            }
+        }
+        self.prev_line_props_open = line_props_open_now;
+
         let side_lbl = match req.side {
             LineSide::Left => "Sol",
             LineSide::Right => "Sağ",
@@ -398,8 +534,10 @@ impl CurveEditorDialogState {
 
         let was_editing_cell = self.editing_cell.is_some();
         let mut do_apply = false;
-        let mut do_close =
-            !was_editing_cell && !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Escape));
+        let mut do_close = !was_editing_cell
+            && !line_props_open_now
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| i.key_pressed(Key::Escape));
         let mut open_props_after = false;
 
         let screen_sz = ctx.screen_rect().size();
@@ -440,8 +578,8 @@ impl CurveEditorDialogState {
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
 
-                        // ── 1. Top Toolbar (`TOOLBAR 12105` + Load/Save `.crv` + Presets) ──
-                        self.show_toolbar(ui, &mut open_props_after);
+                        // ── 1. Top Toolbar (`TOOLBAR 12105` + Load/Save `.FormCurve` + Presets) ──
+                        self.show_toolbar(ui, req.side, &mut open_props_after);
 
                         ui.add_space(4.0);
 
@@ -536,7 +674,7 @@ impl CurveEditorDialogState {
 
         if open_props_after {
             self.flush_active_edit();
-            if self.curve_form != self.orig_form || self.steps != self.orig_steps {
+            if self.has_pending_changes() {
                 self.commit_to_doc(doc, undo, state, req);
             }
             let init_tab = doc
@@ -551,7 +689,7 @@ impl CurveEditorDialogState {
                 line_idx: req.line_idx,
                 initial_tab: init_tab,
             });
-            do_close = true;
+            // Keep Curve Editor open simultaneously while Line Properties is open
         } else if do_apply {
             self.flush_active_edit();
             self.commit_to_doc(doc, undo, state, req);
@@ -565,7 +703,7 @@ impl CurveEditorDialogState {
         }
     }
 
-    fn show_toolbar(&mut self, ui: &mut Ui, open_props_after: &mut bool) {
+    fn show_toolbar(&mut self, ui: &mut Ui, side: LineSide, open_props_after: &mut bool) {
         Frame::NONE
             .fill(colors::CHROME_BG)
             .stroke(Stroke::new(1.0_f32, colors::BORDER_LIGHT))
@@ -574,25 +712,27 @@ impl CurveEditorDialogState {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
 
-                    // Slots 1..2 (`TOOLBAR 12105`): Load / Save `.crv` (`ENG-10` / `DLG-10`)
+                    // Slots 1..2 (`TOOLBAR 12105`): Load / Save `.FormCurve`
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::LoadCurve,
-                        "Eğriyi/Bükümü yükle (.crv)",
+                        "Eğriyi/Bükümü yükle (.FormCurve)",
                         true,
                         false,
                     ) {
                         self.editing_cell = None;
                         if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Stoll Eğri Dosyası (*.crv)", &["crv"])
+                            .add_filter("Stoll Eğri Dosyası (*.FormCurve)", &["FormCurve", "formcurve"])
                             .add_filter("Tüm Dosyalar (*.*)", &["*"])
                             .pick_file()
                         {
-                            match load_curve_file(&path) {
+                            match load_form_curve(&path) {
                                 Ok(loaded) => {
+                                    self.has_chosen_formula = true;
                                     self.curve_form = CurveForm::from_id(loaded.function);
                                     self.reverse_j_active = false;
                                     self.steps = loaded.steps;
+                                    normalize_curve_groups(&mut self.steps);
                                     self.renumber_local_steps();
                                     self.table_gen = self.table_gen.wrapping_add(1);
                                     self.selected_steps.clear();
@@ -619,22 +759,24 @@ impl CurveEditorDialogState {
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::SaveCurve,
-                        "Eğriyi/Büküm...adında kaydet (.crv)",
+                        "Eğriyi/Bükümü farklı kaydet (.FormCurve)",
                         !self.steps.is_empty(),
                         false,
                     ) {
                         self.flush_active_edit();
                         if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("egri.crv")
-                            .add_filter("Stoll Eğri Dosyası (*.crv)", &["crv"])
+                            .set_file_name("egri.FormCurve")
+                            .add_filter("Stoll Eğri Dosyası (*.FormCurve)", &["FormCurve", "formcurve"])
                             .save_file()
                         {
+                            let mut steps_out = self.steps.clone();
+                            normalize_curve_groups(&mut steps_out);
                             let data = CurveData {
-                                function: self.curve_form.to_id(),
-                                steps: self.steps.clone(),
+                                function: self.effective_stoll_curve_form().to_id(),
+                                steps: steps_out,
                                 raw: Default::default(),
                             };
-                            match save_curve_file(&data, &path) {
+                            match save_form_curve(&path, &data) {
                                 Ok(()) => {
                                     self.notice =
                                         Some((format!("Kaydedildi: {}", path.display()), false));
@@ -654,57 +796,70 @@ impl CurveEditorDialogState {
                         CurveTbIcon::Line,
                         "Doğru oluştur (Bresenham / CalcFormula_Line)",
                         true,
-                        !self.reverse_j_active && self.curve_form == CurveForm::Line,
+                        self.has_chosen_formula
+                            && !self.reverse_j_active
+                            && self.curve_form == CurveForm::Line,
                     ) {
                         self.editing_cell = None;
+                        self.has_chosen_formula = true;
                         self.reverse_j_active = false;
                         self.curve_form = CurveForm::Line;
-                        self.regenerate_formula();
+                        self.regenerate_formula(side);
                     }
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::JCurve,
                         "J-eğrisi oluştur (CalcFormula_J)",
                         true,
-                        !self.reverse_j_active && self.curve_form == CurveForm::JCurve,
+                        self.has_chosen_formula
+                            && !self.reverse_j_active
+                            && self.curve_form == CurveForm::JCurve,
                     ) {
                         self.editing_cell = None;
+                        self.has_chosen_formula = true;
                         self.reverse_j_active = false;
                         self.curve_form = CurveForm::JCurve;
-                        self.regenerate_formula();
+                        self.regenerate_formula(side);
                     }
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::SCurve,
                         "S-eğrisi oluştur (CalcFormula_S)",
                         true,
-                        !self.reverse_j_active && self.curve_form == CurveForm::SCurve,
+                        self.has_chosen_formula
+                            && !self.reverse_j_active
+                            && self.curve_form == CurveForm::SCurve,
                     ) {
                         self.editing_cell = None;
+                        self.has_chosen_formula = true;
                         self.reverse_j_active = false;
                         self.curve_form = CurveForm::SCurve;
-                        self.regenerate_formula();
+                        self.regenerate_formula(side);
                     }
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::ReverseJCurve,
                         "Ters J eğrisi oluştur (Simetrik J-eğrisi)",
                         true,
-                        self.reverse_j_active,
+                        self.has_chosen_formula && self.reverse_j_active,
                     ) {
                         self.editing_cell = None;
+                        self.has_chosen_formula = true;
                         self.reverse_j_active = true;
                         self.curve_form = CurveForm::UserCurve;
-                        self.regenerate_formula();
+                        self.regenerate_formula(side);
                     }
                     if tb_icon_btn(
                         ui,
                         CurveTbIcon::UserCurve,
                         "Kullanıcı eğrisi / Serbest mod",
                         true,
-                        !self.reverse_j_active && self.curve_form == CurveForm::UserCurve,
+                        self.has_chosen_formula
+                            && !self.reverse_j_active
+                            && self.curve_form == CurveForm::UserCurve,
                     ) {
                         self.flush_active_edit();
+                        self.has_chosen_formula = true;
                         self.reverse_j_active = false;
                         self.curve_form = CurveForm::UserCurve;
                     }
@@ -734,8 +889,10 @@ impl CurveEditorDialogState {
                                 }
                             }
                         }
+                        normalize_curve_groups(&mut self.steps);
                         self.renumber_local_steps();
                         self.table_gen = self.table_gen.wrapping_add(1);
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -754,6 +911,7 @@ impl CurveEditorDialogState {
                         }
                         self.renumber_local_steps();
                         self.table_gen = self.table_gen.wrapping_add(1);
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -777,6 +935,7 @@ impl CurveEditorDialogState {
                         self.table_gen = self.table_gen.wrapping_add(1);
                         self.select_single(pos);
                         self.focused_cell = Some((pos, 1));
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -791,6 +950,7 @@ impl CurveEditorDialogState {
                         let new_idx = self.steps.len() - 1;
                         self.select_single(new_idx);
                         self.focused_cell = Some((new_idx, 1));
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -817,6 +977,7 @@ impl CurveEditorDialogState {
                         for idx in to_del.into_iter().rev() {
                             self.steps.remove(idx);
                         }
+                        normalize_curve_groups(&mut self.steps);
                         self.renumber_local_steps();
                         self.table_gen = self.table_gen.wrapping_add(1);
                         self.selected_steps.clear();
@@ -828,6 +989,7 @@ impl CurveEditorDialogState {
                             self.anchor_step = None;
                             self.focused_cell = None;
                         }
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -846,6 +1008,7 @@ impl CurveEditorDialogState {
                         self.selected_steps.clear();
                         self.anchor_step = None;
                         self.focused_cell = None;
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -896,6 +1059,7 @@ impl CurveEditorDialogState {
                         self.selected_steps = (pos..pos + count).collect();
                         self.anchor_step = Some(pos);
                         self.focused_cell = Some((pos, 1));
+                        self.has_chosen_formula = true;
                         self.curve_form = CurveForm::UserCurve;
                         self.reverse_j_active = false;
                     }
@@ -936,11 +1100,13 @@ impl CurveEditorDialogState {
                                     .max()
                                     .unwrap_or(2)
                                     .max(2);
-                                for &i in &valid {
+                                for (k, &i) in valid.iter().enumerate() {
                                     self.steps[i].group_tag_id = next_g;
-                                    self.steps[i].group_factor = shared_gf;
+                                    self.steps[i].group_factor = if k == 0 { shared_gf } else { 0 };
                                 }
+                                normalize_curve_groups(&mut self.steps);
                             }
+                            self.has_chosen_formula = true;
                             self.curve_form = CurveForm::UserCurve;
                             self.reverse_j_active = false;
                         }
@@ -966,27 +1132,95 @@ impl CurveEditorDialogState {
                         self.plot_zoom = 1.0;
                         self.plot_pan = egui::Vec2::ZERO;
                     }
+                });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(3.0);
+
+                // Row 2: Mutually exclusive `En basamak (İğne)` & `Boy basamak (May)` spinners + `Çift May` & `Tek Sistem`
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let mut regen = false;
+
+                    if curve_step_axis_spinner(
+                        ui,
+                        &mut self.step_axis_mode,
+                        StepAxisMode::Width,
+                        "En basamak (İğne):",
+                        ("curve_tb_step_x", self.open_gen),
+                        &mut self.step_x_mag,
+                    ) {
+                        regen = true;
+                    }
 
                     ui.separator();
 
-                    // Step X parameter for live formula recalculation (white sunken edit box)
-                    ui.label("En Basamak:");
-                    if let Some(txt) = win32_numeric_text_edit(
+                    if curve_step_axis_spinner(
                         ui,
-                        ("curve_tb_step_x", self.open_gen),
-                        self.step_x_mag.to_string(),
-                        38.0,
-                        true,
+                        &mut self.step_axis_mode,
+                        StepAxisMode::Height,
+                        "Boy basamak (May):",
+                        ("curve_tb_step_y", self.open_gen),
+                        &mut self.step_y_mag,
                     ) {
-                        if let Ok(v) = txt.trim().parse::<i32>() {
-                            let clamped = v.clamp(1, 99);
-                            if clamped != self.step_x_mag {
-                                self.step_x_mag = clamped;
-                                if self.reverse_j_active || self.curve_form != CurveForm::UserCurve {
-                                    self.regenerate_formula();
-                                }
-                            }
+                        regen = true;
+                    }
+
+                    ui.separator();
+
+                    if win32_checkbox(ui, &mut self.even_courses, "Çift May")
+                        .on_hover_text("Üretilen eğri basamaklarında çift may (2, 4, 6...) kullan")
+                        .changed()
+                    {
+                        regen = true;
+                    }
+
+                    if win32_checkbox(ui, &mut self.single_system, "Tek Sistem")
+                        .on_hover_text("Sağ çift may, sol tek may (1 may kayık)")
+                        .changed()
+                    {
+                        regen = true;
+                    }
+
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(
+                            egui::RichText::new("Min May:")
+                                .font(regular_font(11.0))
+                                .color(colors::TEXT_BLACK),
+                        )
+                        .on_hover_text("Formüldeki en küçük boy (may) basamağını sınırla ('-' = serbest, 1..9 = en az o kadar may)");
+                        let prev_min = self.min_step_height;
+                        let sel_txt = if self.min_step_height <= 0 {
+                            "-".to_string()
+                        } else {
+                            self.min_step_height.to_string()
+                        };
+                        win32_combo_scope(ui, |ui| {
+                            egui::ComboBox::from_id_salt(("curve_min_may", self.open_gen))
+                                .width(42.0)
+                                .selected_text(sel_txt)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.min_step_height, 0, "-");
+                                    for m in 1..=9 {
+                                        ui.selectable_value(
+                                            &mut self.min_step_height,
+                                            m,
+                                            m.to_string(),
+                                        );
+                                    }
+                                });
+                        });
+                        if self.min_step_height != prev_min {
+                            regen = true;
                         }
+                    });
+
+                    if regen && (self.reverse_j_active || self.curve_form != CurveForm::UserCurve) {
+                        self.regenerate_formula(side);
                     }
                 });
             });
@@ -1000,20 +1234,26 @@ impl CurveEditorDialogState {
 
         let w_hdr = if is_widening { "En\n+++" } else { "En\n---" };
         let col_specs: [(&str, f32); 8] = [
-            ("", 28.0),
-            ("Faktör\nGruplandırılmış", 104.0),
-            ("Grup", 42.0),
-            ("Boy\nBasamak", 64.0),
-            ("En\nBasamak", 64.0),
-            ("Faktör", 50.0),
-            (w_hdr, 46.0),
-            ("En\n\\\\\\", 46.0),
+            ("", 30.0),
+            ("Faktör", 62.0),
+            ("Grup", 48.0),
+            ("Boy", 62.0),
+            ("En", 62.0),
+            ("Faktör", 58.0),
+            (w_hdr, 52.0),
+            ("En\n\\\\\\", 52.0),
         ];
         let base_total_w: f32 = col_specs.iter().map(|(_, w)| *w).sum();
 
-        let header_h = 34.0_f32;
-        let summary_h = 21.0_f32;
-        let row_h = 21.0_f32;
+        // Responsive row & font scaling matching the main Lines Grid
+        let scale = (width / 460.0).clamp(1.0, 1.45);
+        let font_scale = (1.0 + (scale - 1.0) * 0.78).clamp(1.0, 1.35);
+        let header_h = (32.0 * scale).round();
+        let summary_h = (25.0 * scale).round();
+        let row_h = (25.0 * scale).round();
+        let header_font_sz = 11.5 * font_scale;
+        let cell_font_sz = 13.0 * font_scale;
+        let gutter_font_sz = 11.5 * font_scale;
 
         // Compute totals for the pinned summary row directly beneath column headers
         let (sum_dx, sum_dy) = curve_steps_sum_slice(&self.steps);
@@ -1082,7 +1322,7 @@ impl CurveEditorDialogState {
                                     cell_r.center(),
                                     Align2::CENTER_CENTER,
                                     hdr_txt,
-                                    bold_font(10.0),
+                                    bold_font(header_font_sz),
                                     colors::TEXT_BLACK,
                                 );
                             }
@@ -1109,18 +1349,18 @@ impl CurveEditorDialogState {
                             );
                             if ci == 3 {
                                 top_painter.text(
-                                    pos2(cell_r.right() - 5.0, cell_r.center().y),
+                                    pos2(cell_r.right() - 6.0, cell_r.center().y),
                                     Align2::RIGHT_CENTER,
                                     sum_dy.to_string(),
-                                    bold_font(11.0),
+                                    bold_font(cell_font_sz),
                                     colors::TEXT_BLACK,
                                 );
                             } else if ci == 4 {
                                 top_painter.text(
-                                    pos2(cell_r.right() - 5.0, cell_r.center().y),
+                                    pos2(cell_r.right() - 6.0, cell_r.center().y),
                                     Align2::RIGHT_CENTER,
                                     sum_dx.to_string(),
-                                    bold_font(11.0),
+                                    bold_font(cell_font_sz),
                                     colors::TEXT_BLACK,
                                 );
                             }
@@ -1254,6 +1494,7 @@ impl CurveEditorDialogState {
                                                     (table_gen, r, ci),
                                                     buf,
                                                     &mut self.editing_pristine,
+                                                    cell_font_sz,
                                                 ) {
                                                     CurveCellEditOutcome::Cancel => {
                                                         cancel_edit = true;
@@ -1272,9 +1513,9 @@ impl CurveEditorDialogState {
                                                     Align2::CENTER_CENTER,
                                                     cell_r.center(),
                                                     if is_row_sel {
-                                                        bold_font(10.5)
+                                                        bold_font(gutter_font_sz)
                                                     } else {
-                                                        regular_font(10.5)
+                                                        regular_font(gutter_font_sz)
                                                     },
                                                     if multi_sel {
                                                         Color32::from_rgb(0x1E, 0x3A, 0x8A)
@@ -1285,8 +1526,8 @@ impl CurveEditorDialogState {
                                             } else {
                                                 (
                                                     Align2::RIGHT_CENTER,
-                                                    pos2(cell_r.right() - 5.0, cell_r.center().y),
-                                                    regular_font(11.0),
+                                                    pos2(cell_r.right() - 6.0, cell_r.center().y),
+                                                    regular_font(cell_font_sz),
                                                     colors::TEXT_BLACK,
                                                 )
                                             };
@@ -1655,6 +1896,7 @@ impl CurveEditorDialogState {
                                             self.steps = resampled;
                                             self.renumber_local_steps();
                                             self.table_gen = self.table_gen.wrapping_add(1);
+                                            self.has_chosen_formula = true;
                                             self.reverse_j_active = false;
                                         }
                                         ui.with_layout(
@@ -1728,15 +1970,8 @@ impl CurveEditorDialogState {
             self.plot_pan = egui::Vec2::ZERO;
         }
 
-        // Build per-step staircase polylines from `(0, 0)`
-        let mut group_factors = std::collections::HashMap::new();
-        for s in &self.steps {
-            if s.group_tag_id > 0 && s.group_factor > 0 {
-                group_factors.insert(s.group_tag_id, s.group_factor);
-            }
-        }
-
-        let mut step_paths: Vec<(usize, Vec<(f64, f64)>)> = Vec::with_capacity(self.steps.len());
+        // Build per-step staircase polylines from `(0, 0)` (expanding Stoll `GruppenFaktor` blocks)
+        let mut step_paths: Vec<(usize, Vec<(f64, f64)>)> = Vec::new();
         let mut cx = 0i32;
         let mut cy = 0i32;
         let mut min_x = 0.0_f64.min(self.target_dx as f64);
@@ -1744,38 +1979,76 @@ impl CurveEditorDialogState {
         let mut min_y = 0.0_f64.min(self.target_dy as f64);
         let mut max_y = 0.0_f64.max(self.target_dy as f64);
 
-        for (i, s) in self.steps.iter().enumerate() {
-            let mut pts = vec![(cx as f64, cy as f64)];
-            let mut reps = s.factor.max(1);
-            if s.group_tag_id > 0 {
-                reps *= *group_factors.get(&s.group_tag_id).unwrap_or(&1);
-            }
-            if s.step_height == 0 || s.step_width == 0 {
-                cx += s.step_width * reps;
-                cy += s.step_height * reps;
-                pts.push((cx as f64, cy as f64));
+        let mut i = 0usize;
+        while i < self.steps.len() {
+            let gid = self.steps[i].group_tag_id;
+            let (run_end, group_reps) = if gid > 0 {
+                let mut end = i + 1;
+                while end < self.steps.len() && self.steps[end].group_tag_id == gid {
+                    end += 1;
+                }
+                let gf = self.steps[i..end]
+                    .iter()
+                    .map(|s| s.group_factor)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                (end, gf)
             } else {
-                let draw_reps = reps.min(500);
-                for _ in 0..draw_reps {
-                    cy += s.step_height;
-                    pts.push((cx as f64, cy as f64));
-                    cx += s.step_width;
-                    pts.push((cx as f64, cy as f64));
-                }
-                if reps > draw_reps {
-                    let rem = reps - draw_reps;
-                    cx += s.step_width * rem;
-                    cy += s.step_height * rem;
-                    pts.push((cx as f64, cy as f64));
+                (i + 1, 1)
+            };
+
+            let draw_group_reps = group_reps.min(200);
+            for _ in 0..draw_group_reps {
+                for row_idx in i..run_end {
+                    let s = &self.steps[row_idx];
+                    let mut pts = vec![(cx as f64, cy as f64)];
+                    let reps = s.factor.max(1);
+                    if s.step_height == 0 || s.step_width == 0 {
+                        cx += s.step_width * reps;
+                        cy += s.step_height * reps;
+                        pts.push((cx as f64, cy as f64));
+                    } else {
+                        let draw_reps = reps.min(500);
+                        for _ in 0..draw_reps {
+                            cy += s.step_height;
+                            pts.push((cx as f64, cy as f64));
+                            cx += s.step_width;
+                            pts.push((cx as f64, cy as f64));
+                        }
+                        if reps > draw_reps {
+                            let rem = reps - draw_reps;
+                            cx += s.step_width * rem;
+                            cy += s.step_height * rem;
+                            pts.push((cx as f64, cy as f64));
+                        }
+                    }
+                    for &(px, py) in &pts {
+                        min_x = min_x.min(px);
+                        max_x = max_x.max(px);
+                        min_y = min_y.min(py);
+                        max_y = max_y.max(py);
+                    }
+                    step_paths.push((row_idx, pts));
                 }
             }
-            for &(px, py) in &pts {
-                min_x = min_x.min(px);
-                max_x = max_x.max(px);
-                min_y = min_y.min(py);
-                max_y = max_y.max(py);
+            if group_reps > draw_group_reps {
+                let rem_g = group_reps - draw_group_reps;
+                for row_idx in i..run_end {
+                    let s = &self.steps[row_idx];
+                    let pts_start = (cx as f64, cy as f64);
+                    let reps = s.factor.max(1) * rem_g;
+                    cx += s.step_width * reps;
+                    cy += s.step_height * reps;
+                    let pts_end = (cx as f64, cy as f64);
+                    min_x = min_x.min(pts_end.0);
+                    max_x = max_x.max(pts_end.0);
+                    min_y = min_y.min(pts_end.1);
+                    max_y = max_y.max(pts_end.1);
+                    step_paths.push((row_idx, vec![pts_start, pts_end]));
+                }
             }
-            step_paths.push((i, pts));
+            i = run_end;
         }
 
         let pad = 28.0;
@@ -1888,34 +2161,63 @@ impl CurveEditorDialogState {
         );
     }
 
-    fn regenerate_formula(&mut self) {
+    fn parity_mode(&self, side: LineSide) -> CourseParityMode {
+        if self.single_system {
+            match side {
+                LineSide::Left => CourseParityMode::SingleSystemLeftOdd,
+                LineSide::Right => CourseParityMode::SingleSystemRightEven,
+            }
+        } else if self.even_courses {
+            CourseParityMode::EvenCourses
+        } else {
+            CourseParityMode::Any
+        }
+    }
+
+    fn step_drive(&self) -> CurveStepDrive {
+        match self.step_axis_mode {
+            StepAxisMode::Width => CurveStepDrive::ByWidth,
+            StepAxisMode::Height => CurveStepDrive::ByHeight,
+        }
+    }
+
+    fn regenerate_formula(&mut self, side: LineSide) {
         let (nw, ww, fw) = self.default_widths;
         let sx = if self.target_dx < 0 {
             -self.step_x_mag
         } else {
             self.step_x_mag
         };
-        if self.reverse_j_active {
-            self.steps = generate_reverse_j_steps(
-                self.target_dx,
-                self.target_dy,
-                sx,
-                nw,
-                ww,
-                fw,
-            );
+        let sy = if self.target_dy < 0 {
+            -self.step_y_mag
         } else {
-            self.steps = generate_curve_steps(&CurveGenParams {
-                curve_form: self.curve_form,
-                total_dx: self.target_dx,
-                total_dy: self.target_dy,
-                step_x: sx,
-                step_y: 0,
-                narrowing_width: nw,
-                widening_width: ww,
-                fade_out_width: fw,
-            });
+            self.step_y_mag
+        };
+        let params = CurveGenParams {
+            curve_form: if self.reverse_j_active {
+                CurveForm::JCurve
+            } else {
+                self.curve_form
+            },
+            total_dx: self.target_dx,
+            total_dy: self.target_dy,
+            step_x: sx,
+            step_y: sy,
+            narrowing_width: nw,
+            widening_width: ww,
+            fade_out_width: fw,
+            parity_mode: self.parity_mode(side),
+            step_drive: self.step_drive(),
+            reverse_j: self.reverse_j_active,
+            min_step_height: self.min_step_height,
+        };
+        let feas = check_curve_feasibility(&params);
+        if !feas.feasible {
+            self.notice = feas.warning_tr.map(|w| (w, true));
+        } else {
+            self.notice = None;
         }
+        self.steps = generate_curve_steps(&params);
         self.table_gen = self.table_gen.wrapping_add(1);
         self.selected_steps.clear();
         if !self.steps.is_empty() {
@@ -1963,7 +2265,7 @@ impl CurveEditorDialogState {
         state: &mut UiState,
         req: CurveEditorRequest,
     ) {
-        if self.curve_form == self.orig_form && self.steps == self.orig_steps {
+        if !self.has_pending_changes() {
             return;
         }
         undo.push("Çizgi editörü", doc);
@@ -1984,6 +2286,7 @@ impl CurveEditorDialogState {
                 .map(|(_, l)| l.stitches)
                 .sum();
             if let Some(line) = el.lines_mut(req.side).get_mut(req.line_idx) {
+                line.single_system_curve = self.single_system;
                 if self.steps.is_empty() {
                     line.curve = None;
                     line.kurven_form = 0;
@@ -1993,10 +2296,12 @@ impl CurveEditorDialogState {
                     line.rows = self.target_dy;
                     recalc_line_from_stitches_and_rows(line, &hdr);
                 } else {
-                    apply_curve_to_line(line, &hdr, self.curve_form, self.steps.clone());
+                    normalize_curve_groups(&mut self.steps);
+                    let save_form = self.effective_stoll_curve_form();
+                    apply_curve_to_line(line, &hdr, save_form, self.steps.clone());
                     let is_closing = is_last_row
                         && line.rows == 0
-                        && (line.last_line != 0 || sum_x_others + line.stitches == 0);
+                        && (line.default_widening == 1 || sum_x_others + line.stitches == 0);
                     auto_detect_line_function_in_context(
                         line,
                         req.line_idx == 0,
@@ -2009,20 +2314,23 @@ impl CurveEditorDialogState {
                 }
                 doc.dirty = true;
             }
-            if req.side == LineSide::Left && el.mirrored {
+            auto_sync_closing_line_for_side(doc, req.elem_idx, req.side);
+            if req.side == LineSide::Left && doc.elements[req.elem_idx].mirrored {
                 sync_mirrored_right_lines(doc, req.elem_idx);
             }
         }
         for (ei, dist_top) in endline_dists {
             sync_endline_element_y(doc, ei, dist_top);
         }
-        self.orig_form = self.curve_form;
+        self.orig_form = self.effective_stoll_curve_form();
         self.orig_steps = self.steps.clone();
+        self.orig_single_system = self.single_system;
+        self.had_initial_curve = !self.steps.is_empty();
         state.set_status(
             format!(
                 "Eğri güncellendi (Satır {}, {} - {} basamak).",
                 req.line_idx + 1,
-                self.curve_form.label_tr(),
+                self.active_curve_label(),
                 self.steps.len()
             ),
             false,
@@ -2083,6 +2391,7 @@ fn tb_icon_btn(ui: &mut Ui, icon: CurveTbIcon, tooltip: &str, enabled: bool, act
         CurveTbIcon::SaveCurve => Some(IconKind::CurveSave),
         CurveTbIcon::Line => Some(IconKind::CurveLine),
         CurveTbIcon::JCurve => Some(IconKind::CurveJ),
+        CurveTbIcon::ReverseJCurve => Some(IconKind::CurveReverseJ),
         CurveTbIcon::SCurve => Some(IconKind::CurveS),
         CurveTbIcon::UserCurve => Some(IconKind::CurveUser),
         CurveTbIcon::InsertBefore => Some(IconKind::CurveInsert),
@@ -2126,19 +2435,6 @@ fn paint_curve_tb_icon(
     let c = r.center();
 
     match icon {
-        CurveTbIcon::ReverseJCurve => {
-            // Mirrored/Symmetric J-curve (`y = dy - J(dx - x)`): steep rise then gentle top
-            let st = Stroke::new(1.8_f32, blu);
-            let pts = [
-                pos2(r.left() + 1.5, r.bottom() - 1.0),
-                pos2(r.left() + 3.5, c.y - 1.0),
-                pos2(c.x, r.top() + 2.0),
-                pos2(r.right() - 1.0, r.top() + 1.0),
-            ];
-            for w in pts.windows(2) {
-                painter.line_segment([w[0], w[1]], st);
-            }
-        }
         CurveTbIcon::FlipVertical => {
             // Vertical flip `↕` (up & down arrows)
             let st = Stroke::new(1.4_f32, blk);
@@ -2202,6 +2498,7 @@ fn paint_curve_tb_icon(
         | CurveTbIcon::SaveCurve
         | CurveTbIcon::Line
         | CurveTbIcon::JCurve
+        | CurveTbIcon::ReverseJCurve
         | CurveTbIcon::SCurve
         | CurveTbIcon::UserCurve
         | CurveTbIcon::InsertBefore
@@ -2216,95 +2513,41 @@ fn paint_curve_tb_icon(
     }
 }
 
-/// Generate symmetric/mirrored J-curve steps (`y(x) = dy - J(dx - x)`) matching Stoll's `CalcFormula_J` grid.
-fn generate_reverse_j_steps(
-    dx: i32,
-    dy: i32,
-    step_x: i32,
-    narrowing_width: i32,
-    widening_width: i32,
-    fade_out_width: i32,
-) -> Vec<CurveStep> {
-    if dx == 0 && dy == 0 {
-        return Vec::new();
-    }
-    if dx == 0 || dy == 0 {
-        return generate_curve_steps(&CurveGenParams {
-            curve_form: CurveForm::JCurve,
-            total_dx: dx,
-            total_dy: dy,
-            step_x,
-            step_y: 0,
-            narrowing_width,
-            widening_width,
-            fade_out_width,
-        });
-    }
-
-    let step_x_mag = step_x.abs().max(1).min(dx.abs());
-    let sx = if dx < 0 { -step_x_mag } else { step_x_mag };
-    let abs_dx = dx.abs();
-    let abs_sx = sx.abs();
-    let num_full = abs_dx / abs_sx;
-    let rem_x = dx - sx * num_full;
-
-    let mut pairs: Vec<(i32, i32)> = Vec::new();
-    let mut cur_x = 0i32;
-    let mut cur_y = 0i32;
-    let mut eff_dx = dx as f64;
-    let mut eff_dy = dy as f64;
-    let mut x_offset = 0.0f64;
-    let mut y_offset = 0i32;
-
-    for i in 1..=num_full {
-        let x_i = sx * i;
-        let is_final = x_i.abs() == abs_dx;
-        let mut y_i = if is_final {
-            dy
-        } else {
-            let local_x = x_i as f64 - x_offset;
-            let u = eff_dx - local_x;
-            let k = eff_dy / (1.6 * eff_dx * eff_dx);
-            let j_rev = eff_dy - (u * u + 0.6 * eff_dx * u) * k;
-            y_offset + stoll_round(j_rev)
-        };
-
-        if i == 1 && y_i == 0 && !is_final {
-            let y1 = dy.signum();
-            y_i = y1;
-            x_offset = sx as f64;
-            y_offset = y1;
-            eff_dx = (dx - sx) as f64;
-            eff_dy = (dy - y1) as f64;
+/// Mutually exclusive step-axis control: radio toggle + `[-]` + editable numeric input + `[+]`.
+fn curve_step_axis_spinner(
+    ui: &mut Ui,
+    active_mode: &mut StepAxisMode,
+    my_mode: StepAxisMode,
+    label: &str,
+    edit_id: (&'static str, u64),
+    val: &mut i32,
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 3.0;
+        if win32_radio(ui, active_mode, my_mode, label).changed() {
+            changed = true;
         }
-
-        let mut delta_y = y_i - cur_y;
-        if dy >= 0 && delta_y < 0 {
-            delta_y = 0;
-        } else if dy < 0 && delta_y > 0 {
-            delta_y = 0;
+        let enabled = *active_mode == my_mode;
+        if win32_button(ui, "-", vec2(18.0, 20.0), enabled && *val > 1).clicked() {
+            *val = (*val - 1).clamp(1, 99);
+            changed = true;
         }
-
-        pairs.push((sx, delta_y));
-        cur_x += sx;
-        cur_y += delta_y;
-    }
-
-    if rem_x != 0 {
-        let delta_y = dy - cur_y;
-        pairs.push((rem_x, delta_y));
-        cur_x += rem_x;
-        cur_y += delta_y;
-    }
-
-    if cur_x != dx || cur_y != dy {
-        if let Some(last) = pairs.last_mut() {
-            last.0 += dx - cur_x;
-            last.1 += dy - cur_y;
+        if let Some(txt) = win32_numeric_text_edit(ui, edit_id, val.to_string(), 34.0, enabled) {
+            if let Ok(parsed) = txt.trim().parse::<i32>() {
+                let clamped = parsed.clamp(1, 99);
+                if clamped != *val {
+                    *val = clamped;
+                    changed = true;
+                }
+            }
         }
-    }
-
-    compress_pairs_to_steps(&pairs, narrowing_width, widening_width, fade_out_width)
+        if win32_button(ui, "+", vec2(18.0, 20.0), enabled && *val < 99).clicked() {
+            *val = (*val + 1).clamp(1, 99);
+            changed = true;
+        }
+    });
+    changed
 }
 
 #[derive(Clone, Copy)]
@@ -2366,6 +2609,7 @@ fn show_curve_cell_text_edit(
     cell_key: (u64, usize, usize),
     buf: &mut String,
     pristine: &mut bool,
+    font_sz: f32,
 ) -> CurveCellEditOutcome {
     let already_inited = ui
         .ctx()
@@ -2411,7 +2655,7 @@ fn show_curve_cell_text_edit(
     let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(edit_rect));
     let te = egui::TextEdit::singleline(buf)
         .id(te_id)
-        .font(regular_font(11.0))
+        .font(regular_font(font_sz))
         .horizontal_align(egui::Align::RIGHT)
         .frame(false)
         .desired_width(edit_rect.width());
@@ -2578,7 +2822,15 @@ mod tests {
     #[test]
     fn reverse_j_curve_closes_exactly_and_is_steep_then_gentle() {
         for (dx, dy, sx) in [(20, 60, 2), (-20, 60, -2), (17, 45, 3), (8, 40, 1)] {
-            let steps = generate_reverse_j_steps(dx, dy, sx, 1, 0, 0);
+            let steps = generate_curve_steps(&CurveGenParams {
+                curve_form: CurveForm::JCurve,
+                total_dx: dx,
+                total_dy: dy,
+                step_x: sx,
+                narrowing_width: 6,
+                reverse_j: true,
+                ..Default::default()
+            });
             let data = CurveData {
                 function: CurveForm::UserCurve.to_id(),
                 steps: steps.clone(),
@@ -2644,5 +2896,91 @@ mod tests {
                 "window grew on frame {frame_idx}: first_stable={first_stable:?}, got={sz:?}, all={sizes:?}"
             );
         }
+    }
+
+    #[test]
+    fn unselected_initial_preset_slash_commit_and_cift_may_reopen() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::configure_fonts(&ctx);
+        crate::ui::theme::apply_win32_theme(&ctx);
+
+        let mut doc = FormDocument::new_default_template();
+        let hdr = doc.header.clone();
+        let mut seg = stoll_kalip_editoru::model::LineSegment {
+            index: 1,
+            tag_id: 1,
+            stitches: 10,
+            rows: 30,
+            function: LineFunction::Narrowing,
+            ..Default::default()
+        };
+        recalc_line_from_stitches_and_rows(&mut seg, &hdr);
+        doc.elements[0].left_lines.push(seg);
+
+        let mut undo = UndoStack::default();
+        let mut state = UiState::default();
+        state.user_settings.default_even_courses = false;
+        let req = CurveEditorRequest {
+            elem_idx: 0,
+            side: LineSide::Left,
+            line_idx: 0,
+        };
+        state.curve_editor_req = Some(req);
+
+        let mut dlg = CurveEditorDialogState::default();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1280.0, 860.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run(raw_input.clone(), |ctx| {
+            dlg.show(ctx, &mut doc, &mut undo, &mut state);
+        });
+
+        // 1. Opening on a line with NO [Kurve]: preset is unselected
+        assert!(!dlg.has_chosen_formula);
+        assert!(!dlg.had_initial_curve);
+        // Committing without choosing a formula must NOT attach a curve
+        dlg.commit_to_doc(&mut doc, &mut undo, &mut state, req);
+        assert!(doc.elements[0].left_lines[0].curve.is_none());
+
+        // 2a. User chooses plain `/` (`CurveForm::Line`, even_courses = false, step_x_mag = 1) -> commit saves Line (1)
+        dlg.has_chosen_formula = true;
+        dlg.curve_form = CurveForm::Line;
+        dlg.even_courses = false;
+        dlg.step_x_mag = 1;
+        dlg.regenerate_formula(LineSide::Left);
+        dlg.commit_to_doc(&mut doc, &mut undo, &mut state, req);
+
+        let plain_curve = doc.elements[0].left_lines[0]
+            .curve
+            .as_ref()
+            .expect("clicking '/' and Tamam must commit [Kurve]");
+        assert_eq!(plain_curve.function, CurveForm::Line.to_id());
+
+        // 2b. User chooses `J` with `Çift May` and `step_x_mag = 2` -> commit saves UserCurve (5) so Stoll vecformeditor preserves exact steps
+        dlg.curve_form = CurveForm::JCurve;
+        dlg.even_courses = true;
+        dlg.step_x_mag = 2;
+        dlg.regenerate_formula(LineSide::Left);
+        dlg.commit_to_doc(&mut doc, &mut undo, &mut state, req);
+
+        let saved_curve = doc.elements[0].left_lines[0]
+            .curve
+            .as_ref()
+            .expect("custom-stepped curve must be committed");
+        assert_eq!(saved_curve.function, CurveForm::UserCurve.to_id());
+        assert!(saved_curve.steps.iter().all(|s| s.step_height % 2 == 0));
+        assert!(saved_curve.steps.iter().all(|s| s.step_width.abs() == 2));
+
+        // 3. Reopening a fresh dialog with default_even_courses = false auto-detects `Çift May` = true and UserCurve
+        let mut dlg2 = CurveEditorDialogState::default();
+        state.curve_editor_req = Some(req);
+        let _ = ctx.run(raw_input, |ctx| {
+            dlg2.show(ctx, &mut doc, &mut undo, &mut state);
+        });
+        assert!(dlg2.has_chosen_formula);
+        assert!(dlg2.had_initial_curve);
+        assert!(dlg2.even_courses, "Çift May must auto-detect on reopen from even step heights");
+        assert_eq!(dlg2.curve_form, CurveForm::UserCurve);
     }
 }

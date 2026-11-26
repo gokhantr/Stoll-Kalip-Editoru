@@ -14,6 +14,8 @@ pub struct UserSettings {
     pub default_template_index: usize,
     pub auto_apply_default_template: bool,
     pub snap_even_rows: bool,
+    pub default_even_courses: bool,
+    pub splitter_width: Option<f32>,
     pub show_dimensions: bool,
     pub show_detail_columns: bool,
     pub custom_stoll_defaultform_path: Option<PathBuf>,
@@ -22,6 +24,7 @@ pub struct UserSettings {
     pub window_w: Option<i32>,
     pub window_h: Option<i32>,
     pub window_maximized: bool,
+    pub always_on_top: bool,
     pub ignored_update_version: Option<String>,
 }
 
@@ -34,6 +37,8 @@ impl Default for UserSettings {
             default_template_index: 1, // "2 : CMS  >6< / <1>"
             auto_apply_default_template: true,
             snap_even_rows: false,
+            default_even_courses: false,
+            splitter_width: None,
             show_dimensions: true,
             show_detail_columns: false,
             custom_stoll_defaultform_path: None,
@@ -42,6 +47,7 @@ impl Default for UserSettings {
             window_w: None,
             window_h: None,
             window_maximized: false,
+            always_on_top: false,
             ignored_update_version: None,
         }
     }
@@ -120,6 +126,7 @@ impl UserSettings {
              default_template_index={}\r\n\
              auto_apply_default_template={}\r\n\
              snap_even_rows={}\r\n\
+             DefaultEvenCourses={}\r\n\
              show_dimensions={}\r\n\
              show_detail_columns={}\r\n\
              custom_stoll_defaultform_path={}\r\n",
@@ -129,10 +136,16 @@ impl UserSettings {
             self.default_template_index,
             self.auto_apply_default_template,
             self.snap_even_rows,
+            self.default_even_courses,
             self.show_dimensions,
             self.show_detail_columns,
             custom_path,
         );
+        if let Some(sw) = self.splitter_width {
+            if sw.is_finite() && sw > 0.0 {
+                out.push_str(&format!("SplitterWidth={sw:.2}\r\n"));
+            }
+        }
         if let Some(v) = self.window_x {
             out.push_str(&format!("WindowX={v}\r\n"));
         }
@@ -146,6 +159,7 @@ impl UserSettings {
             out.push_str(&format!("WindowH={v}\r\n"));
         }
         out.push_str(&format!("WindowMaximized={}\r\n", self.window_maximized));
+        out.push_str(&format!("AlwaysOnTop={}\r\n", self.always_on_top));
         if let Some(ver) = &self.ignored_update_version {
             let trimmed = ver.trim();
             if !trimmed.is_empty() {
@@ -206,6 +220,18 @@ impl UserSettings {
                         s.snap_even_rows = b;
                     }
                 }
+                "DefaultEvenCourses" | "default_even_courses" => {
+                    if let Some(b) = parse_bool(v) {
+                        s.default_even_courses = b;
+                    }
+                }
+                "SplitterWidth" | "splitter_width" => {
+                    if let Ok(val) = v.replace(',', ".").parse::<f32>() {
+                        if val.is_finite() && (160.0..=4000.0).contains(&val) {
+                            s.splitter_width = Some(val);
+                        }
+                    }
+                }
                 "show_dimensions" => {
                     if let Some(b) = parse_bool(v) {
                         s.show_dimensions = b;
@@ -254,6 +280,11 @@ impl UserSettings {
                 "WindowMaximized" | "window_maximized" => {
                     if let Some(b) = parse_bool(v) {
                         s.window_maximized = b;
+                    }
+                }
+                "AlwaysOnTop" | "always_on_top" => {
+                    if let Some(b) = parse_bool(v) {
+                        s.always_on_top = b;
                     }
                 }
                 "IgnoredUpdateVersion" | "ignored_update_version" => {

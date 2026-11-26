@@ -10,7 +10,10 @@ use crate::ui::theme::{
     bold_font, colors, regular_font, win32_checkbox, win32_group_box, win32_input_frame,
     win32_numeric_text_edit,
 };
-use crate::ui::{marker_function_label_tr, PointMultiplyRequest, UiState};
+use crate::ui::{
+    centered_modal_pos, marker_function_label_tr, modal_shadow, show_modal_backdrop,
+    PointMultiplyRequest, UiState,
+};
 
 /// Direction option when multiplying marking points (`DIALOG 4277`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +98,8 @@ impl PointMultiplyDialogState {
         }
 
         let use_mm = doc.header.input_format == InputFormat::Mm;
-        let unit_x = if use_mm { "mm" } else { "ilmek" };
-        let unit_y = if use_mm { "mm" } else { "sıra" };
+        let unit_x = if use_mm { "mm" } else { "iğne" };
+        let unit_y = if use_mm { "mm" } else { "may" };
 
         // Read source marker snapshot
         let source_entry = doc
@@ -132,16 +135,21 @@ impl PointMultiplyDialogState {
             !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut commit = false;
 
+        show_modal_backdrop(ctx, "point_multiply_backdrop", false);
+        let def_pos = centered_modal_pos(ctx, vec2(430.0, 420.0));
+
         egui::Window::new("İşaretleme noktalarını çoğalt")
             .id(egui::Id::new("point_multiply_modal"))
             .title_bar(false)
             .collapsible(false)
+            .movable(true)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_pos(def_pos)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                    .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                    .shadow(modal_shadow())
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {
@@ -232,7 +240,7 @@ impl PointMultiplyDialogState {
                                     });
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "~ {} ilmek ({:.1} mm)",
+                                            "~ {} iğne ({:.1} mm)",
                                             dx_st,
                                             stitches_to_mm(dx_st, &doc.header)
                                         ))
@@ -258,7 +266,7 @@ impl PointMultiplyDialogState {
                                     });
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "~ {} sıra ({:.1} mm)",
+                                            "~ {} may ({:.1} mm)",
                                             dy_st,
                                             rows_to_mm(dy_st, &doc.header)
                                         ))
@@ -317,8 +325,8 @@ impl PointMultiplyDialogState {
                                                     .show(ui, |ui| {
                                                         for hdr in [
                                                             "No.",
-                                                            "En (ilmek)",
-                                                            "Boy (sıra)",
+                                                            "En (iğne)",
+                                                            "Boy (may)",
                                                             "En (mm)",
                                                             "Boy (mm)",
                                                         ] {

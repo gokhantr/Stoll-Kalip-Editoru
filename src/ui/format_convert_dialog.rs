@@ -11,7 +11,9 @@ use crate::ui::icons::{paint_icon, IconKind};
 use crate::ui::theme::{
     bold_font, colors, regular_font, win32_checkbox, win32_group_box, win32_input_frame,
 };
-use crate::ui::{FormatConvertRequest, UiState};
+use crate::ui::{
+    centered_modal_pos, modal_shadow, show_modal_backdrop, FormatConvertRequest, UiState,
+};
 
 /// Modal dialog state handling:
 /// - `Başka formatta kaydet` / `Yeniden hesapla ve adıyla kayıt et...` (`50505`)
@@ -79,16 +81,21 @@ impl FormatConvertDialogState {
             !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let mut commit = false;
 
+        show_modal_backdrop(ctx, "format_convert_backdrop", false);
+        let def_pos = centered_modal_pos(ctx, vec2(520.0, 420.0));
+
         egui::Window::new(title)
             .id(egui::Id::new("format_convert_modal"))
             .title_bar(false)
             .collapsible(false)
+            .movable(true)
             .resizable(false)
-            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .default_pos(def_pos)
             .frame(
                 Frame::NONE
                     .fill(colors::CHROME_BG)
-                    .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                    .stroke(Stroke::new(1.5_f32, colors::BORDER_DARK))
+                    .shadow(modal_shadow())
                     .inner_margin(Margin::ZERO),
             )
             .show(ctx, |ui| {

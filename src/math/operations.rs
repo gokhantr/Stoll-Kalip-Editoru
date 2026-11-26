@@ -1,5 +1,6 @@
 use crate::math::curves::{
-    apply_curve_to_line, extract_curve_module_widths, generate_curve_steps, CurveGenParams,
+    apply_curve_to_line, mirror_curve_steps_single_system, resolve_curve_module_widths,
+    generate_curve_steps, CourseParityMode, CurveGenParams,
 };
 use crate::math::geometry::{
     snapshot_endline_distances, sync_all_endline_elements,
@@ -10,7 +11,7 @@ use crate::math::units::{
 };
 use crate::model::{
     CurveForm, ElementType, FormDocument, FormHeader, InputFormat, KanteChildSlot, LineFunction,
-    LineSegment, LineSide, PointEntry, PointOffset, ShapeElement, YReferenceLine,
+    LineSegment, LineSide, ModuleAssignment, PointEntry, PointOffset, ShapeElement, YReferenceLine,
 };
 
 /// Insert a new empty line segment BEFORE `row_idx` (`Yeni Çizgiyi Öne Ekle`, `Insert`, `50574`).
@@ -373,8 +374,17 @@ pub fn sync_mirrored_right_lines(doc: &mut FormDocument, elem_idx: usize) {
         r.step_x = -left.step_x;
         r.rest_x = -left.rest_x;
         if let Some(ref mut c) = r.curve {
-            for s in &mut c.steps {
-                s.step_width = -s.step_width;
+            if left.single_system_curve && !c.steps.is_empty() {
+                c.steps = mirror_curve_steps_single_system(&c.steps, true);
+                for (idx, s) in c.steps.iter_mut().enumerate() {
+                    s.index = (idx + 1) as i32;
+                    s.tag_id = s.index;
+                    s.raw.original_header = Some(format!("[KurvenLinie] = {}", s.index));
+                }
+            } else {
+                for s in &mut c.steps {
+                    s.step_width = -s.step_width;
+                }
             }
         }
         for pt in &mut r.points {
@@ -489,6 +499,9 @@ pub fn apply_directives_to_lines(
     directive_height: i32,
 ) -> usize {
     let hdr = doc.header.clone();
+    let std_nw = doc.guidelines.std_narrow_w;
+    let std_ww = doc.guidelines.std_widen_w;
+    let std_fw = doc.guidelines.std_fadeout_w;
     let mut modified = 0usize;
     let is_mirrored;
 
@@ -506,7 +519,7 @@ pub fn apply_directives_to_lines(
                 .filter(|&(i, l)| {
                     !(is_basic && i == 0)
                         && l.function != LineFunction::BaseLine
-                        && !(l.rows == 0 && l.last_line != 0)
+                        && !(l.rows == 0 && l.default_widening == 1)
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -541,7 +554,16 @@ pub fn apply_directives_to_lines(
                             LineFunction::Widening => directive_widening.abs().max(1),
                             _ => 1,
                         };
-                        let (nw, ww, fw) = extract_curve_module_widths(line);
+                        let (nw, ww, fw) =
+                            resolve_curve_module_widths(line, std_nw, std_ww, std_fw);
+                        let parity_mode = if line.single_system_curve {
+                            match side {
+                                LineSide::Left => CourseParityMode::SingleSystemLeftOdd,
+                                LineSide::Right => CourseParityMode::SingleSystemRightEven,
+                            }
+                        } else {
+                            CourseParityMode::Any
+                        };
                         let steps = generate_curve_steps(&CurveGenParams {
                             curve_form: form,
                             total_dx: line.stitches,
@@ -555,6 +577,8 @@ pub fn apply_directives_to_lines(
                             narrowing_width: nw,
                             widening_width: ww,
                             fade_out_width: fw,
+                            parity_mode,
+                            ..Default::default()
                         });
                         apply_curve_to_line(line, &hdr, form, steps);
                         modified += 1;
@@ -575,7 +599,6 @@ pub fn apply_directives_to_lines(
                     let sx = directive_widening.abs().max(1) * line.stitches.signum();
                     let sy = directive_height.max(0);
                     calculate_and_set_stufung(line, sx, sy);
-                    line.default_widening = 1;
                     modified += 1;
                 }
                 _ if line.stitches == 0 && line.rows != 0 && directive_height > 0 => {
@@ -864,11 +887,11 @@ pub fn import_external_table_lines(
     count
 }
 
-/// Smart closing-line helper:
+/// Smart closing-line helper matching Stoll `vecformeditor.exe` 1:1:
 /// - If `sum_x == 0`, does nothing and returns `None`.
 /// - If the last row (`len >= 2`) is already a horizontal closing row (`rows == 0 && function != BaseLine`),
-///   adjusts its `stitches` (`-= sum_x`) and `last_line = 1` instead of appending a duplicate row.
-/// - Otherwise appends a new closing horizontal row (`stitches = -sum_x, rows = 0, last_line = 1`).
+///   adjusts its `stitches` (`-= sum_x`), sets `last_line = 0` and `default_widening = 1` (`DefaultZunehmen = 1`).
+/// - Otherwise appends a clean closing horizontal row (`stitches = -sum_x, rows = 0, last_line = 0, default_widening = 1, default_used = 0`, zero sub-sections).
 /// Automatically recalculates `mm`/`Stufung` and syncs mirrored right lines if `el.mirrored`.
 pub fn update_or_append_closing_line(
     doc: &mut FormDocument,
@@ -899,10 +922,18 @@ pub fn update_or_append_closing_line(
     let hdr = doc.header.clone();
     let target_idx = if let Some(idx) = existing_closing_idx {
         let el = doc.elements.get_mut(elem_idx)?;
-        if let Some(line) = el.lines_mut(side).get_mut(idx) {
+        let lines = el.lines_mut(side);
+        for (i, l) in lines.iter_mut().enumerate() {
+            if i != idx && l.default_widening == 1 {
+                l.default_widening = 0;
+            }
+        }
+        if let Some(line) = lines.get_mut(idx) {
             line.stitches -= sum_x;
             line.rows = 0;
-            line.last_line = 1;
+            line.last_line = 0;
+            line.default_widening = 1;
+            line.default_used = 0;
             line.function = LineFunction::None;
             line.user_set_function = false;
             recalc_line_from_stitches_and_rows(line, &hdr);
@@ -911,12 +942,27 @@ pub fn update_or_append_closing_line(
     } else {
         let pos = append_line(doc, elem_idx, side)?;
         let el = doc.elements.get_mut(elem_idx)?;
-        if let Some(line) = el.lines_mut(side).get_mut(pos) {
+        let lines = el.lines_mut(side);
+        for (i, l) in lines.iter_mut().enumerate() {
+            if i != pos && l.default_widening == 1 {
+                l.default_widening = 0;
+            }
+        }
+        if let Some(line) = lines.get_mut(pos) {
             line.stitches = -sum_x;
             line.rows = 0;
-            line.last_line = 1;
+            line.last_line = 0;
+            line.default_widening = 1;
+            line.default_used = 0;
+            line.comment.clear();
             line.function = LineFunction::None;
             line.user_set_function = false;
+            line.fade_out = None;
+            line.narrowing = None;
+            line.widening = None;
+            line.binding_off = None;
+            line.connection_points = None;
+            line.child_order.clear();
             recalc_line_from_stitches_and_rows(line, &hdr);
         }
         pos
@@ -927,5 +973,308 @@ pub fn update_or_append_closing_line(
     }
     doc.dirty = true;
     Some(target_idx)
+}
+
+/// Returns `Some(last_idx)` if the last line on `side` of `el` is an active horizontal closing row
+/// (`rows == 0 && function != BaseLine`, and either `default_widening == 1` (`DefaultZunehmen = 1`)
+/// or it is already a non-zero horizontal row closing `sum_x == 0`).
+/// Never hijacks a freshly added blank row (`rows == 0 && stitches == 0 && default_widening == 0`).
+pub fn closing_line_index(el: &ShapeElement, side: LineSide) -> Option<usize> {
+    let lines = el.lines(side);
+    if lines.len() < 2 {
+        return None;
+    }
+    let last_i = lines.len() - 1;
+    let last = &lines[last_i];
+    if last.rows == 0
+        && last.function != LineFunction::BaseLine
+        && (last.default_widening == 1
+            || (last.stitches != 0 && lines.iter().map(|l| l.stitches).sum::<i32>() == 0))
+    {
+        Some(last_i)
+    } else {
+        None
+    }
+}
+
+/// Automatically recalculate an EXISTING closing horizontal row on `(elem_idx, side)`
+/// so `sum_x == 0`, preserving any user-chosen `LineFunction` on the closing row.
+/// Also clears any stale `default_widening = 1` on non-closing rows so Stoll `DefaultZunehmen = 1`
+/// appears exclusively on the active closing row (with `LastLine = 0`).
+/// Does NOT append a new closing row if none exists yet (use `ensure_closing_line_for_side` for that).
+pub fn auto_sync_closing_line_for_side(
+    doc: &mut FormDocument,
+    elem_idx: usize,
+    side: LineSide,
+) -> bool {
+    let hdr = doc.header.clone();
+    let (existing_closing, is_mirrored) = {
+        let Some(el) = doc.elements.get(elem_idx) else {
+            return false;
+        };
+        if el.lines(side).is_empty() {
+            return false;
+        }
+        (closing_line_index(el, side), el.mirrored)
+    };
+
+    let mut changed = false;
+    {
+        let el = &mut doc.elements[elem_idx];
+        let lines = el.lines_mut(side);
+        for (i, line) in lines.iter_mut().enumerate() {
+            if Some(i) != existing_closing && line.default_widening == 1 {
+                line.default_widening = 0;
+                changed = true;
+            }
+        }
+        if let Some(c_idx) = existing_closing {
+            let sum_others: i32 = lines[..c_idx].iter().map(|l| l.stitches).sum();
+            let target_stitches = -sum_others;
+            if let Some(line) = lines.get_mut(c_idx) {
+                if line.stitches != target_stitches
+                    || line.rows != 0
+                    || line.last_line != 0
+                    || line.default_widening != 1
+                {
+                    line.stitches = target_stitches;
+                    line.rows = 0;
+                    line.last_line = 0;
+                    line.default_widening = 1;
+                    if !line.user_set_function && line.function == LineFunction::None {
+                        line.default_used = 0;
+                    }
+                    recalc_line_from_stitches_and_rows(line, &hdr);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    if changed {
+        if is_mirrored && side == LineSide::Left {
+            sync_mirrored_right_lines(doc, elem_idx);
+        }
+        doc.dirty = true;
+    }
+    changed
+}
+
+/// Ensure a closing horizontal row exists and closes `sum_x == 0` on `(elem_idx, side)`
+/// (updates existing closing row or appends a clean Stoll closing row with `LastLine = 0`,
+/// `DefaultZunehmen = 1`, `DefaultUsed = 0`, and zero sub-sections if missing and `has_height && sum_x != 0`).
+pub fn ensure_closing_line_for_side(
+    doc: &mut FormDocument,
+    elem_idx: usize,
+    side: LineSide,
+) -> bool {
+    if auto_sync_closing_line_for_side(doc, elem_idx, side) {
+        return true;
+    }
+    let hdr = doc.header.clone();
+    let (existing_closing, has_height, sum_x, is_mirrored) = {
+        let Some(el) = doc.elements.get(elem_idx) else {
+            return false;
+        };
+        let lines = el.lines(side);
+        if lines.is_empty() {
+            return false;
+        }
+        let closing = closing_line_index(el, side);
+        let has_h = lines.iter().any(|l| l.rows != 0);
+        let sx: i32 = lines.iter().map(|l| l.stitches).sum();
+        (closing, has_h, sx, el.mirrored)
+    };
+    if existing_closing.is_some() || !has_height || sum_x == 0 {
+        return false;
+    }
+    let tag_id = doc.next_line_tag_id();
+    let el = &mut doc.elements[elem_idx];
+    let lines = el.lines_mut(side);
+    for l in lines.iter_mut() {
+        if l.default_widening == 1 {
+            l.default_widening = 0;
+        }
+    }
+    let pos = lines.len();
+    let mut closing = LineSegment {
+        index: (pos + 1) as i32,
+        tag_id,
+        stitches: -sum_x,
+        rows: 0,
+        function: LineFunction::None,
+        user_set_function: false,
+        last_line: 0,
+        default_used: 0,
+        default_widening: 1,
+        connection_points: None,
+        child_order: Vec::new(),
+        ..LineSegment::default()
+    };
+    recalc_line_from_stitches_and_rows(&mut closing, &hdr);
+    lines.push(closing);
+    if side == LineSide::Right {
+        el.has_right_lines_section = true;
+    } else {
+        el.has_left_lines_section = true;
+    }
+    el.renumber_lines(side);
+    if is_mirrored && side == LineSide::Left {
+        sync_mirrored_right_lines(doc, elem_idx);
+    }
+    doc.dirty = true;
+    true
+}
+
+/// Ensure every element and active side in `doc` has a closing row before saving.
+pub fn ensure_all_closing_lines(doc: &mut FormDocument) -> bool {
+    let mut any_changed = false;
+    for elem_idx in 0..doc.elements.len() {
+        if ensure_closing_line_for_side(doc, elem_idx, LineSide::Left) {
+            any_changed = true;
+        }
+        let sync_right = doc
+            .elements
+            .get(elem_idx)
+            .map(|el| !el.mirrored && !el.right_lines.is_empty())
+            .unwrap_or(false);
+        if sync_right && ensure_closing_line_for_side(doc, elem_idx, LineSide::Right) {
+            any_changed = true;
+        }
+    }
+    any_changed
+}
+
+/// Automatically synchronize the closing horizontal row (`En / İğne`) on every element and side
+/// whenever any line changes so every contour stays mathematically closed (`sum_x == 0`),
+/// keeping any user-chosen function on the closing line (default `LineFunction::None`).
+pub fn auto_sync_closing_lines(doc: &mut FormDocument) -> bool {
+    let mut any_changed = false;
+    for elem_idx in 0..doc.elements.len() {
+        if auto_sync_closing_line_for_side(doc, elem_idx, LineSide::Left) {
+            any_changed = true;
+        }
+        let sync_right = doc
+            .elements
+            .get(elem_idx)
+            .map(|el| !el.mirrored && !el.right_lines.is_empty())
+            .unwrap_or(false);
+        if sync_right && auto_sync_closing_line_for_side(doc, elem_idx, LineSide::Right) {
+            any_changed = true;
+        }
+    }
+    any_changed
+}
+
+fn set_active_module_width_on_list(modules: &mut Vec<ModuleAssignment>, width: i32) {
+    if let Some(m) = modules.iter_mut().find(|m| m.module_art_id == 0) {
+        m.width = width;
+    } else if let Some(m) = modules.iter_mut().find(|m| m.module_art_id >= 0) {
+        m.width = width;
+    } else if let Some(m) = modules.first_mut() {
+        m.width = width;
+    } else {
+        modules.push(ModuleAssignment {
+            module_art_id: 0,
+            width,
+            ..ModuleAssignment::default()
+        });
+    }
+}
+
+/// Apply global standard widths & height (`Standart özellikler` -> `çevir al`) across ALL elements
+/// and sides in `doc`:
+/// - Updates `doc.guidelines.std_narrow_w` / `std_widen_w`.
+/// - Updates `[Mindern]` / `[Zunehmen]` module widths AND `[KurvenLinie]` rows (`MindernBreite`,
+///   `ZunehmenBreite`) on `Narrowing`/`NarrowingMulti` (`reglan_w`) and `Widening` (`artirma_w`) lines.
+/// - Updates vertical step height (`StufungY` / `boy_h`) on straight vertical lines (`stitches == 0 && rows != 0`).
+/// - Syncs mirrored right lines automatically.
+pub fn apply_standard_widths_to_all(
+    doc: &mut FormDocument,
+    reglan_w: i32,
+    artirma_w: i32,
+    boy_h: i32,
+) -> usize {
+    let nw = reglan_w.max(0);
+    let ww = artirma_w.max(0);
+    let bh = boy_h.max(0);
+
+    doc.guidelines.std_narrow_w = nw;
+    doc.guidelines.std_widen_w = ww;
+
+    let mut modified_count = 0usize;
+    let elem_count = doc.elements.len();
+
+    for ei in 0..elem_count {
+        let is_mirrored = doc.elements[ei].mirrored;
+        let is_basic = doc.elements[ei].element_type() == ElementType::BasicShape;
+        let sides: &[LineSide] = if is_mirrored {
+            &[LineSide::Left]
+        } else {
+            &[LineSide::Left, LineSide::Right]
+        };
+
+        let mut elem_changed = false;
+        for &side in sides {
+            let lines = doc.elements[ei].lines_mut(side);
+            for (r_idx, line) in lines.iter_mut().enumerate() {
+                if (is_basic && r_idx == 0)
+                    || line.function == LineFunction::BaseLine
+                    || (r_idx > 0 && line.rows == 0 && line.default_widening == 1)
+                {
+                    continue;
+                }
+
+                let mut line_changed = false;
+                match line.function {
+                    LineFunction::Narrowing | LineFunction::NarrowingMulti => {
+                        let nar = line.narrowing.get_or_insert_with(Default::default);
+                        set_active_module_width_on_list(&mut nar.modules, nw);
+                        line.ensure_child_slot(KanteChildSlot::Narrowing);
+                        line.default_narrowing = true;
+                        if let Some(ref mut cv) = line.curve {
+                            for st in &mut cv.steps {
+                                st.narrowing_width = nw;
+                                st.widening_width = 0;
+                            }
+                        }
+                        line_changed = true;
+                    }
+                    LineFunction::Widening => {
+                        let wid = line.widening.get_or_insert_with(Default::default);
+                        set_active_module_width_on_list(&mut wid.modules, ww);
+                        line.ensure_child_slot(KanteChildSlot::Widening);
+                        if let Some(ref mut cv) = line.curve {
+                            for st in &mut cv.steps {
+                                st.widening_width = ww;
+                                st.narrowing_width = 0;
+                            }
+                        }
+                        line_changed = true;
+                    }
+                    _ if line.stitches == 0 && line.rows != 0 && bh > 0 && !line.is_curve() => {
+                        calculate_and_set_stufung(line, 0, bh);
+                        line.default_height = 1;
+                        line_changed = true;
+                    }
+                    _ => {}
+                }
+
+                if line_changed {
+                    modified_count += 1;
+                    elem_changed = true;
+                }
+            }
+        }
+
+        if elem_changed && is_mirrored {
+            sync_mirrored_right_lines(doc, ei);
+        }
+    }
+
+    if modified_count > 0 {
+        doc.dirty = true;
+    }
+    modified_count
 }
 

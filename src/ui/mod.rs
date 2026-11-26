@@ -152,10 +152,11 @@ pub struct UiState {
     /// Which table side owns `editing_cell` so cross-table clicks commit cleanly.
     pub editing_side: LineSide,
 
-    /// Top panel `Yönergeler` step directives (Reglan, Artırma, Boy).
+    /// Preserved narrowing/widening defaults.
+    #[allow(dead_code)]
     pub directive_narrowing: i32,
+    #[allow(dead_code)]
     pub directive_widening: i32,
-    pub directive_height: i32,
 
     /// Top panel `Standart özellikler` selection.
     pub preset_is_user: bool,
@@ -171,7 +172,6 @@ pub struct UiState {
 
     /// Modern Light Studio state.
     pub show_detail_columns: bool,
-    pub snap_even_rows: bool,
     pub show_dimensions: bool,
     pub settings_popover_open: bool,
     pub active_table_side: LineSide,
@@ -213,7 +213,7 @@ impl Default for UiState {
     fn default() -> Self {
         Self {
             selected_elem: 0,
-            all_elements_selected: false,
+            all_elements_selected: true,
             table_mode: TableMode::LeftLines,
             sign_mode: SignMode::Cartesian,
             selected_rows: vec![0],
@@ -225,7 +225,6 @@ impl Default for UiState {
             editing_side: LineSide::Left,
             directive_narrowing: 1,
             directive_widening: 1,
-            directive_height: 1,
             preset_is_user: false,
             selected_preset_idx: 1, // "2 : CMS  >6< / <1>" default as in screenshot 222001.png
             always_on_top: false,
@@ -235,12 +234,11 @@ impl Default for UiState {
             show_status_bar: true,
             toolbars: ToolbarVisibility::default(),
             show_detail_columns: false,
-            snap_even_rows: false,
             show_dimensions: true,
             settings_popover_open: false,
             active_table_side: LineSide::Left,
             grid_unit_cm: false,
-            right_panel_collapsed: false,
+            right_panel_collapsed: true,
             copied_lines: Vec::new(),
             copied_markers: Vec::new(),
             line_props_req: None,
@@ -334,9 +332,9 @@ pub enum AppAction {
     // Lines toolbar & grid
     DeleteSelectedLines,
     ToggleGroupSelectedLines,
-    CreateClosingLine,
     AppendLine,
     InsertLineBefore,
+    AddClosingLine,
     QuickStartTemel,
     QuickStartRectangle,
     CopySelectedLines,
@@ -364,7 +362,6 @@ pub enum AppAction {
     },
 
     // Top panel actions
-    ApplyDirectives,
     ApplyStandardPreset,
 
     // Left panel actions
@@ -477,5 +474,220 @@ pub fn marker_function_label_tr(punkt_art_tag_id: i32) -> &'static str {
         2 => "Alt kol kesimi",
         3 => "Delik",
         _ => "Normal",
+    }
+}
+
+/// Standard crisp drop shadow for prominent modal dialogs.
+pub fn modal_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 8],
+        blur: 24,
+        spread: 2,
+        color: egui::Color32::from_black_alpha(72),
+    }
+}
+
+/// Compute a centered top-left window position inside `ctx.screen_rect()` for a modal of `approx_size`.
+pub fn centered_modal_pos(ctx: &egui::Context, approx_size: egui::Vec2) -> egui::Pos2 {
+    let sr = ctx.screen_rect();
+    let c = sr.center();
+    egui::pos2(
+        (c.x - approx_size.x * 0.5).max(sr.left() + 8.0),
+        (c.y - approx_size.y * 0.5).max(sr.top() + 8.0),
+    )
+}
+
+/// Paint a subtle dark backdrop overlay behind prominent modals so users never miss confirmations or alerts.
+/// When `order` is `Order::Middle` and `block_clicks` is false, it only dims visually; when `block_clicks`
+/// is true (e.g. behind an `Order::Foreground` alert), it also blocks background clicks.
+pub fn show_modal_backdrop(ctx: &egui::Context, id_salt: &str, block_clicks: bool) {
+    let sr = ctx.screen_rect();
+    let area = egui::Area::new(egui::Id::new(id_salt))
+        .order(egui::Order::Middle)
+        .fixed_pos(sr.min)
+        .interactable(block_clicks)
+        .constrain(false);
+    area.show(ctx, |ui| {
+        let sense = if block_clicks {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        };
+        let (rect, _) = ui.allocate_exact_size(sr.size(), sense);
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::ZERO,
+            egui::Color32::from_black_alpha(68),
+        );
+    });
+}
+
+/// Render a prominent, centered-on-open, movable Win32/Light-Studio modal dialog with crisp border & shadow.
+#[allow(clippy::too_many_arguments)]
+pub fn show_studio_modal_window(
+    ctx: &egui::Context,
+    id: egui::Id,
+    title: &str,
+    open: &mut bool,
+    approx_size: egui::Vec2,
+    resizable: bool,
+    show_icon: bool,
+    foreground: bool,
+    add_contents: impl FnOnce(&mut egui::Ui),
+) {
+    if !*open {
+        return;
+    }
+
+    let order = if foreground {
+        egui::Order::Foreground
+    } else {
+        egui::Order::Middle
+    };
+    let def_pos = centered_modal_pos(ctx, approx_size);
+
+    let mut win = egui::Window::new(title)
+        .id(id)
+        .order(order)
+        .title_bar(false)
+        .collapsible(false)
+        .movable(true)
+        .resizable(resizable)
+        .default_pos(def_pos)
+        .default_size(approx_size)
+        .frame(
+            egui::Frame::NONE
+                .fill(theme::colors::CARD_BG)
+                .corner_radius(egui::CornerRadius::same(6))
+                .stroke(egui::Stroke::new(1.5_f32, theme::colors::BORDER_DARK))
+                .shadow(modal_shadow()),
+        );
+    if !resizable {
+        win = win.fixed_size(approx_size);
+    }
+
+    let mut close_clicked = false;
+    win.show(ctx, |ui| {
+        let title_h = 28.0_f32;
+        let avail_w = if resizable {
+            ui.available_width().max(approx_size.x)
+        } else {
+            approx_size.x
+        };
+        if !resizable {
+            ui.set_width(approx_size.x);
+            ui.set_max_width(approx_size.x);
+        }
+        // Use Sense::hover() so dragging anywhere on the titlebar moves the egui::Window smoothly.
+        let (bar_rect, _) =
+            ui.allocate_exact_size(egui::vec2(avail_w, title_h), egui::Sense::hover());
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            bar_rect,
+            egui::CornerRadius {
+                nw: 6,
+                ne: 6,
+                sw: 0,
+                se: 0,
+            },
+            egui::Color32::WHITE,
+        );
+        painter.line_segment(
+            [bar_rect.left_bottom(), bar_rect.right_bottom()],
+            egui::Stroke::new(1.0_f32, theme::colors::BORDER_MID),
+        );
+
+        let mut text_left = bar_rect.left() + 10.0;
+        if show_icon {
+            let icon_r = egui::Rect::from_min_size(
+                egui::pos2(bar_rect.left() + 8.0, bar_rect.center().y - 7.0),
+                egui::Vec2::splat(14.0),
+            );
+            painter.rect_filled(icon_r, egui::CornerRadius::same(2), theme::colors::CANVAS_BLUE);
+            painter.rect_stroke(
+                icon_r,
+                egui::CornerRadius::same(2),
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0x30, 0x50, 0x78)),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_stroke(
+                icon_r.shrink(3.0),
+                egui::CornerRadius::ZERO,
+                egui::Stroke::new(1.0_f32, theme::colors::CONTOUR_GREEN),
+                egui::StrokeKind::Inside,
+            );
+            text_left = icon_r.right() + 7.0;
+        }
+
+        let close_w = 34.0_f32;
+        let close_rect = egui::Rect::from_min_max(
+            egui::pos2(bar_rect.right() - close_w, bar_rect.top()),
+            bar_rect.max,
+        );
+        let close_resp = ui.interact(close_rect, id.with("studio_modal_close"), egui::Sense::click());
+        if close_resp.hovered() {
+            painter.rect_filled(
+                close_rect,
+                egui::CornerRadius {
+                    nw: 0,
+                    ne: 6,
+                    sw: 0,
+                    se: 0,
+                },
+                egui::Color32::from_rgb(0xE8, 0x11, 0x23),
+            );
+        }
+        let x_col = if close_resp.hovered() {
+            egui::Color32::WHITE
+        } else {
+            theme::colors::TEXT_BLACK
+        };
+        let xc = close_rect.center();
+        painter.line_segment(
+            [egui::pos2(xc.x - 4.0, xc.y - 4.0), egui::pos2(xc.x + 4.0, xc.y + 4.0)],
+            egui::Stroke::new(1.2_f32, x_col),
+        );
+        painter.line_segment(
+            [egui::pos2(xc.x + 4.0, xc.y - 4.0), egui::pos2(xc.x - 4.0, xc.y + 4.0)],
+            egui::Stroke::new(1.2_f32, x_col),
+        );
+        if close_resp.clicked() {
+            close_clicked = true;
+        }
+
+        let title_clip = egui::Rect::from_min_max(
+            egui::pos2(text_left, bar_rect.top()),
+            egui::pos2(close_rect.left() - 4.0, bar_rect.bottom()),
+        );
+        painter.with_clip_rect(title_clip).text(
+            egui::pos2(text_left, bar_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            title,
+            theme::bold_font(11.5),
+            theme::colors::TEXT_BLACK,
+        );
+
+        let inner_w = (avail_w - 20.0).max(1.0);
+        egui::Frame::NONE
+            .fill(theme::colors::CHROME_BG)
+            .corner_radius(egui::CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: 6,
+                se: 6,
+            })
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.set_min_width(inner_w);
+                if !resizable {
+                    ui.set_width(inner_w);
+                }
+                add_contents(ui);
+            });
+    });
+
+    if close_clicked {
+        *open = false;
     }
 }

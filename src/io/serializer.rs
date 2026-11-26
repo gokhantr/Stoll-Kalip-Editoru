@@ -518,13 +518,13 @@ fn write_kante(out: &mut String, k: &LineSegment) {
         ("DefaultZunehmen", Some(k.default_widening.to_string())),
         ("DefaultHoehe", Some(k.default_height.to_string())),
         ("StartbezugElement", k.start_ref_element.map(|v| v.to_string())),
-        ("FillColor", k.fill_color.map(|v| v.to_string())),
         ("BorderFilling", k.border_filling.map(|v| v.to_string())),
-        ("BorderOptionColor", k.border_option_color.map(|v| v.to_string())),
+        ("FillColor", k.fill_color.map(|v| v.to_string())),
         (
             "BorderOptionInside",
             k.border_option_inside.map(|v| v.to_string()),
         ),
+        ("BorderOptionColor", k.border_option_color.map(|v| v.to_string())),
     ];
 
     // If the user added a comment or optional/neck/gore/color flags to a parsed line that didn't originally have them, emit them!
@@ -1272,7 +1272,7 @@ fn write_curve_step(out: &mut String, s: &CurveStep) {
     );
 }
 
-/// Serialize a standalone `[Kurve]` + `[KurvenLinie]` block for `.crv` export.
+/// Serialize a standalone `[Kurve]` + `[KurvenLinie]` block for `.FormCurve` export.
 pub fn serialize_curve_text(c: &CurveData) -> String {
     let mut out = String::with_capacity(2048);
     write_curve(&mut out, c);

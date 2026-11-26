@@ -84,8 +84,16 @@ pub enum IconKind {
     ElementBadge,
     CurveLine,
     CurveJ,
+    CurveReverseJ,
     CurveS,
     CurveUser,
+
+    // Clean vector toolbar / UI icons (also available via `StudioGlyph`)
+    OpenFile,
+    SaveFile,
+    Pin,
+    PinActive,
+    UpdateAlert,
 }
 
 #[derive(Clone)]
@@ -151,19 +159,7 @@ impl SpriteSheet {
     }
 }
 
-fn load_sheet(ctx: &egui::Context, sheet: SpriteSheet) -> IconAtlasPair {
-    let id = egui::Id::new(sheet.key());
-    if let Some(pair) = ctx.data(|d| d.get_temp::<IconAtlasPair>(id)) {
-        return pair;
-    }
-
-    let raw = sheet.bytes();
-    let w = u16::from_le_bytes([raw[0], raw[1]]) as usize;
-    let h = u16::from_le_bytes([raw[2], raw[3]]) as usize;
-    let pix = &raw[4..];
-
-    let img_enabled = ColorImage::from_rgba_unmultiplied([w, h], pix);
-
+fn make_disabled_rgba(pix: &[u8]) -> Vec<u8> {
     // Classic Win32 disabled embossed monochrome grey (#989898 - #B8B8B8, zero color leaks)
     let mut dis_rgba = Vec::with_capacity(pix.len());
     for chunk in pix.chunks_exact(4) {
@@ -180,6 +176,22 @@ fn load_sheet(ctx: &egui::Context, sheet: SpriteSheet) -> IconAtlasPair {
             dis_rgba.extend_from_slice(&[grey, grey, grey, a]);
         }
     }
+    dis_rgba
+}
+
+fn load_sheet(ctx: &egui::Context, sheet: SpriteSheet) -> IconAtlasPair {
+    let id = egui::Id::new(sheet.key());
+    if let Some(pair) = ctx.data(|d| d.get_temp::<IconAtlasPair>(id)) {
+        return pair;
+    }
+
+    let raw = sheet.bytes();
+    let w = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+    let h = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    let pix = &raw[4..];
+
+    let img_enabled = ColorImage::from_rgba_unmultiplied([w, h], pix);
+    let dis_rgba = make_disabled_rgba(pix);
     let img_disabled = ColorImage::from_rgba_unmultiplied([w, h], &dis_rgba);
 
     let enabled = ctx.load_texture(sheet.key(), img_enabled, TextureOptions::NEAREST);
@@ -193,6 +205,52 @@ fn load_sheet(ctx: &egui::Context, sheet: SpriteSheet) -> IconAtlasPair {
         disabled,
         w: w as u32,
         h: h as u32,
+    };
+    ctx.data_mut(|d| d.insert_temp(id, pair.clone()));
+    pair
+}
+
+/// Build an exact horizontal + vertical mirror of Stoll's `CurveJ` bitmap sprite (`FT_4308_RGBA` sprite 7).
+fn load_reverse_j_pair(ctx: &egui::Context) -> IconAtlasPair {
+    let id = egui::Id::new("stoll_icon_curve_reverse_j");
+    if let Some(pair) = ctx.data(|d| d.get_temp::<IconAtlasPair>(id)) {
+        return pair;
+    }
+
+    let raw = FT_4308_RGBA;
+    let sheet_w = u16::from_le_bytes([raw[0], raw[1]]) as usize;
+    let sh = u16::from_le_bytes([raw[2], raw[3]]) as usize;
+    let pix = &raw[4..];
+    let sw = sheet_w / 9;
+    let src_x0 = 7 * sw;
+
+    let mut mirrored = vec![0u8; sw * sh * 4];
+    for y in 0..sh {
+        for x in 0..sw {
+            let sx = src_x0 + (sw - 1 - x);
+            let sy = sh - 1 - y;
+            let si = (sy * sheet_w + sx) * 4;
+            let di = (y * sw + x) * 4;
+            mirrored[di..di + 4].copy_from_slice(&pix[si..si + 4]);
+        }
+    }
+
+    let dis_rgba = make_disabled_rgba(&mirrored);
+    let enabled = ctx.load_texture(
+        "stoll_icon_curve_reverse_j",
+        ColorImage::from_rgba_unmultiplied([sw, sh], &mirrored),
+        TextureOptions::NEAREST,
+    );
+    let disabled = ctx.load_texture(
+        "stoll_icon_curve_reverse_j_dis",
+        ColorImage::from_rgba_unmultiplied([sw, sh], &dis_rgba),
+        TextureOptions::NEAREST,
+    );
+    let pair = IconAtlasPair {
+        enabled,
+        disabled,
+        w: sw as u32,
+        h: sh as u32,
     };
     ctx.data_mut(|d| d.insert_temp(id, pair.clone()));
     pair
@@ -268,32 +326,96 @@ fn icon_sprite(kind: IconKind) -> Option<(SpriteSheet, usize, usize)> {
         VerticalArrowFromBottom => Some((Ft4301, 0, 1)),
         VerticalArrowFromTop => Some((Ft4302, 0, 1)),
 
-        CurveUser => None,
+        CurveUser | CurveReverseJ | OpenFile | SaveFile | Pin | PinActive | UpdateAlert => None,
     }
+}
+
+fn paint_atlas_sprite(
+    painter: &Painter,
+    rect: Rect,
+    pair: &IconAtlasPair,
+    idx: usize,
+    count: usize,
+    enabled: bool,
+    max_scale: f32,
+) {
+    let tex = if enabled { &pair.enabled } else { &pair.disabled };
+    let sprite_w = (pair.w as f32) / (count as f32);
+    let sprite_h = pair.h as f32;
+
+    // Preserve exact native pixel aspect ratio without blurry stretching
+    let scale = (rect.width() / sprite_w)
+        .min(rect.height() / sprite_h)
+        .min(max_scale.max(0.1));
+    let draw_w = (sprite_w * scale).round().max(1.0);
+    let draw_h = (sprite_h * scale).round().max(1.0);
+    let c = rect.center();
+    let draw_rect = Rect::from_center_size(pos2(c.x.round(), c.y.round()), vec2(draw_w, draw_h));
+
+    let u0 = (idx as f32) / (count as f32);
+    let u1 = ((idx + 1) as f32) / (count as f32);
+    let uv = Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0));
+    painter.image(tex.id(), draw_rect, uv, Color32::WHITE);
 }
 
 /// Paint an original Stoll bitmap icon centered cleanly inside `rect` (pixel-exact NEAREST sampling).
 pub fn paint_icon(painter: &Painter, rect: Rect, kind: IconKind, enabled: bool) {
+    paint_icon_scaled(painter, rect, kind, enabled, 1.0);
+}
+
+/// Paint an original Stoll bitmap icon centered cleanly inside `rect`, allowing crisp scaling up to `max_scale`.
+pub fn paint_icon_scaled(
+    painter: &Painter,
+    rect: Rect,
+    kind: IconKind,
+    enabled: bool,
+    max_scale: f32,
+) {
+    if kind == IconKind::CurveReverseJ {
+        let pair = load_reverse_j_pair(painter.ctx());
+        paint_atlas_sprite(painter, rect, &pair, 0, 1, enabled, max_scale);
+        return;
+    }
+
     if let Some((sheet, idx, count)) = icon_sprite(kind) {
         let pair = load_sheet(painter.ctx(), sheet);
-        let tex = if enabled { &pair.enabled } else { &pair.disabled };
-        let sprite_w = (pair.w as f32) / (count as f32);
-        let sprite_h = pair.h as f32;
-
-        // Preserve exact native pixel aspect ratio without blurry stretching
-        let scale = (rect.width() / sprite_w)
-            .min(rect.height() / sprite_h)
-            .min(1.0);
-        let draw_w = (sprite_w * scale).round().max(1.0);
-        let draw_h = (sprite_h * scale).round().max(1.0);
-        let c = rect.center();
-        let draw_rect = Rect::from_center_size(pos2(c.x.round(), c.y.round()), vec2(draw_w, draw_h));
-
-        let u0 = (idx as f32) / (count as f32);
-        let u1 = ((idx + 1) as f32) / (count as f32);
-        let uv = Rect::from_min_max(pos2(u0, 0.0), pos2(u1, 1.0));
-        painter.image(tex.id(), draw_rect, uv, Color32::WHITE);
+        paint_atlas_sprite(painter, rect, &pair, idx, count, enabled, max_scale);
         return;
+    }
+
+    let glyph_col = if enabled {
+        colors::TEXT_BLACK
+    } else {
+        Color32::from_rgb(0x9A, 0x9A, 0x9A)
+    };
+    match kind {
+        IconKind::OpenFile => {
+            paint_studio_glyph(painter, rect, StudioGlyph::OpenFile, glyph_col);
+            return;
+        }
+        IconKind::SaveFile => {
+            paint_studio_glyph(painter, rect, StudioGlyph::SaveFile, glyph_col);
+            return;
+        }
+        IconKind::Pin => {
+            paint_studio_glyph(painter, rect, StudioGlyph::Pin, glyph_col);
+            return;
+        }
+        IconKind::PinActive => {
+            let active_col = if enabled { colors::WIN_BLUE } else { glyph_col };
+            paint_studio_glyph(painter, rect, StudioGlyph::PinActive, active_col);
+            return;
+        }
+        IconKind::UpdateAlert => {
+            let alert_col = if enabled {
+                Color32::from_rgb(0xDC, 0x26, 0x26)
+            } else {
+                glyph_col
+            };
+            paint_studio_glyph(painter, rect, StudioGlyph::UpdateAlert, alert_col);
+            return;
+        }
+        _ => {}
     }
 
     // Fallback for `CurveUser` (check-shaped blue curve glyph)
@@ -316,6 +438,12 @@ pub fn paint_icon(painter: &Painter, rect: Rect, kind: IconKind, enabled: bool) 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StudioGlyph {
+    NewFile,
+    OpenFile,
+    SaveFile,
+    Pin,
+    PinActive,
+    UpdateAlert,
     Undo,
     Redo,
     Mirror,
@@ -337,6 +465,129 @@ pub fn paint_studio_glyph(painter: &Painter, rect: Rect, glyph: StudioGlyph, col
     let thin = Stroke::new(1.15 * s, color);
 
     match glyph {
+        StudioGlyph::NewFile => {
+            // Crisp document page with folded top-right corner
+            let l = c.x - 4.0 * s;
+            let r = c.x + 4.0 * s;
+            let t = c.y - 5.0 * s;
+            let b = c.y + 5.0 * s;
+            let f = 2.8 * s;
+            let pts = vec![
+                pos2(l, t),
+                pos2(r - f, t),
+                pos2(r, t + f),
+                pos2(r, b),
+                pos2(l, b),
+            ];
+            painter.add(egui::Shape::closed_line(pts, stroke));
+            painter.line_segment([pos2(r - f, t), pos2(r - f, t + f)], thin);
+            painter.line_segment([pos2(r - f, t + f), pos2(r, t + f)], thin);
+        }
+        StudioGlyph::OpenFile => {
+            // Clean open folder silhouette
+            let l = c.x - 5.2 * s;
+            let r = c.x + 4.5 * s;
+            let t = c.y - 4.2 * s;
+            let b = c.y + 4.2 * s;
+            let back = vec![
+                pos2(l, b),
+                pos2(l, t),
+                pos2(c.x - 1.2 * s, t),
+                pos2(c.x + 0.2 * s, t + 1.6 * s),
+                pos2(r, t + 1.6 * s),
+                pos2(r, t + 3.0 * s),
+            ];
+            painter.add(egui::Shape::line(back, stroke));
+            let flap = vec![
+                pos2(l, b),
+                pos2(l + 1.8 * s, c.y - 0.6 * s),
+                pos2(r + 1.0 * s, c.y - 0.6 * s),
+                pos2(r - 0.6 * s, b),
+            ];
+            painter.add(egui::Shape::closed_line(flap, stroke));
+        }
+        StudioGlyph::SaveFile => {
+            // Crisp floppy disk outline with top shutter & bottom label
+            let l = c.x - 4.8 * s;
+            let r = c.x + 4.8 * s;
+            let t = c.y - 4.8 * s;
+            let b = c.y + 4.8 * s;
+            let bev = 2.0 * s;
+            let outer = vec![
+                pos2(l, t),
+                pos2(r - bev, t),
+                pos2(r, t + bev),
+                pos2(r, b),
+                pos2(l, b),
+            ];
+            painter.add(egui::Shape::closed_line(outer, stroke));
+            let shutter = Rect::from_min_max(pos2(l + 2.2 * s, t), pos2(r - 2.6 * s, c.y - 1.2 * s));
+            painter.rect_stroke(shutter, 0.5, thin, egui::StrokeKind::Inside);
+            let label = Rect::from_min_max(pos2(l + 1.8 * s, c.y + 0.8 * s), pos2(r - 1.8 * s, b));
+            painter.rect_stroke(label, 0.5, thin, egui::StrokeKind::Inside);
+        }
+        StudioGlyph::Pin => {
+            // Sharp, unmistakable tilted 45° pushpin (off state: clean outline + angled needle)
+            // Top cap -> tapered waist -> wide flange (all connected polygon outline)
+            let outline = vec![
+                pos2(c.x + 1.0 * s, c.y - 5.2 * s), // cap top-left
+                pos2(c.x + 5.2 * s, c.y - 1.0 * s), // cap bottom-right
+                pos2(c.x + 4.0 * s, c.y + 0.2 * s), // waist right
+                pos2(c.x + 2.4 * s, c.y - 0.6 * s), // neck right
+                pos2(c.x + 1.0 * s, c.y + 0.8 * s), // collar inner-right
+                pos2(c.x + 2.0 * s, c.y + 2.6 * s), // flange bottom-right
+                pos2(c.x - 2.6 * s, c.y - 2.0 * s), // flange top-left
+                pos2(c.x - 0.8 * s, c.y - 1.0 * s), // collar inner-left
+                pos2(c.x + 0.6 * s, c.y - 2.4 * s), // neck left
+                pos2(c.x - 0.2 * s, c.y - 4.0 * s), // waist left
+            ];
+            painter.add(egui::Shape::closed_line(outline, Stroke::new(1.3 * s, color)));
+            // Sharp diagonal needle pointing bottom-left
+            painter.line_segment(
+                [pos2(c.x - 0.3 * s, c.y + 0.3 * s), pos2(c.x - 4.8 * s, c.y + 4.8 * s)],
+                Stroke::new(1.65 * s, color),
+            );
+        }
+        StudioGlyph::PinActive => {
+            // Active vertical pinned-down pushpin (bold accent fill + crisp outline + vertical needle)
+            let cap = vec![
+                pos2(c.x - 3.2 * s, c.y - 5.2 * s),
+                pos2(c.x + 3.2 * s, c.y - 5.2 * s),
+                pos2(c.x + 2.6 * s, c.y - 3.6 * s),
+                pos2(c.x - 2.6 * s, c.y - 3.6 * s),
+            ];
+            let body = vec![
+                pos2(c.x - 2.0 * s, c.y - 3.6 * s),
+                pos2(c.x + 2.0 * s, c.y - 3.6 * s),
+                pos2(c.x + 2.2 * s, c.y - 0.8 * s),
+                pos2(c.x - 2.2 * s, c.y - 0.8 * s),
+            ];
+            let flange = vec![
+                pos2(c.x - 4.4 * s, c.y - 0.8 * s),
+                pos2(c.x + 4.4 * s, c.y - 0.8 * s),
+                pos2(c.x + 4.4 * s, c.y + 1.0 * s),
+                pos2(c.x - 4.4 * s, c.y + 1.0 * s),
+            ];
+            let border = Stroke::new(0.9 * s, color);
+            painter.add(egui::Shape::convex_polygon(cap, color, border));
+            painter.add(egui::Shape::convex_polygon(body, color, border));
+            painter.add(egui::Shape::convex_polygon(flange, color, border));
+            // Vertical needle pinned straight down
+            painter.line_segment(
+                [pos2(c.x, c.y + 1.0 * s), pos2(c.x, c.y + 5.4 * s)],
+                Stroke::new(1.85 * s, color),
+            );
+        }
+        StudioGlyph::UpdateAlert => {
+            // Crisp circular badge with upward arrow & notification dot
+            painter.circle_stroke(c, 5.2 * s, stroke);
+            let top = pos2(c.x, c.y - 2.8 * s);
+            let bot = pos2(c.x, c.y + 2.8 * s);
+            painter.line_segment([bot, top], stroke);
+            painter.line_segment([top, pos2(c.x - 2.4 * s, c.y - 0.4 * s)], stroke);
+            painter.line_segment([top, pos2(c.x + 2.4 * s, c.y - 0.4 * s)], stroke);
+            painter.circle_filled(pos2(c.x + 4.2 * s, c.y - 4.2 * s), 1.6 * s, color);
+        }
         StudioGlyph::Undo => {
             // Crisp left-pointing curved back-arrow arch (↶), open at bottom — never a refresh loop
             let pts = vec![

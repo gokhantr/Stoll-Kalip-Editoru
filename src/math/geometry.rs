@@ -1,4 +1,4 @@
-use crate::math::curves::curve_steps_sum;
+use crate::math::curves::{curve_steps_sum, expand_curve_steps};
 use crate::math::units::{rows_to_mm, stitches_to_mm};
 use crate::model::{
     ElementType, FormDocument, InputFormat, LineSegment, LineSide, ShapeElement,
@@ -292,30 +292,27 @@ fn trace_side(
             if !curve.steps.is_empty() {
                 let mut sx = cur_st.0;
                 let mut sy = cur_st.1;
-                // Expand each step * factor to draw crisp stepped Stoll curve contour
-                for step in &curve.steps {
-                    let reps = step.factor.max(1);
-                    for _ in 0..reps {
-                        if step.step_height != 0 {
-                            sy += step.step_height;
-                            let pm = Vec2::new(
-                                seg_start_mm.x + stitches_to_mm(sx - seg_start_st.0, hdr),
-                                seg_start_mm.y + rows_to_mm(sy - seg_start_st.1, hdr),
-                            );
-                            poly_st.push(Vec2::new(sx as f64, sy as f64));
-                            poly_mm.push(pm);
-                            full_poly.push(pm);
-                        }
-                        if step.step_width != 0 {
-                            sx += step.step_width;
-                            let pm = Vec2::new(
-                                seg_start_mm.x + stitches_to_mm(sx - seg_start_st.0, hdr),
-                                seg_start_mm.y + rows_to_mm(sy - seg_start_st.1, hdr),
-                            );
-                            poly_st.push(Vec2::new(sx as f64, sy as f64));
-                            poly_mm.push(pm);
-                            full_poly.push(pm);
-                        }
+                // Expand each step * factor and GruppenTagId/GruppenFaktor blocks to draw crisp Stoll curve contour
+                for (sw, sh) in expand_curve_steps(&curve.steps) {
+                    if sh != 0 {
+                        sy += sh;
+                        let pm = Vec2::new(
+                            seg_start_mm.x + stitches_to_mm(sx - seg_start_st.0, hdr),
+                            seg_start_mm.y + rows_to_mm(sy - seg_start_st.1, hdr),
+                        );
+                        poly_st.push(Vec2::new(sx as f64, sy as f64));
+                        poly_mm.push(pm);
+                        full_poly.push(pm);
+                    }
+                    if sw != 0 {
+                        sx += sw;
+                        let pm = Vec2::new(
+                            seg_start_mm.x + stitches_to_mm(sx - seg_start_st.0, hdr),
+                            seg_start_mm.y + rows_to_mm(sy - seg_start_st.1, hdr),
+                        );
+                        poly_st.push(Vec2::new(sx as f64, sy as f64));
+                        poly_mm.push(pm);
+                        full_poly.push(pm);
                     }
                 }
             }

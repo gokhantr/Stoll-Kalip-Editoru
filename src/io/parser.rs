@@ -172,6 +172,11 @@ pub fn parse_form_text(text: &str, ole: OlePreservedStreams) -> Result<FormDocum
                             gore_align_rows: None,
                             is_imitated_neck_processing: None,
                             gks_line_state: None,
+                            start_ref_element: None,
+                            fill_color: None,
+                            border_filling: None,
+                            border_option_color: None,
+                            border_option_inside: None,
                             connection_points: None,
                             child_order: Vec::new(),
                             raw: RawSectionMeta {
