@@ -99,6 +99,19 @@ pub fn check_curve_feasibility(params: &CurveGenParams) -> CurveFeasibility {
     let abs_dy = params.total_dy.abs();
     let min_h = params.min_step_height;
 
+    if params.parity_mode == CourseParityMode::EvenCourses && abs_dy > 0 && abs_dy % 2 != 0 {
+        return CurveFeasibility {
+            feasible: false,
+            num_steps: 0,
+            effective_min_height: min_h.max(2),
+            required_min_dy: abs_dy + 1,
+            actual_dy: abs_dy,
+            warning_tr: Some(format!(
+                "Çift May modu için toplam boy çift sayı olmalıdır (mevcut: {abs_dy}). Boyu 1 may artırın veya azaltın."
+            )),
+        };
+    }
+
     if min_h <= 0 || abs_dx == 0 || abs_dy == 0 {
         return CurveFeasibility {
             feasible: true,
@@ -317,7 +330,7 @@ pub fn extract_curve_module_widths(line: &LineSegment) -> (i32, i32, i32) {
 }
 
 /// Expand `[KurvenLinie]` steps into elementary `(dx, dy)` step pairs, repeating
-/// contiguous `GruppenTagId > 0` blocks by their header row's `GruppenFaktor`.
+/// contiguous grouped blocks (`GruppenTagId > 0`, or Stoll `GruppenFaktor > 1` followed by `0` rows).
 pub fn expand_curve_steps(steps: &[CurveStep]) -> Vec<(i32, i32)> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -342,8 +355,27 @@ pub fn expand_curve_steps(steps: &[CurveStep]) -> Vec<(i32, i32)> {
                     }
                 }
             }
+        } else if steps[i].group_factor > 1
+            && steps.get(i + 1).is_some_and(|n| n.group_tag_id == 0 && n.group_factor == 0)
+        {
+            let start = i;
+            let gf = steps[i].group_factor.max(1);
+            i += 1;
+            while i < steps.len() && steps[i].group_tag_id == 0 && steps[i].group_factor == 0 {
+                i += 1;
+            }
+            let block = &steps[start..i];
+            for _ in 0..gf {
+                for s in block {
+                    let reps = s.factor.max(1);
+                    for _ in 0..reps {
+                        out.push((s.step_width, s.step_height));
+                    }
+                }
+            }
         } else {
-            let reps = steps[i].factor.max(1);
+            let gf = steps[i].group_factor.max(1);
+            let reps = steps[i].factor.max(1) * gf;
             for _ in 0..reps {
                 out.push((steps[i].step_width, steps[i].step_height));
             }
@@ -356,7 +388,9 @@ pub fn expand_curve_steps(steps: &[CurveStep]) -> Vec<(i32, i32)> {
 /// Normalize `GruppenFaktor` / `GruppenTagId` across `[KurvenLinie]` rows to match Stoll's format:
 /// - First row of a contiguous `GruppenTagId > 0` block holds `GruppenFaktor = N >= 1`.
 /// - Continuation rows of that block hold `GruppenFaktor = 0`.
-/// - Ungrouped rows (`GruppenTagId == 0`) hold `GruppenFaktor = 1`.
+/// - Stoll `GruppenTagId == 0, GruppenFaktor > 1` blocks followed by `GruppenTagId == 0, GruppenFaktor == 0`
+///   continuation rows are preserved intact.
+/// - Standalone ungrouped rows (`GruppenTagId == 0`) keep `GruppenFaktor >= 1`.
 pub fn normalize_curve_groups(steps: &mut [CurveStep]) {
     let mut i = 0;
     while i < steps.len() {
@@ -376,9 +410,19 @@ pub fn normalize_curve_groups(steps: &mut [CurveStep]) {
             for s in &mut steps[start + 1..i] {
                 s.group_factor = 0;
             }
+        } else if steps[i].group_factor > 1
+            && steps
+                .get(i + 1)
+                .is_some_and(|n| n.group_tag_id == 0 && n.group_factor == 0)
+        {
+            // Preserve native Stoll GruppenTagId=0 multi-row repeat block
+            i += 1;
+            while i < steps.len() && steps[i].group_tag_id == 0 && steps[i].group_factor == 0 {
+                i += 1;
+            }
         } else {
             steps[i].group_tag_id = 0;
-            steps[i].group_factor = 1;
+            steps[i].group_factor = steps[i].group_factor.max(1);
             i += 1;
         }
     }
@@ -407,8 +451,23 @@ pub fn curve_steps_sum_slice(steps: &[CurveStep]) -> (i32, i32) {
                 tot_dx += s.step_width * mult;
                 tot_dy += s.step_height * mult;
             }
+        } else if steps[i].group_factor > 1
+            && steps.get(i + 1).is_some_and(|n| n.group_tag_id == 0 && n.group_factor == 0)
+        {
+            let start = i;
+            let gf = steps[i].group_factor.max(1);
+            i += 1;
+            while i < steps.len() && steps[i].group_tag_id == 0 && steps[i].group_factor == 0 {
+                i += 1;
+            }
+            for s in &steps[start..i] {
+                let mult = s.factor.max(0) * gf;
+                tot_dx += s.step_width * mult;
+                tot_dy += s.step_height * mult;
+            }
         } else {
-            let mult = steps[i].factor.max(0);
+            let gf = steps[i].group_factor.max(1);
+            let mult = steps[i].factor.max(0) * gf;
             tot_dx += steps[i].step_width * mult;
             tot_dy += steps[i].step_height * mult;
             i += 1;
@@ -424,6 +483,7 @@ pub fn curve_steps_sum(curve: &CurveData) -> (i32, i32) {
 
 /// Convert a Left/Right single-system (`Tek Sistem`) curve's steps to the opposite side:
 /// - Negates `step_width` for mirroring.
+/// - Preserves per-step `(narrowing_width, widening_width, fade_out_width)` and horizontal `dy == 0` steps.
 /// - Shifts shaping course heights by `+1` course (`SingleSystemLeftOdd -> SingleSystemRightEven`)
 ///   or `-1` course (`SingleSystemRightEven -> SingleSystemLeftOdd`) while keeping `sum_dy` identical.
 pub fn mirror_curve_steps_single_system(
@@ -433,34 +493,144 @@ pub fn mirror_curve_steps_single_system(
     if steps.is_empty() {
         return Vec::new();
     }
-    let nw = steps[0].narrowing_width;
-    let ww = steps[0].widening_width;
-    let fw = steps[0].fade_out_width;
-    let expanded = expand_curve_steps(steps);
+    // Expand preserving per-step module widths: (dx, dy, nw, ww, fw)
+    let mut expanded: Vec<(i32, i32, i32, i32, i32)> = Vec::new();
+    let mut i = 0usize;
+    while i < steps.len() {
+        let gid = steps[i].group_tag_id;
+        if gid > 0 {
+            let start = i;
+            while i < steps.len() && steps[i].group_tag_id == gid {
+                i += 1;
+            }
+            let block = &steps[start..i];
+            let gf = block
+                .iter()
+                .map(|s| s.group_factor)
+                .find(|&f| f > 0)
+                .unwrap_or(1);
+            for _ in 0..gf {
+                for s in block {
+                    for _ in 0..s.factor.max(1) {
+                        expanded.push((
+                            s.step_width,
+                            s.step_height,
+                            s.narrowing_width,
+                            s.widening_width,
+                            s.fade_out_width,
+                        ));
+                    }
+                }
+            }
+        } else if steps[i].group_factor > 1
+            && steps
+                .get(i + 1)
+                .is_some_and(|n| n.group_tag_id == 0 && n.group_factor == 0)
+        {
+            let start = i;
+            let gf = steps[i].group_factor.max(1);
+            i += 1;
+            while i < steps.len() && steps[i].group_tag_id == 0 && steps[i].group_factor == 0 {
+                i += 1;
+            }
+            let block = &steps[start..i];
+            for _ in 0..gf {
+                for s in block {
+                    for _ in 0..s.factor.max(1) {
+                        expanded.push((
+                            s.step_width,
+                            s.step_height,
+                            s.narrowing_width,
+                            s.widening_width,
+                            s.fade_out_width,
+                        ));
+                    }
+                }
+            }
+        } else {
+            let s = &steps[i];
+            let reps = s.factor.max(1) * s.group_factor.max(1);
+            for _ in 0..reps {
+                expanded.push((
+                    s.step_width,
+                    s.step_height,
+                    s.narrowing_width,
+                    s.widening_width,
+                    s.fade_out_width,
+                ));
+            }
+            i += 1;
+        }
+    }
     if expanded.is_empty() {
         return Vec::new();
     }
-    let total_dy: i32 = expanded.iter().map(|&(_, dy)| dy).sum();
-    if total_dy == 0 {
-        let pairs: Vec<(i32, i32)> = expanded.into_iter().map(|(dx, dy)| (-dx, dy)).collect();
-        return compress_pairs_to_steps(&pairs, nw, ww, fw);
+
+    let compress_rich = |items: &[(i32, i32, i32, i32, i32)]| -> Vec<CurveStep> {
+        let mut out: Vec<CurveStep> = Vec::new();
+        for &(dx, dy, nw, ww, fw) in items {
+            if let Some(last) = out.last_mut() {
+                if last.step_width == dx
+                    && last.step_height == dy
+                    && last.narrowing_width == nw
+                    && last.widening_width == ww
+                    && last.fade_out_width == fw
+                {
+                    last.factor += 1;
+                    continue;
+                }
+            }
+            let idx = (out.len() + 1) as i32;
+            out.push(CurveStep {
+                index: idx,
+                tag_id: idx,
+                step_width: dx,
+                step_height: dy,
+                factor: 1,
+                narrowing_width: nw,
+                widening_width: ww,
+                fade_out_width: fw,
+                group_factor: 1,
+                group_tag_id: 0,
+                ..CurveStep::default()
+            });
+        }
+        out
+    };
+
+    let total_dy: i32 = expanded.iter().map(|&(_, dy, _, _, _)| dy).sum();
+    let has_shaping = expanded.iter().any(|&(dx, dy, _, _, _)| dx != 0 && dy != 0);
+    if total_dy == 0 || !has_shaping {
+        let mirrored: Vec<(i32, i32, i32, i32, i32)> = expanded
+            .into_iter()
+            .map(|(dx, dy, nw, ww, fw)| (-dx, dy, nw, ww, fw))
+            .collect();
+        return compress_rich(&mirrored);
     }
 
     let sign_y = total_dy.signum();
-    let mut pairs: Vec<(i32, i32)> = Vec::with_capacity(expanded.len() + 1);
+    let mut rich_pairs: Vec<(i32, i32, i32, i32, i32)> = Vec::with_capacity(expanded.len() + 1);
     let mut cur_src_y = 0i32;
     let mut cur_dst_y = 0i32;
+    let last_shaping_idx = expanded
+        .iter()
+        .rposition(|&(dx, dy, _, _, _)| dx != 0 && dy != 0)
+        .unwrap();
+    let mut last_widths = (
+        steps[0].narrowing_width,
+        steps[0].widening_width,
+        steps[0].fade_out_width,
+    );
 
-    let has_shaping = expanded.iter().any(|&(dx, _)| dx != 0);
-    if !has_shaping {
-        let pairs: Vec<(i32, i32)> = expanded.into_iter().map(|(dx, dy)| (-dx, dy)).collect();
-        return compress_pairs_to_steps(&pairs, nw, ww, fw);
-    }
-
-    let last_shaping_idx = expanded.iter().rposition(|&(dx, _)| dx != 0).unwrap();
-    for (idx, (dx, dy)) in expanded.into_iter().enumerate() {
+    for (idx, (dx, dy, nw, ww, fw)) in expanded.into_iter().enumerate() {
         cur_src_y += dy;
+        last_widths = (nw, ww, fw);
         if dx == 0 {
+            continue;
+        }
+        if dy == 0 {
+            // Preserve intentional horizontal (dy == 0) bind-off steps without shifting course height
+            rich_pairs.push((-dx, 0, nw, ww, fw));
             continue;
         }
         let target_y = if target_right_even {
@@ -483,14 +653,14 @@ pub fn mirror_curve_steps_single_system(
         };
         let new_dy = target_y - cur_dst_y;
         cur_dst_y += new_dy;
-        pairs.push((-dx, new_dy));
+        rich_pairs.push((-dx, new_dy, nw, ww, fw));
     }
 
     if cur_dst_y != total_dy {
-        pairs.push((0, total_dy - cur_dst_y));
+        rich_pairs.push((0, total_dy - cur_dst_y, last_widths.0, last_widths.1, last_widths.2));
     }
 
-    compress_pairs_to_steps(&pairs, nw, ww, fw)
+    compress_rich(&rich_pairs)
 }
 
 #[inline]
@@ -961,7 +1131,8 @@ fn calc_formula_y_driven(
         if abs_dy <= 1 {
             return vec![(dx, dy)];
         }
-        let sy_even = (step_y.abs() / 2).max(1) * 2;
+        // Round UP to even so Min May (e.g. 3 -> sy_even=4, first_mag=3) is strictly respected
+        let sy_even = ((step_y.abs() + 1) / 2).max(1) * 2;
         let target_last_shaping = if dy % 2 == 0 { dy - sign_y } else { dy };
         let abs_target = target_last_shaping.abs();
 
@@ -1207,4 +1378,481 @@ pub fn apply_curve_to_line(
 
     line.curve = Some(curve);
     line.ensure_child_slot(KanteChildSlot::Curve);
+}
+
+/// Recovered curve formula & parameters from an existing `[Kurve]` step table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetectedCurveFormula {
+    pub form: CurveForm,
+    pub reverse_j: bool,
+    pub step_drive: CurveStepDrive,
+    pub step_x_mag: i32,
+    pub step_y_mag: i32,
+    pub even_courses: bool,
+    pub single_system: bool,
+    pub min_step_height: i32,
+}
+
+/// Recover the generating formula (`Line`, `JCurve`, `SCurve`, `ReverseJ`, `Step`) and parameters
+/// (`En basamak`, `Boy basamak`, `Çift May`, `Tek Sistem`, `Min May`) from a `[Kurve]` stored on disk
+/// (even when stored under Stoll `Funktion = 5` to protect custom steps in `vecformeditor.exe`).
+pub fn detect_curve_formula_from_steps(
+    curve: &CurveData,
+    side: crate::model::LineSide,
+    single_system_hint: bool,
+) -> Option<DetectedCurveFormula> {
+    use crate::model::LineSide;
+
+    if curve.steps.is_empty() {
+        return None;
+    }
+    let deltas = expand_curve_steps(&curve.steps);
+    if deltas.is_empty() {
+        return None;
+    }
+    let total_dx: i32 = deltas.iter().map(|d| d.0).sum();
+    let total_dy: i32 = deltas.iter().map(|d| d.1).sum();
+    if total_dx == 0 && total_dy == 0 {
+        return None;
+    }
+
+    let push_uniq = |v: &mut Vec<i32>, x: i32| {
+        if x >= 1 && !v.contains(&x) {
+            v.push(x);
+        }
+    };
+
+    // Most common non-zero |dx| and |dy|
+    let mut dx_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut dy_counts: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    for &(dx, dy) in &deltas {
+        if dx != 0 {
+            *dx_counts.entry(dx.abs()).or_insert(0) += 1;
+        }
+        if dy != 0 {
+            *dy_counts.entry(dy.abs()).or_insert(0) += 1;
+        }
+    }
+    let mode_dx = dx_counts
+        .into_iter()
+        .max_by_key(|&(k, cnt)| (cnt, -(k as isize)))
+        .map(|(k, _)| k)
+        .unwrap_or(1);
+    let mode_dy = dy_counts
+        .into_iter()
+        .max_by_key(|&(k, cnt)| (cnt, -(k as isize)))
+        .map(|(k, _)| k)
+        .unwrap_or(1);
+
+    let mut sx_cands = Vec::new();
+    if let Some(&(dx0, _)) = deltas.iter().find(|&&(dx, _)| dx != 0) {
+        push_uniq(&mut sx_cands, dx0.abs());
+    }
+    push_uniq(&mut sx_cands, mode_dx);
+    push_uniq(&mut sx_cands, 1);
+
+    let mut sy_cands = Vec::new();
+    if let Some(&(_, dy0)) = deltas.iter().find(|&&(_, dy)| dy != 0) {
+        push_uniq(&mut sy_cands, dy0.abs());
+    }
+    push_uniq(&mut sy_cands, mode_dy);
+    push_uniq(&mut sy_cands, 1);
+    push_uniq(&mut sy_cands, 2);
+
+    let all_even_y = deltas.iter().any(|&(_, dy)| dy != 0)
+        && deltas.iter().all(|&(_, dy)| dy % 2 == 0);
+    let left_odd_pattern = side == LineSide::Left
+        && deltas.len() >= 2
+        && deltas[0].1 % 2 != 0
+        && deltas[1..]
+            .iter()
+            .all(|&(dx, dy)| dx == 0 || dy % 2 == 0);
+
+    let mut parity_cands: Vec<(bool, bool)> = Vec::new();
+    let mut push_parity = |ev: bool, ss: bool| {
+        if !parity_cands.contains(&(ev, ss)) {
+            parity_cands.push((ev, ss));
+        }
+    };
+    if single_system_hint {
+        push_parity(false, true);
+    }
+    if left_odd_pattern {
+        push_parity(false, true);
+    }
+    if all_even_y {
+        push_parity(true, false);
+        if side == LineSide::Right {
+            push_parity(false, true);
+        }
+    }
+    push_parity(false, false);
+
+    let mut min_h_cands: Vec<i32> = vec![0];
+    if let Some(mh) = deltas
+        .iter()
+        .filter(|&&(dx, _)| dx != 0)
+        .map(|&(_, dy)| dy.abs())
+        .min()
+    {
+        if (1..=9).contains(&mh) {
+            min_h_cands.push(mh);
+            if mh == 2 && all_even_y {
+                min_h_cands.push(1);
+            }
+        }
+    }
+
+    let uniform_dx = deltas.len() >= 2 && {
+        let target = deltas[0].0.abs();
+        target > 0
+            && deltas[..deltas.len() - 1]
+                .iter()
+                .all(|&(dx, _)| dx.abs() == target)
+            && deltas.last().unwrap().0.abs() <= target
+    };
+    let uniform_dy = deltas.len() >= 2 && {
+        let target = deltas[0].1.abs();
+        target > 0
+            && deltas[..deltas.len() - 1]
+                .iter()
+                .all(|&(_, dy)| dy.abs() == target)
+            && deltas.last().unwrap().1.abs() <= target
+    };
+    let drives: [CurveStepDrive; 2] = if uniform_dy && !uniform_dx {
+        [CurveStepDrive::ByHeight, CurveStepDrive::ByWidth]
+    } else {
+        [CurveStepDrive::ByWidth, CurveStepDrive::ByHeight]
+    };
+
+    let stored_form = CurveForm::from_id(curve.function);
+    let formulas: Vec<(CurveForm, bool)> = match stored_form {
+        CurveForm::Line => vec![
+            (CurveForm::Line, false),
+            (CurveForm::JCurve, false),
+            (CurveForm::JCurve, true),
+            (CurveForm::SCurve, false),
+            (CurveForm::Step, false),
+        ],
+        CurveForm::JCurve => vec![
+            (CurveForm::JCurve, false),
+            (CurveForm::Line, false),
+            (CurveForm::JCurve, true),
+            (CurveForm::SCurve, false),
+        ],
+        CurveForm::SCurve => vec![
+            (CurveForm::SCurve, false),
+            (CurveForm::Line, false),
+            (CurveForm::JCurve, false),
+            (CurveForm::JCurve, true),
+        ],
+        CurveForm::Step => vec![(CurveForm::Step, false), (CurveForm::Line, false)],
+        CurveForm::UserCurve => vec![
+            (CurveForm::Line, false),
+            (CurveForm::JCurve, false),
+            (CurveForm::JCurve, true),
+            (CurveForm::SCurve, false),
+        ],
+    };
+
+    let make_parity = |ev: bool, ss: bool| -> CourseParityMode {
+        if ss {
+            match side {
+                LineSide::Left => CourseParityMode::SingleSystemLeftOdd,
+                LineSide::Right => CourseParityMode::SingleSystemRightEven,
+            }
+        } else if ev {
+            CourseParityMode::EvenCourses
+        } else {
+            CourseParityMode::Any
+        }
+    };
+
+    // Pass 1: exact delta sequence match
+    for &(form, rev_j) in &formulas {
+        for &drive in &drives {
+            let mut drive_x_list = if drive == CurveStepDrive::ByWidth {
+                sx_cands.clone()
+            } else {
+                vec![sx_cands[0]]
+            };
+            if drive_x_list.is_empty() {
+                drive_x_list.push(1);
+            }
+            let mut drive_y_list = if drive == CurveStepDrive::ByHeight {
+                sy_cands.clone()
+            } else {
+                vec![sy_cands.first().copied().unwrap_or(1)]
+            };
+            if drive_y_list.is_empty() {
+                drive_y_list.push(1);
+            }
+
+            for &(ev, ss) in &parity_cands {
+                let pm = make_parity(ev, ss);
+                for &mh in &min_h_cands {
+                    for &sx_mag in &drive_x_list {
+                        for &sy_mag in &drive_y_list {
+                            let sx_signed = if total_dx < 0 { -sx_mag } else { sx_mag };
+                            let sy_signed = if total_dy < 0 { -sy_mag } else { sy_mag };
+                            let cand_steps = generate_curve_steps(&CurveGenParams {
+                                curve_form: form,
+                                total_dx,
+                                total_dy,
+                                step_x: sx_signed,
+                                step_y: sy_signed,
+                                narrowing_width: 0,
+                                widening_width: 0,
+                                fade_out_width: 0,
+                                parity_mode: pm,
+                                step_drive: drive,
+                                reverse_j: rev_j,
+                                min_step_height: mh,
+                            });
+                            let cand_deltas = expand_curve_steps(&cand_steps);
+                            if cand_deltas == deltas {
+                                return Some(DetectedCurveFormula {
+                                    form,
+                                    reverse_j: rev_j,
+                                    step_drive: drive,
+                                    step_x_mag: sx_mag.clamp(1, 99),
+                                    step_y_mag: sy_mag.clamp(1, 99),
+                                    even_courses: ev,
+                                    single_system: ss,
+                                    min_step_height: mh,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2: pre-monotonicity legacy curves (exact same step widths and same step count / multiset,
+    // cumulative error <= 2) OR explicit Stoll formula tag (Funktion = 1, 2, 3, 4)
+    if uniform_dx || uniform_dy {
+        let mut sorted_actual = deltas.clone();
+        sorted_actual.sort_unstable();
+        for &(form, rev_j) in &formulas {
+            let drive = if uniform_dy && !uniform_dx {
+                CurveStepDrive::ByHeight
+            } else {
+                CurveStepDrive::ByWidth
+            };
+            let sx_mag = sx_cands[0];
+            let sy_mag = sy_cands[0];
+            for &(ev, ss) in &parity_cands {
+                let pm = make_parity(ev, ss);
+                for &mh in &min_h_cands {
+                    let cand_steps = generate_curve_steps(&CurveGenParams {
+                        curve_form: form,
+                        total_dx,
+                        total_dy,
+                        step_x: if total_dx < 0 { -sx_mag } else { sx_mag },
+                        step_y: if total_dy < 0 { -sy_mag } else { sy_mag },
+                        narrowing_width: 0,
+                        widening_width: 0,
+                        fade_out_width: 0,
+                        parity_mode: pm,
+                        step_drive: drive,
+                        reverse_j: rev_j,
+                        min_step_height: mh,
+                    });
+                    let cand_deltas = expand_curve_steps(&cand_steps);
+                    if cand_deltas.len() == deltas.len()
+                        && cand_deltas.iter().zip(deltas.iter()).all(|(a, b)| a.0 == b.0)
+                    {
+                        let mut sorted_cand = cand_deltas.clone();
+                        sorted_cand.sort_unstable();
+                        if sorted_cand == sorted_actual {
+                            return Some(DetectedCurveFormula {
+                                form,
+                                reverse_j: rev_j,
+                                step_drive: drive,
+                                step_x_mag: sx_mag.clamp(1, 99),
+                                step_y_mag: sy_mag.clamp(1, 99),
+                                even_courses: ev,
+                                single_system: ss,
+                                min_step_height: mh,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if matches!(
+        stored_form,
+        CurveForm::Line | CurveForm::JCurve | CurveForm::SCurve | CurveForm::Step
+    ) {
+        let drive = if uniform_dy && !uniform_dx {
+            CurveStepDrive::ByHeight
+        } else {
+            CurveStepDrive::ByWidth
+        };
+        let ss = single_system_hint || left_odd_pattern;
+        let ev = !ss && all_even_y;
+        return Some(DetectedCurveFormula {
+            form: stored_form,
+            reverse_j: false,
+            step_drive: drive,
+            step_x_mag: sx_cands.first().copied().unwrap_or(1).clamp(1, 99),
+            step_y_mag: sy_cands.first().copied().unwrap_or(1).clamp(1, 99),
+            even_courses: ev,
+            single_system: ss,
+            min_step_height: 0,
+        });
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::LineSide;
+
+    #[test]
+    fn test_stoll_curve_formulas_closure_parity_and_first_step_guard() {
+        // Pure Stoll JCurve cumulative rounding for dX=22, dY=40, En basamak=2, Çift May=true
+        let steps_j = generate_curve_steps(&CurveGenParams {
+            curve_form: CurveForm::JCurve,
+            total_dx: 22,
+            total_dy: 40,
+            step_x: 2,
+            parity_mode: CourseParityMode::EvenCourses,
+            reverse_j: false,
+            ..Default::default()
+        });
+        let deltas_j = expand_curve_steps(&steps_j);
+        assert_eq!(
+            deltas_j,
+            vec![(2, 2), (2, 2), (2, 2), (2, 2), (2, 4), (2, 4), (2, 4), (2, 4), (2, 6), (2, 4), (2, 6)]
+        );
+        assert_eq!(curve_steps_sum_slice(&steps_j), (22, 40));
+
+        // Shallow JCurve (dX=20, dY=10, En=1): first_step_guard keeps step 0 non-zero (must NOT be sorted to 0)
+        let shallow_j = generate_curve_steps(&CurveGenParams {
+            curve_form: CurveForm::JCurve,
+            total_dx: 20,
+            total_dy: 10,
+            step_x: 1,
+            parity_mode: CourseParityMode::Any,
+            reverse_j: false,
+            ..Default::default()
+        });
+        let shallow_deltas = expand_curve_steps(&shallow_j);
+        assert!(shallow_deltas[0].1 > 0, "first_step_guard must keep step 0 > 0: {shallow_deltas:?}");
+        assert_eq!(curve_steps_sum_slice(&shallow_j), (20, 10));
+
+        // Sweep combinations for J, ReverseJ, SCurve with EvenCourses, SingleSystemLeftOdd, MinMay
+        for &form in &[CurveForm::Line, CurveForm::JCurve, CurveForm::SCurve] {
+            for &(dx, dy) in &[(22, 40), (-22, 40), (15, 34), (10, 26), (18, 52), (30, 60)] {
+                for &sx in &[1, 2, 3] {
+                    for &rev in &[false, true] {
+                        if rev && form != CurveForm::JCurve {
+                            continue;
+                        }
+                        for &pm in &[CourseParityMode::Any, CourseParityMode::EvenCourses, CourseParityMode::SingleSystemLeftOdd] {
+                            for &min_h in &[0, 1, 2] {
+                                let params = CurveGenParams {
+                                    curve_form: form,
+                                    total_dx: dx,
+                                    total_dy: dy,
+                                    step_x: if dx < 0 { -sx } else { sx },
+                                    parity_mode: pm,
+                                    reverse_j: rev,
+                                    min_step_height: min_h,
+                                    ..Default::default()
+                                };
+                                let steps = generate_curve_steps(&params);
+                                assert_eq!(curve_steps_sum_slice(&steps), (dx, dy), "closure mismatch for {params:?}");
+                                let deltas = expand_curve_steps(&steps);
+                                if pm == CourseParityMode::EvenCourses {
+                                    assert!(deltas.iter().all(|&(_, h)| h % 2 == 0));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_detect_curve_formula_roundtrip() {
+        for &(form, rev, drive, sx, sy, ev, ss, mh) in &[
+            (CurveForm::Line, false, CurveStepDrive::ByWidth, 2, 1, true, false, 0),
+            (CurveForm::JCurve, false, CurveStepDrive::ByWidth, 2, 1, true, false, 0),
+            (CurveForm::JCurve, true, CurveStepDrive::ByWidth, 2, 1, false, false, 0),
+            (CurveForm::SCurve, false, CurveStepDrive::ByWidth, 1, 1, false, true, 0),
+            (CurveForm::JCurve, false, CurveStepDrive::ByHeight, 1, 2, true, false, 0),
+            (CurveForm::Line, false, CurveStepDrive::ByWidth, 2, 1, false, false, 2),
+        ] {
+            let side = LineSide::Left;
+            let pm = if ss {
+                CourseParityMode::SingleSystemLeftOdd
+            } else if ev {
+                CourseParityMode::EvenCourses
+            } else {
+                CourseParityMode::Any
+            };
+            let steps = generate_curve_steps(&CurveGenParams {
+                curve_form: form,
+                total_dx: 22,
+                total_dy: 40,
+                step_x: sx,
+                step_y: sy,
+                parity_mode: pm,
+                step_drive: drive,
+                reverse_j: rev,
+                min_step_height: mh,
+                ..Default::default()
+            });
+            let data = CurveData {
+                function: CurveForm::UserCurve.to_id(),
+                steps,
+                raw: Default::default(),
+            };
+            let det = detect_curve_formula_from_steps(&data, side, ss)
+                .unwrap_or_else(|| panic!("failed to detect ({form:?}, rev={rev}, drive={drive:?}, sx={sx}, sy={sy}, ev={ev}, ss={ss}, mh={mh})"));
+            assert_eq!(det.form, form);
+            assert_eq!(det.reverse_j, rev);
+            assert_eq!(det.step_drive, drive);
+            if drive == CurveStepDrive::ByWidth {
+                assert_eq!(det.step_x_mag, sx);
+            } else {
+                assert_eq!(det.step_y_mag, sy);
+            }
+            assert_eq!(det.even_courses, ev);
+            assert_eq!(det.single_system, ss);
+        }
+
+        // Legacy v1.0.2 pre-monotonicity steps [2,2,2,2,4,4,4,4,6,4,6] still detect as JCurve (En=2, Çift May)
+        let legacy = CurveData {
+            function: 5,
+            steps: compress_pairs_to_steps(
+                &[(2,2),(2,2),(2,2),(2,2),(2,4),(2,4),(2,4),(2,4),(2,6),(2,4),(2,6)],
+                6,
+                0,
+                0,
+            ),
+            raw: Default::default(),
+        };
+        let det_legacy = detect_curve_formula_from_steps(&legacy, LineSide::Left, false).unwrap();
+        assert_eq!(det_legacy.form, CurveForm::JCurve);
+        assert!(!det_legacy.reverse_j);
+        assert_eq!(det_legacy.step_x_mag, 2);
+        assert!(det_legacy.even_courses);
+
+        // Arbitrary manual curve stays None (UserCurve)
+        let manual = CurveData {
+            function: 5,
+            steps: compress_pairs_to_steps(&[(1, 10), (7, 2), (2, 12), (4, 1)], 6, 0, 0),
+            raw: Default::default(),
+        };
+        assert!(detect_curve_formula_from_steps(&manual, LineSide::Left, false).is_none());
+    }
 }

@@ -1,10 +1,13 @@
 ﻿use egui::{vec2, Align, Color32, CornerRadius, Layout, Margin, Rect, Sense, Stroke, StrokeKind, Ui};
 
 use stoll_kalip_editoru::math::{
-    element_distance_from_top, mm_to_stitches, round2, set_element_distance_from_bottom,
-    set_element_distance_from_top, stitches_to_mm, DocumentGeometry,
+    element_distance_from_top, mm_to_stitches, recalc_all_auto_line_functions, round2,
+    set_element_distance_from_bottom, set_element_distance_from_top, stitches_to_mm,
+    sync_mirrored_right_lines, DocumentGeometry,
 };
-use stoll_kalip_editoru::model::{FormDocument, InputFormat, LineSide, UndoStack, YReferenceLine};
+use stoll_kalip_editoru::model::{
+    ElementType, FormDocument, InputFormat, LineSide, UndoStack, YReferenceLine,
+};
 
 use crate::ui::menu_toolbar::paint_shape_thumbnail;
 use crate::ui::theme::{
@@ -406,12 +409,19 @@ pub fn show_elements_strip(
                             } else {
                                 format!("{:.0}", el.start_width)
                             };
+                            let sw_enabled = !matches!(
+                                el.element_type(),
+                                ElementType::Neckline
+                                    | ElementType::Armhole
+                                    | ElementType::Opening
+                                    | ElementType::Hole
+                            );
                             if let Some(txt) = win32_numeric_text_edit(
                                 ui,
                                 ("studio_start_width", elem_idx),
                                 sw_disp,
                                 sw_w,
-                                !is_secondary || el.start_width > 0.0,
+                                sw_enabled,
                             ) {
                                 if let Ok(v) = txt.trim().replace(',', ".").parse::<f64>() {
                                     if v.is_finite() {
@@ -673,9 +683,32 @@ pub fn show_elements_strip(
 
                 if let Some(art_id) = pending_art_tag {
                     undo.push("Eleman türü", doc);
+                    let default_basic_sw = doc
+                        .basic_element()
+                        .map(|e| e.start_width)
+                        .filter(|&w| w > 0.0)
+                        .unwrap_or(500.0);
+                    let mut sync_mirror = false;
                     if let Some(el) = doc.elements.get_mut(elem_idx) {
                         el.art_tag_id = art_id;
+                        let new_t = el.element_type();
+                        if new_t == ElementType::Gore && el.start_width <= 0.0 {
+                            el.start_width = default_basic_sw;
+                        } else if matches!(
+                            new_t,
+                            ElementType::Neckline
+                                | ElementType::Armhole
+                                | ElementType::Opening
+                                | ElementType::Hole
+                        ) {
+                            el.start_width = 0.0;
+                        }
+                        recalc_all_auto_line_functions(el);
+                        sync_mirror = el.mirrored;
                         doc.dirty = true;
+                    }
+                    if sync_mirror {
+                        sync_mirrored_right_lines(doc, elem_idx);
                     }
                 }
                 if let Some(new_name) = pending_name {

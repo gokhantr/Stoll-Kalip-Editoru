@@ -580,7 +580,7 @@ impl GraphicsWindowState {
                     LineSide::Right => TableMode::RightLines,
                 };
                 state.select_single_row(li);
-                state.focused_cell = Some((li, 11));
+                state.focused_cell = Some((li, if state.show_detail_columns { 11 } else { 6 }));
                 let target_line = doc.elements.get(ei).and_then(|e| e.lines(effective_side).get(li));
                 if target_line.and_then(|l| l.curve.as_ref()).is_some() {
                     state.curve_editor_req = Some(CurveEditorRequest {
@@ -1045,10 +1045,20 @@ fn paint_element_markers(
     }
 
     // Line-attached markers (Başlama / Bitiş `[Punkt]` with assigned modules or non-zero offsets)
-    for (lines, segs) in [
-        (&el_doc.left_lines, &eg.left_segments),
-        (&el_doc.right_lines, &eg.right_segments),
-    ] {
+    let mirror_left_markers = el_doc.mirrored && el_doc.right_lines.is_empty();
+    let side_pairs: [(&[stoll_kalip_editoru::model::LineSegment], &[stoll_kalip_editoru::math::SegmentSpan], f64); 2] =
+        if mirror_left_markers {
+            [
+                (&el_doc.left_lines, &eg.left_segments, 1.0),
+                (&el_doc.left_lines, &eg.right_segments, -1.0),
+            ]
+        } else {
+            [
+                (&el_doc.left_lines, &eg.left_segments, 1.0),
+                (&el_doc.right_lines, &eg.right_segments, 1.0),
+            ]
+        };
+    for (lines, segs, off_x_sign) in side_pairs {
         for (line, seg) in lines.iter().zip(segs.iter()) {
             for pt in &line.points {
                 let has_mod = pt
@@ -1072,11 +1082,12 @@ fn paint_element_markers(
                 };
                 let (ox, oy) = pt.offsets.first().map(|o| (o.x, o.y)).unwrap_or((0, 0));
                 let wx = anchor.0
-                    + if use_mm {
-                        stitches_to_mm(ox, &doc.header)
-                    } else {
-                        ox as f64
-                    };
+                    + off_x_sign
+                        * if use_mm {
+                            stitches_to_mm(ox, &doc.header)
+                        } else {
+                            ox as f64
+                        };
                 let wy = anchor.1
                     + if use_mm {
                         rows_to_mm(oy, &doc.header)

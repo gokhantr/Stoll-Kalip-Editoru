@@ -167,6 +167,38 @@ pub fn open_url_in_browser(url: &str) {
 #[cfg(not(windows))]
 pub fn open_url_in_browser(_url: &str) {}
 
+/// Open a local file (e.g. printable HTML report) with its default handler without spawning `cmd.exe`.
+#[cfg(windows)]
+pub fn open_local_file(path: &std::path::Path) {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    let op = to_wide_null("open");
+    let target = to_wide_null(&path.to_string_lossy());
+    unsafe {
+        let _ = ShellExecuteW(
+            core::ptr::null_mut(),
+            op.as_ptr(),
+            target.as_ptr(),
+            core::ptr::null(),
+            core::ptr::null(),
+            1, // SW_SHOWNORMAL
+        );
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_local_file(_path: &std::path::Path) {}
+
 /// Compare semantic version tags (e.g. `"v1.0.1"` > `"v1.0.0"`).
 pub fn is_newer_version(latest_tag: &str, current_version: &str) -> bool {
     let parse = |s: &str| -> Option<Vec<u64>> {
@@ -308,8 +340,12 @@ pub fn parse_github_release_json(json: &str) -> Result<ReleaseInfo, String> {
     let exe_url = asset_urls
         .iter()
         .find(|u| is_safe_http_url(u) && u.to_ascii_lowercase().ends_with(".exe"))
+        .or_else(|| {
+            asset_urls
+                .iter()
+                .find(|u| is_safe_http_url(u) && u.to_ascii_lowercase().ends_with(".zip"))
+        })
         .cloned()
-        .or_else(|| asset_urls.into_iter().find(|u| is_safe_http_url(u)))
         .unwrap_or_else(|| html.clone());
 
     Ok(ReleaseInfo {

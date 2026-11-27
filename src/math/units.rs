@@ -1,5 +1,6 @@
 use crate::model::{
     CurveForm, ElementType, FormDocument, FormHeader, InputFormat, LineFunction, LineSegment,
+    LineSide,
 };
 
 /// Stoll round-half-away-from-zero (`formaccess.dll`).
@@ -129,11 +130,16 @@ pub fn auto_detect_line_function_for_element(
     if line.user_set_function {
         return;
     }
+    let has_base = crate::math::operations::element_has_base_line(elem_type);
+    if !crate::math::operations::element_auto_detects_shaping(elem_type) {
+        line.function = LineFunction::None;
+        return;
+    }
     let is_cutout = matches!(
         elem_type,
         ElementType::Neckline | ElementType::Armhole | ElementType::Hole | ElementType::Opening
     );
-    if !is_cutout && is_first_row {
+    if has_base && is_first_row {
         if line.rows == 0 {
             line.function = LineFunction::BaseLine;
             return;
@@ -196,6 +202,26 @@ pub fn auto_detect_line_function_in_context(
 /// Recalculate `width_mm`, `height_mm`, and steps (or regenerate `[Kurve]` steps)
 /// after editing `line.stitches` or `line.rows` (`Boy İlmekler` / `En İlmekler`).
 pub fn recalc_line_from_stitches_and_rows(line: &mut LineSegment, header: &FormHeader) {
+    let inferred_side = if line.stitches < 0
+        && matches!(
+            line.function,
+            LineFunction::Narrowing | LineFunction::NarrowingMulti
+        ) {
+        LineSide::Right
+    } else {
+        LineSide::Left
+    };
+    recalc_line_from_stitches_and_rows_for_side(line, header, inferred_side);
+}
+
+/// Side-aware variant of `recalc_line_from_stitches_and_rows` so `SingleSystem` (`Tek Sistem`)
+/// parity and detected custom curve parameters (`En basamak`, `Boy basamak`, `Çift May`, `Min May`)
+/// are preserved intact when line dimensions change.
+pub fn recalc_line_from_stitches_and_rows_for_side(
+    line: &mut LineSegment,
+    header: &FormHeader,
+    side: LineSide,
+) {
     line.width_mm = round2(stitches_to_mm(line.stitches, header));
     line.height_mm = round2(rows_to_mm(line.rows, header));
 
@@ -210,35 +236,69 @@ pub fn recalc_line_from_stitches_and_rows(line: &mut LineSegment, header: &FormH
                 line.rest_y = 0;
                 return;
             }
-            let form = CurveForm::from_id(curve.function);
             let (nw, ww, fw) = crate::math::curves::extract_curve_module_widths(line);
-            // For `CurveForm::Step` (`LineOben`), `steps[0].step_width` is 0; find first non-zero `step_width`.
-            let step_x_mag = curve
-                .steps
-                .iter()
-                .find(|s| s.step_width != 0)
-                .map(|s| s.step_width.abs())
-                .unwrap_or(1);
-            let new_steps = if form == CurveForm::UserCurve {
-                crate::math::curves::resample_user_curve(curve, line.stitches, line.rows)
-            } else {
-                crate::math::curves::generate_curve_steps(&crate::math::curves::CurveGenParams {
-                    curve_form: form,
-                    total_dx: line.stitches,
-                    total_dy: line.rows,
-                    step_x: if line.stitches < 0 {
-                        -step_x_mag
-                    } else {
-                        step_x_mag
+            let detected = crate::math::curves::detect_curve_formula_from_steps(
+                curve,
+                side,
+                line.single_system_curve,
+            );
+            let (new_steps, save_form_id) = if let Some(det) = detected {
+                let parity_mode = if det.single_system || line.single_system_curve {
+                    match side {
+                        LineSide::Left => crate::math::curves::CourseParityMode::SingleSystemLeftOdd,
+                        LineSide::Right => {
+                            crate::math::curves::CourseParityMode::SingleSystemRightEven
+                        }
+                    }
+                } else if det.even_courses {
+                    crate::math::curves::CourseParityMode::EvenCourses
+                } else {
+                    crate::math::curves::CourseParityMode::Any
+                };
+                let generated = crate::math::curves::generate_curve_steps(
+                    &crate::math::curves::CurveGenParams {
+                        curve_form: det.form,
+                        total_dx: line.stitches,
+                        total_dy: line.rows,
+                        step_x: if line.stitches < 0 {
+                            -det.step_x_mag
+                        } else {
+                            det.step_x_mag
+                        },
+                        step_y: if line.rows < 0 {
+                            -det.step_y_mag
+                        } else {
+                            det.step_y_mag
+                        },
+                        narrowing_width: nw,
+                        widening_width: ww,
+                        fade_out_width: fw,
+                        parity_mode,
+                        step_drive: det.step_drive,
+                        reverse_j: det.reverse_j,
+                        min_step_height: det.min_step_height,
                     },
-                    step_y: 0,
-                    narrowing_width: nw,
-                    widening_width: ww,
-                    fade_out_width: fw,
-                    ..Default::default()
-                })
+                );
+                let is_custom = det.reverse_j
+                    || det.even_courses
+                    || det.single_system
+                    || det.min_step_height > 0
+                    || det.step_drive == crate::math::curves::CurveStepDrive::ByHeight
+                    || det.step_x_mag != 1;
+                let fid = if is_custom {
+                    CurveForm::UserCurve.to_id()
+                } else {
+                    det.form.to_id()
+                };
+                (generated, fid)
+            } else {
+                (
+                    crate::math::curves::resample_user_curve(curve, line.stitches, line.rows),
+                    curve.function,
+                )
             };
             if let Some(ref mut c) = line.curve {
+                c.function = save_form_id;
                 c.steps = new_steps;
                 for (i, s) in c.steps.iter_mut().enumerate() {
                     s.index = (i + 1) as i32;
@@ -283,6 +343,19 @@ pub fn recalc_line_from_mm(line: &mut LineSegment, header: &FormHeader) {
     line.stitches = mm_to_stitches(saved_w, header);
     line.rows = mm_to_rows(saved_h, header);
     recalc_line_from_stitches_and_rows(line, header);
+    if header.input_format == InputFormat::Mm {
+        line.width_mm = round2(saved_w);
+        line.height_mm = round2(saved_h);
+    }
+}
+
+/// Side-aware variant of `recalc_line_from_mm`.
+pub fn recalc_line_from_mm_for_side(line: &mut LineSegment, header: &FormHeader, side: LineSide) {
+    let saved_w = line.width_mm;
+    let saved_h = line.height_mm;
+    line.stitches = mm_to_stitches(saved_w, header);
+    line.rows = mm_to_rows(saved_h, header);
+    recalc_line_from_stitches_and_rows_for_side(line, header, side);
     if header.input_format == InputFormat::Mm {
         line.width_mm = round2(saved_w);
         line.height_mm = round2(saved_h);
@@ -357,8 +430,11 @@ pub fn recalc_document_for_density_change(doc: &mut FormDocument) {
                 el.offset_x_stitches = mm_to_stitches(el.offset_x_mm, &hdr) as f64;
                 el.offset_x_stitches_base = mm_to_stitches(el.offset_x_mm_base, &hdr) as f64;
                 el.offset_y_rows = mm_to_rows(el.offset_y_mm, &hdr) as f64;
-                for line in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-                    recalc_line_from_mm(line, &hdr);
+                for line in &mut el.left_lines {
+                    recalc_line_from_mm_for_side(line, &hdr, LineSide::Left);
+                }
+                for line in &mut el.right_lines {
+                    recalc_line_from_mm_for_side(line, &hdr, LineSide::Right);
                 }
             }
             InputFormat::Steps | InputFormat::Stufung | InputFormat::Stitches => {
@@ -401,30 +477,35 @@ pub fn convert_input_format(doc: &mut FormDocument, target: InputFormat) {
             }
             _ => {}
         }
-        for line in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-            match (old, target) {
-                (InputFormat::Mm, InputFormat::Stitches | InputFormat::Steps | InputFormat::Stufung) => {
-                    recalc_line_from_mm(line, &hdr);
-                }
-                (InputFormat::Steps | InputFormat::Stufung | InputFormat::Stitches, InputFormat::Mm) => {
-                    line.width_mm = round2(stitches_to_mm(line.stitches, &hdr));
-                    line.height_mm = round2(rows_to_mm(line.rows, &hdr));
-                }
-                (InputFormat::Steps | InputFormat::Stufung, InputFormat::Stitches) => {
-                    if !line.is_curve()
-                        && line.step_factor >= 1
-                        && (line.step_x != 0 || line.step_y != 0 || line.rest_x != 0 || line.rest_y != 0)
-                    {
-                        line.stitches = line.step_x * line.step_factor + line.rest_x;
-                        line.rows = line.step_y * line.step_factor + line.rest_y;
+        for (side, lines) in [
+            (LineSide::Left, &mut el.left_lines),
+            (LineSide::Right, &mut el.right_lines),
+        ] {
+            for line in lines.iter_mut() {
+                match (old, target) {
+                    (InputFormat::Mm, InputFormat::Stitches | InputFormat::Steps | InputFormat::Stufung) => {
+                        recalc_line_from_mm_for_side(line, &hdr, side);
                     }
-                    line.width_mm = round2(stitches_to_mm(line.stitches, &hdr));
-                    line.height_mm = round2(rows_to_mm(line.rows, &hdr));
+                    (InputFormat::Steps | InputFormat::Stufung | InputFormat::Stitches, InputFormat::Mm) => {
+                        line.width_mm = round2(stitches_to_mm(line.stitches, &hdr));
+                        line.height_mm = round2(rows_to_mm(line.rows, &hdr));
+                    }
+                    (InputFormat::Steps | InputFormat::Stufung, InputFormat::Stitches) => {
+                        if !line.is_curve()
+                            && line.step_factor >= 1
+                            && (line.step_x != 0 || line.step_y != 0 || line.rest_x != 0 || line.rest_y != 0)
+                        {
+                            line.stitches = line.step_x * line.step_factor + line.rest_x;
+                            line.rows = line.step_y * line.step_factor + line.rest_y;
+                        }
+                        line.width_mm = round2(stitches_to_mm(line.stitches, &hdr));
+                        line.height_mm = round2(rows_to_mm(line.rows, &hdr));
+                    }
+                    (InputFormat::Stitches, InputFormat::Steps | InputFormat::Stufung) => {
+                        recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
+                    }
+                    _ => {}
                 }
-                (InputFormat::Stitches, InputFormat::Steps | InputFormat::Stufung) => {
-                    recalc_line_from_stitches_and_rows(line, &hdr);
-                }
-                _ => {}
             }
         }
     }
@@ -435,4 +516,49 @@ pub fn convert_input_format(doc: &mut FormDocument, target: InputFormat) {
 #[inline]
 pub fn round2(v: f64) -> f64 {
     (v * 100.0).round() / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::curves::{
+        apply_curve_to_line, curve_steps_sum_slice, detect_curve_formula_from_steps,
+        generate_curve_steps, CourseParityMode, CurveGenParams,
+    };
+
+    #[test]
+    fn test_recalc_line_preserves_curve_formula_params() {
+        let hdr = FormHeader::default();
+        let mut line = LineSegment {
+            index: 2,
+            tag_id: 2,
+            stitches: 22,
+            rows: 40,
+            function: LineFunction::Narrowing,
+            ..Default::default()
+        };
+        let steps = generate_curve_steps(&CurveGenParams {
+            curve_form: CurveForm::JCurve,
+            total_dx: 22,
+            total_dy: 40,
+            step_x: 2,
+            narrowing_width: 6,
+            parity_mode: CourseParityMode::EvenCourses,
+            ..Default::default()
+        });
+        apply_curve_to_line(&mut line, &hdr, CurveForm::UserCurve, steps);
+
+        line.stitches = 26;
+        line.rows = 48;
+        recalc_line_from_stitches_and_rows_for_side(&mut line, &hdr, LineSide::Left);
+
+        let curve = line.curve.as_ref().expect("curve retained");
+        assert_eq!(curve.function, CurveForm::UserCurve.to_id());
+        assert_eq!(curve_steps_sum_slice(&curve.steps), (26, 48));
+        assert!(curve.steps.iter().all(|s| s.step_width == 2 && s.step_height % 2 == 0));
+        let det = detect_curve_formula_from_steps(curve, LineSide::Left, false).unwrap();
+        assert_eq!(det.form, CurveForm::JCurve);
+        assert_eq!(det.step_x_mag, 2);
+        assert!(det.even_courses);
+    }
 }

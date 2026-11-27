@@ -2,8 +2,9 @@
     vec2, Color32, CornerRadius, Frame, Margin, Rect, Sense, Stroke, Ui,
 };
 
-use stoll_kalip_editoru::model::{FormDocument, InputFormat, LineSide};
+use stoll_kalip_editoru::model::{FormDocument, InputFormat, LineSide, UndoStack};
 
+use crate::ui::grid_table::flush_active_grid_edit;
 use crate::ui::icons::{paint_icon, paint_studio_glyph, IconKind, StudioGlyph};
 use crate::ui::theme::{bold_font, colors, regular_font, win32_numeric_text_edit};
 use crate::ui::{AppAction, SignMode, TableMode, UiState};
@@ -13,11 +14,12 @@ use crate::ui::{AppAction, SignMode, TableMode, UiState};
 pub fn show_menu_bar(
     ui: &mut Ui,
     doc: &mut FormDocument,
-    can_undo: bool,
-    can_redo: bool,
+    undo: &mut UndoStack,
     state: &mut UiState,
     actions: &mut Vec<AppAction>,
 ) {
+    let can_undo = undo.can_undo();
+    let can_redo = undo.can_redo();
     let elem = doc.elements.get(state.selected_elem);
     let mirrored = elem.map(|e| e.mirrored).unwrap_or(true);
 
@@ -298,13 +300,12 @@ pub fn show_menu_bar(
                     {
                         ui.close_menu();
                     }
-                    ui.menu_button("Sembol çubukları", |ui| {
-                        ui.checkbox(&mut state.toolbars.standard, "Standart");
-                        ui.checkbox(&mut state.toolbars.input, "Giriş");
-                        ui.checkbox(&mut state.toolbars.elements, "Elemanlar");
-                        ui.checkbox(&mut state.toolbars.lines, "Çizgiler");
-                        ui.checkbox(&mut state.toolbars.markers, "İşaretler");
-                    });
+                    if ui
+                        .checkbox(&mut state.toolbars.standard, "Araç çubuğu")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                    }
                 });
 
                 // ── Çizgiler-Giriş ──────────────────────────────────────────────
@@ -331,37 +332,34 @@ pub fn show_menu_bar(
                         ui.close_menu();
                     }
                     ui.separator();
+                    let mut tip_a = doc.header.hand_knitting_method;
                     if ui
-                        .checkbox(
-                            &mut doc.header.hand_knitting_method,
-                            "Kalıb örnekleri için tip A",
-                        )
+                        .checkbox(&mut tip_a, "Kalıb örnekleri için tip A")
                         .changed()
                     {
+                        undo.push("Kalıb örnekleri için tip A", doc);
+                        doc.header.hand_knitting_method = tip_a;
                         doc.dirty = true;
                         ui.close_menu();
                     }
                     ui.separator();
                     ui.menu_button("Başlama", |ui| {
+                        let mut fst = doc.header.form_start_type;
                         if ui
-                            .radio_value(
-                                &mut doc.header.form_start_type,
-                                1,
-                                "Önce arttır sonra ör",
-                            )
+                            .radio_value(&mut fst, 1, "Önce arttır sonra ör")
                             .changed()
                         {
+                            undo.push("Başlama tipi", doc);
+                            doc.header.form_start_type = fst;
                             doc.dirty = true;
                             ui.close_menu();
                         }
                         if ui
-                            .radio_value(
-                                &mut doc.header.form_start_type,
-                                2,
-                                "Önce ör sonra arttır",
-                            )
+                            .radio_value(&mut fst, 2, "Önce ör sonra arttır")
                             .changed()
                         {
+                            undo.push("Başlama tipi", doc);
+                            doc.header.form_start_type = fst;
                             doc.dirty = true;
                             ui.close_menu();
                         }
@@ -369,6 +367,35 @@ pub fn show_menu_bar(
                 });
 
                 // ── Tablolar ────────────────────────────────────────────────────
+                let switch_table_mode = |doc: &mut FormDocument,
+                                         undo: &mut UndoStack,
+                                         state: &mut UiState,
+                                         mode: TableMode,
+                                         side: LineSide| {
+                    flush_active_grid_edit(doc, undo, state);
+                    state.table_mode = mode;
+                    state.active_table_side = side;
+                    let len = doc
+                        .elements
+                        .get(state.selected_elem)
+                        .map(|el| {
+                            if mode.is_markers() {
+                                match side {
+                                    LineSide::Left => el.left_points.len(),
+                                    LineSide::Right => el.right_points.len(),
+                                }
+                            } else {
+                                el.lines(side).len()
+                            }
+                        })
+                        .unwrap_or(0);
+                    if len > 0 {
+                        state.select_single_row(0);
+                    } else {
+                        state.selected_rows.clear();
+                        state.focused_cell = None;
+                    }
+                };
                 ui.menu_button("Tablolar", |ui| {
                     ui.set_min_width(200.0);
                     if menu_radio_item(
@@ -378,9 +405,7 @@ pub fn show_menu_bar(
                         state.table_mode == TableMode::LeftLines,
                         true,
                     ) {
-                        state.table_mode = TableMode::LeftLines;
-                        state.active_table_side = LineSide::Left;
-                        state.select_single_row(0);
+                        switch_table_mode(doc, undo, state, TableMode::LeftLines, LineSide::Left);
                         ui.close_menu();
                     }
                     if menu_radio_item(
@@ -390,9 +415,7 @@ pub fn show_menu_bar(
                         state.table_mode == TableMode::RightLines,
                         !mirrored,
                     ) {
-                        state.table_mode = TableMode::RightLines;
-                        state.active_table_side = LineSide::Right;
-                        state.select_single_row(0);
+                        switch_table_mode(doc, undo, state, TableMode::RightLines, LineSide::Right);
                         ui.close_menu();
                     }
                     if menu_radio_item(
@@ -402,9 +425,7 @@ pub fn show_menu_bar(
                         state.table_mode == TableMode::LeftMarkers,
                         true,
                     ) {
-                        state.table_mode = TableMode::LeftMarkers;
-                        state.active_table_side = LineSide::Left;
-                        state.select_single_row(0);
+                        switch_table_mode(doc, undo, state, TableMode::LeftMarkers, LineSide::Left);
                         ui.close_menu();
                     }
                     if menu_radio_item(
@@ -414,9 +435,13 @@ pub fn show_menu_bar(
                         state.table_mode == TableMode::RightMarkers,
                         !mirrored,
                     ) {
-                        state.table_mode = TableMode::RightMarkers;
-                        state.active_table_side = LineSide::Right;
-                        state.select_single_row(0);
+                        switch_table_mode(
+                            doc,
+                            undo,
+                            state,
+                            TableMode::RightMarkers,
+                            LineSide::Right,
+                        );
                         ui.close_menu();
                     }
                     ui.separator();
@@ -456,12 +481,16 @@ pub fn show_menu_bar(
 pub fn show_toolbar(
     ui: &mut Ui,
     doc: &mut FormDocument,
-    can_undo: bool,
-    can_redo: bool,
+    undo: &mut UndoStack,
     state: &mut UiState,
     available_update_tag: Option<&str>,
     actions: &mut Vec<AppAction>,
 ) {
+    if !state.toolbars.standard {
+        return;
+    }
+    let can_undo = undo.can_undo();
+    let can_redo = undo.can_redo();
     let elem = doc.elements.get(state.selected_elem);
     let mirrored = elem.map(|e| e.mirrored).unwrap_or(true);
     let in_markers = state.table_mode.is_markers();
@@ -620,6 +649,7 @@ pub fn show_toolbar(
                     in_markers,
                     true,
                 ) {
+                    flush_active_grid_edit(doc, undo, state);
                     if in_markers {
                         state.table_mode = match state.active_table_side {
                             LineSide::Left => TableMode::LeftLines,
@@ -633,8 +663,27 @@ pub fn show_toolbar(
                             LineSide::Right => TableMode::LeftMarkers,
                         };
                     }
-                    state.editing_cell = None;
-                    state.select_single_row(0);
+                    let target_side = state.table_mode.side();
+                    let len = doc
+                        .elements
+                        .get(state.selected_elem)
+                        .map(|el| {
+                            if state.table_mode.is_markers() {
+                                match target_side {
+                                    LineSide::Left => el.left_points.len(),
+                                    LineSide::Right => el.right_points.len(),
+                                }
+                            } else {
+                                el.lines(target_side).len()
+                            }
+                        })
+                        .unwrap_or(0);
+                    if len > 0 {
+                        state.select_single_row(0);
+                    } else {
+                        state.selected_rows.clear();
+                        state.focused_cell = None;
+                    }
                 }
 
                 if studio_icon_chip(

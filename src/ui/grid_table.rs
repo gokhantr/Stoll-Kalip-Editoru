@@ -1,14 +1,15 @@
 ﻿use egui::{pos2, vec2, Align2, Color32, CornerRadius, Frame, Key, Margin, Rect, Sense, Stroke, Ui};
 
 use stoll_kalip_editoru::math::{
-    auto_detect_line_function_in_context, auto_sync_closing_lines, closing_line_index, mm_to_rows,
-    mm_to_stitches, recalc_line_from_mm, recalc_line_from_step_edit_for_element,
-    recalc_line_from_stitches_and_rows, rows_to_mm, snapshot_endline_distances, stitches_to_mm,
-    sync_all_endline_elements, sync_mirrored_right_lines,
+    auto_detect_line_function_in_context, auto_sync_closing_lines, closing_line_index,
+    detect_curve_formula_from_steps, mm_to_rows, mm_to_stitches, recalc_line_from_mm_for_side,
+    recalc_line_from_step_edit_for_element, recalc_line_from_stitches_and_rows_for_side,
+    rows_to_mm, snapshot_endline_distances, stitches_to_mm, sync_all_endline_elements,
+    sync_mirrored_right_lines,
 };
 use stoll_kalip_editoru::model::{
-    FormDocument, InputFormat, KanteChildSlot, LineSegment, LineSide, PointEntry, PointOffset,
-    UndoStack,
+    CurveForm, FormDocument, InputFormat, KanteChildSlot, LineFunction, LineSegment, LineSide,
+    PointEntry, PointOffset, UndoStack,
 };
 
 use crate::ui::icons::{paint_icon_scaled, paint_studio_glyph, IconKind, StudioGlyph};
@@ -53,7 +54,7 @@ const ALL_LINE_COLS: &[(LineCol, f32)] = &[
     (LineCol::RestX, 56.0),
     (LineCol::WidthNarrow, 44.0),
     (LineCol::WidthFadeOut, 44.0),
-    (LineCol::Function, 84.0),
+    (LineCol::Function, 108.0),
     (LineCol::Group, 42.0),
     (LineCol::Comment, 92.0),
 ];
@@ -347,6 +348,128 @@ pub fn show_grid_area(
         state.editing_side = eside;
         state.editing_cell = Some((er, ec, init));
         state.editing_pristine = true;
+    }
+
+    // Inline `Fonksiyon ▾` quick-select popup
+    let fn_popup_id = ui.id().with("line_fn_quick_popup");
+    if let Some((p_elem, p_side_u8, p_row, p_rect)) =
+        ui.ctx().data(|d| d.get_temp::<(usize, u8, usize, Rect)>(fn_popup_id))
+    {
+        let p_side = if p_side_u8 == 0 {
+            LineSide::Left
+        } else {
+            LineSide::Right
+        };
+        let valid = doc
+            .elements
+            .get(p_elem)
+            .and_then(|e| e.lines(p_side).get(p_row))
+            .is_some();
+        if !valid || ui.input(|i| i.key_pressed(Key::Escape)) {
+            ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, Rect)>(fn_popup_id));
+        } else {
+            let mut chosen_fn: Option<LineFunction> = None;
+            let mut open_props = false;
+            let mut close_popup = false;
+            let area_resp = egui::Area::new(ui.id().with("line_fn_quick_popup_area"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos2(p_rect.left(), p_rect.bottom() + 2.0))
+                .show(ui.ctx(), |ui| {
+                    Frame::NONE
+                        .fill(colors::CARD_BG)
+                        .corner_radius(CornerRadius::same(4))
+                        .stroke(Stroke::new(1.0_f32, colors::BORDER_DARK))
+                        .inner_margin(Margin::same(4))
+                        .show(ui, |ui| {
+                            ui.set_min_width(142.0);
+                            let cur_fn = doc
+                                .elements
+                                .get(p_elem)
+                                .and_then(|e| e.lines(p_side).get(p_row))
+                                .map(|l| l.function)
+                                .unwrap_or(LineFunction::None);
+                            for (func, lbl) in [
+                                (LineFunction::None, "(Yok)"),
+                                (LineFunction::Narrowing, "Reglan"),
+                                (LineFunction::Widening, "Artırma"),
+                                (LineFunction::BindOff, "Remayözleme"),
+                                (LineFunction::FadeOut, "Kenar düzeltimi"),
+                            ] {
+                                if ui.selectable_label(cur_fn == func, lbl).clicked() {
+                                    chosen_fn = Some(func);
+                                    close_popup = true;
+                                }
+                            }
+                            ui.separator();
+                            if ui.button("Çizgi özellikleri...").clicked() {
+                                open_props = true;
+                                close_popup = true;
+                            }
+                        });
+                })
+                .response;
+
+            if ui.input(|i| i.pointer.any_pressed())
+                && !area_resp.hovered()
+                && !ui.rect_contains_pointer(p_rect)
+            {
+                close_popup = true;
+            }
+
+            if let Some(new_fn) = chosen_fn {
+                undo.push("Çizgi fonksiyonu", doc);
+                let mut sync_mirror = false;
+                if let Some(el) = doc.elements.get_mut(p_elem) {
+                    if let Some(line) = el.lines_mut(p_side).get_mut(p_row) {
+                        line.function = new_fn;
+                        line.user_set_function = true;
+                        match new_fn {
+                            LineFunction::Narrowing | LineFunction::NarrowingMulti => {
+                                line.narrowing.get_or_insert_with(Default::default);
+                                line.ensure_child_slot(KanteChildSlot::Narrowing);
+                            }
+                            LineFunction::Widening => {
+                                line.widening.get_or_insert_with(Default::default);
+                                line.ensure_child_slot(KanteChildSlot::Widening);
+                            }
+                            LineFunction::BindOff => {
+                                line.binding_off.get_or_insert_with(Default::default);
+                                line.ensure_child_slot(KanteChildSlot::BindingOff);
+                            }
+                            LineFunction::FadeOut => {
+                                line.fade_out.get_or_insert_with(Default::default);
+                                line.ensure_child_slot(KanteChildSlot::FadeOut);
+                            }
+                            _ => {}
+                        }
+                        doc.dirty = true;
+                    }
+                    sync_mirror = p_side == LineSide::Left && el.mirrored;
+                }
+                if sync_mirror {
+                    sync_mirrored_right_lines(doc, p_elem);
+                }
+                auto_sync_closing_lines(doc);
+            }
+
+            if open_props {
+                let func_id = doc
+                    .elements
+                    .get(p_elem)
+                    .and_then(|e| e.lines(p_side).get(p_row))
+                    .map(|l| l.function.to_id())
+                    .unwrap_or(0);
+                state.select_single_row(p_row);
+                actions.push(AppAction::OpenLineProps {
+                    line_idx: p_row,
+                    initial_tab: line_function_default_tab(func_id),
+                });
+            }
+
+            if close_popup {
+                ui.ctx().data_mut(|d| d.remove::<(usize, u8, usize, Rect)>(fn_popup_id));
+            }
+        }
     }
 }
 
@@ -1174,24 +1297,15 @@ fn show_lines_grid_for_side(
                                     resp.is_pointer_button_down_on(),
                                     btn_enabled,
                                 );
-                                // Paint ONLY the crisp Stoll Curve Editor icon scaled cleanly inside the cell (no double stroke!)
+                                // Paint ONLY the crisp Stoll Curve Editor icon scaled cleanly inside the cell (cached per curve hash!)
                                 if let Some(ref curve) = line_snap.curve {
                                     if !curve.steps.is_empty() {
-                                        let is_reverse_j = curve.function == 5
-                                            && curve.steps.len() >= 2
-                                            && curve.steps.first().unwrap().step_height
-                                                > curve.steps.last().unwrap().step_height
-                                            && curve
-                                                .steps
-                                                .windows(2)
-                                                .all(|w| w[0].step_height >= w[1].step_height);
-                                        let glyph = match curve.function {
-                                            1 => IconKind::CurveLine,
-                                            3 => IconKind::CurveJ,
-                                            4 => IconKind::CurveS,
-                                            5 if is_reverse_j => IconKind::CurveReverseJ,
-                                            _ => IconKind::CurveUser,
-                                        };
+                                        let glyph = cached_curve_icon_kind(
+                                            ui.ctx(),
+                                            curve,
+                                            side,
+                                            line_snap.single_system_curve,
+                                        );
                                         let ic_r = cell_r.shrink(2.0);
                                         paint_icon_scaled(&painter, ic_r, glyph, true, 1.35);
                                     }
@@ -1216,7 +1330,16 @@ fn show_lines_grid_for_side(
                                 }
                                 if !read_only_mirrored {
                                     resp.context_menu(|ui| {
-                                        show_line_context_menu(ui, state, actions, r, func_id, is_base_row, is_closing);
+                                        show_line_context_menu(
+                                            ui,
+                                            state,
+                                            actions,
+                                            side,
+                                            r,
+                                            func_id,
+                                            is_base_row,
+                                            is_closing,
+                                        );
                                     });
                                 }
                                 cx += w;
@@ -1260,6 +1383,42 @@ fn show_lines_grid_for_side(
                                     Stroke::new(1.0_f32, pill_border),
                                     egui::StrokeKind::Inside,
                                 );
+                                if !read_only_mirrored && !is_base_row {
+                                    let drop_w = (17.0 * metrics.font_scale).min(inner_r.width() * 0.25);
+                                    let drop_r = Rect::from_min_max(
+                                        pos2(inner_r.right() - drop_w, inner_r.top()),
+                                        inner_r.max,
+                                    );
+                                    if ui.rect_contains_pointer(drop_r) {
+                                        painter.rect_filled(
+                                            drop_r,
+                                            CornerRadius {
+                                                nw: 0,
+                                                sw: 0,
+                                                ne: pill_cr.ne,
+                                                se: pill_cr.se,
+                                            },
+                                            colors::WIN_BLUE_FILL,
+                                        );
+                                    }
+                                    painter.line_segment(
+                                        [
+                                            pos2(drop_r.left(), inner_r.top() + 3.0),
+                                            pos2(drop_r.left(), inner_r.bottom() - 3.0),
+                                        ],
+                                        Stroke::new(0.8_f32, pill_border),
+                                    );
+                                    let dc = drop_r.center();
+                                    painter.add(egui::Shape::convex_polygon(
+                                        vec![
+                                            pos2(dc.x - 3.2, dc.y - 1.5),
+                                            pos2(dc.x + 3.2, dc.y - 1.5),
+                                            pos2(dc.x, dc.y + 2.5),
+                                        ],
+                                        colors::TEXT_SECONDARY,
+                                        Stroke::NONE,
+                                    ));
+                                }
                             } else {
                                 painter.rect_filled(cell_r, CornerRadius::ZERO, cell_bg);
                                 painter.rect_stroke(
@@ -1355,10 +1514,19 @@ fn show_lines_grid_for_side(
                                 };
                                 if col == LineCol::Function {
                                     if !text.is_empty() {
+                                        let label_r = if !read_only_mirrored && !is_base_row {
+                                            let drop_w = (17.0 * metrics.font_scale).min(cell_r.width() * 0.24);
+                                            Rect::from_min_max(
+                                                cell_r.min,
+                                                pos2((cell_r.right() - drop_w).max(cell_r.left() + 8.0), cell_r.bottom()),
+                                            )
+                                        } else {
+                                            cell_r
+                                        };
                                         painter
-                                            .with_clip_rect(cell_r.shrink(3.0))
+                                            .with_clip_rect(label_r.shrink(3.0))
                                             .text(
-                                                cell_r.center(),
+                                                label_r.center(),
                                                 Align2::CENTER_CENTER,
                                                 text,
                                                 font,
@@ -1427,10 +1595,20 @@ fn show_lines_grid_for_side(
                                         state.select_single_row(r);
                                         state.focused_cell = Some((r, vis_ci));
                                         if col == LineCol::Function && !read_only_mirrored {
-                                            actions.push(AppAction::OpenLineProps {
-                                                line_idx: r,
-                                                initial_tab: line_function_default_tab(func_id),
-                                            });
+                                            let drop_w = (17.0 * metrics.font_scale).min(cell_r.width() * 0.25);
+                                            let in_drop = !is_base_row
+                                                && resp.interact_pointer_pos().is_some_and(|p| p.x >= cell_r.right() - drop_w - 2.0);
+                                            if in_drop {
+                                                let popup_id = ui.id().with("line_fn_quick_popup");
+                                                ui.ctx().data_mut(|d| {
+                                                    d.insert_temp(popup_id, (elem_idx, side as u8, r, cell_r));
+                                                });
+                                            } else {
+                                                actions.push(AppAction::OpenLineProps {
+                                                    line_idx: r,
+                                                    initial_tab: line_function_default_tab(func_id),
+                                                });
+                                            }
                                         } else if editable {
                                             let init = format_line_cell(
                                                 line_snap,
@@ -1474,7 +1652,16 @@ fn show_lines_grid_for_side(
                                         resp
                                     };
                                     resp_ctx.context_menu(|ui| {
-                                        show_line_context_menu(ui, state, actions, r, func_id, is_base_row, is_closing);
+                                        show_line_context_menu(
+                                            ui,
+                                            state,
+                                            actions,
+                                            side,
+                                            r,
+                                            func_id,
+                                            is_base_row,
+                                            is_closing,
+                                        );
                                     });
                                 }
                             }
@@ -1524,9 +1711,19 @@ fn show_lines_grid_for_side(
                         child_ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0 * metrics.font_scale;
                             let btn_h = (24.0 * metrics.row_scale).round();
+                            let has_base = doc
+                                .elements
+                                .get(elem_idx)
+                                .map(|e| stoll_kalip_editoru::math::element_has_base_line(e.element_type()))
+                                .unwrap_or(false);
+                            let first_btn_lbl = if has_base {
+                                "+ Temel Çizgi Ekle"
+                            } else {
+                                "+ İlk Çizgi Ekle"
+                            };
                             if win32_button(
                                 ui,
-                                "+ Temel Çizgi Ekle",
+                                first_btn_lbl,
                                 vec2(126.0 * metrics.font_scale, btn_h),
                                 true,
                             )
@@ -2148,7 +2345,16 @@ fn show_markers_grid_for_side(
                                             ui.close_menu();
                                         }
                                         ui.separator();
+                                        let set_marker_side = |state: &mut UiState| {
+                                            state.active_table_side = side;
+                                            state.table_mode = if side == LineSide::Left {
+                                                TableMode::LeftMarkers
+                                            } else {
+                                                TableMode::RightMarkers
+                                            };
+                                        };
                                         if ui.button("Kopyala (Ctrl+C)").clicked() {
+                                            set_marker_side(state);
                                             if !state.selected_rows.contains(&r) {
                                                 state.select_single_row(r);
                                             }
@@ -2159,6 +2365,7 @@ fn show_markers_grid_for_side(
                                             .add_enabled(!state.copied_markers.is_empty(), egui::Button::new("Ekle+Yapıştır (Ctrl+Shift+V)"))
                                             .clicked()
                                         {
+                                            set_marker_side(state);
                                             state.select_single_row(r);
                                             actions.push(AppAction::PasteInsertMarkers);
                                             ui.close_menu();
@@ -2167,6 +2374,7 @@ fn show_markers_grid_for_side(
                                             .add_enabled(!state.copied_markers.is_empty(), egui::Button::new("Üzerine Yapıştır (Ctrl+V)"))
                                             .clicked()
                                         {
+                                            set_marker_side(state);
                                             state.select_single_row(r);
                                             actions.push(AppAction::PasteReplaceMarkers);
                                             ui.close_menu();
@@ -2761,7 +2969,7 @@ fn handle_lines_grid_keyboard(
                         state.editing_side = side;
                         state.editing_cell = Some((r, c, init));
                         state.editing_pristine = !clear_init;
-                    } else if col == LineCol::LineEditor && !is_base {
+                    } else if col == LineCol::LineEditor && !is_base && !is_closing {
                         actions.push(AppAction::OpenCurveEditor { line_idx: r });
                     } else if col == LineCol::Function {
                         actions.push(AppAction::OpenLineProps {
@@ -2926,7 +3134,7 @@ fn is_line_cell_editable(
         LineCol::No | LineCol::LineEditor | LineCol::RestY | LineCol::RestX | LineCol::Function | LineCol::Group => false,
         LineCol::Rows => !has_curve && !is_base_row,
         LineCol::Stitches => !has_curve && !is_closing,
-        LineCol::StepY | LineCol::StepX | LineCol::Factor => !has_curve && !is_base_row,
+        LineCol::StepY | LineCol::StepX | LineCol::Factor => !has_curve && !is_base_row && !is_closing,
         LineCol::WidthNarrow => matches!(func_id, 1 | 2 | 9),
         LineCol::WidthFadeOut => !is_base_row,
         LineCol::Comment => true,
@@ -3365,21 +3573,88 @@ fn next_editable_marker_cell(
     (cur_r, cur_c)
 }
 
+fn cached_curve_icon_kind(
+    ctx: &egui::Context,
+    curve: &stoll_kalip_editoru::model::CurveData,
+    side: LineSide,
+    single_system: bool,
+) -> IconKind {
+    use std::collections::HashMap;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    curve.function.hash(&mut hasher);
+    (side as u8).hash(&mut hasher);
+    single_system.hash(&mut hasher);
+    curve.steps.len().hash(&mut hasher);
+    for s in &curve.steps {
+        s.step_width.hash(&mut hasher);
+        s.step_height.hash(&mut hasher);
+        s.factor.hash(&mut hasher);
+        s.group_factor.hash(&mut hasher);
+        s.group_tag_id.hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    let cache_id = egui::Id::new("grid_curve_icon_cache");
+    if let Some(cached) = ctx.data(|d| {
+        d.get_temp::<HashMap<u64, IconKind>>(cache_id)
+            .and_then(|m| m.get(&key).copied())
+    }) {
+        return cached;
+    }
+
+    let detected = detect_curve_formula_from_steps(curve, side, single_system);
+    let glyph = if let Some(det) = detected {
+        if det.reverse_j {
+            IconKind::CurveReverseJ
+        } else {
+            match det.form {
+                CurveForm::Line => IconKind::CurveLine,
+                CurveForm::JCurve => IconKind::CurveJ,
+                CurveForm::SCurve => IconKind::CurveS,
+                _ => IconKind::CurveUser,
+            }
+        }
+    } else {
+        IconKind::CurveUser
+    };
+
+    ctx.data_mut(|d| {
+        let map = d.get_temp_mut_or_default::<HashMap<u64, IconKind>>(cache_id);
+        if map.len() > 256 {
+            map.clear();
+        }
+        map.insert(key, glyph);
+    });
+    glyph
+}
+
 fn show_line_context_menu(
     ui: &mut Ui,
     state: &mut UiState,
     actions: &mut Vec<AppAction>,
+    side: LineSide,
     r: usize,
     func_id: i32,
     is_base_row: bool,
     is_closing: bool,
 ) {
+    let set_line_side = |state: &mut UiState| {
+        state.active_table_side = side;
+        state.table_mode = if side == LineSide::Left {
+            TableMode::LeftLines
+        } else {
+            TableMode::RightLines
+        };
+    };
     if ui.button("Yeni çizgiyi seçilenden önce ekle").clicked() {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::InsertLineBefore);
         ui.close_menu();
     }
     if ui.button("Yeni çizgiyi sona ekle").clicked() {
+        set_line_side(state);
         actions.push(AppAction::AppendLine);
         ui.close_menu();
     }
@@ -3387,6 +3662,7 @@ fn show_line_context_menu(
         .add_enabled(!is_base_row, egui::Button::new("Seçilen çizgiyi sil"))
         .clicked()
     {
+        set_line_side(state);
         if !state.selected_rows.contains(&r) {
             state.select_single_row(r);
         }
@@ -3395,6 +3671,7 @@ fn show_line_context_menu(
     }
     ui.separator();
     if ui.button("Kopyala (Ctrl+C)").clicked() {
+        set_line_side(state);
         if !state.selected_rows.contains(&r) {
             state.select_single_row(r);
         }
@@ -3408,6 +3685,7 @@ fn show_line_context_menu(
         )
         .clicked()
     {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::PasteInsertLines);
         ui.close_menu();
@@ -3419,12 +3697,14 @@ fn show_line_context_menu(
         )
         .clicked()
     {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::PasteReplaceLines);
         ui.close_menu();
     }
     ui.separator();
     if ui.button("Özellikler...").clicked() {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::OpenLineProps {
             line_idx: r,
@@ -3433,6 +3713,7 @@ fn show_line_context_menu(
         ui.close_menu();
     }
     if ui.button("Özellikleri başka çizgiden al...").clicked() {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::OpenRefLineSelect { line_idx: r });
         ui.close_menu();
@@ -3444,6 +3725,7 @@ fn show_line_context_menu(
         )
         .clicked()
     {
+        set_line_side(state);
         state.select_single_row(r);
         actions.push(AppAction::OpenCurveEditor { line_idx: r });
         ui.close_menu();
@@ -3542,10 +3824,10 @@ fn commit_line_cell_edit(
                         if !same {
                             if is_mm {
                                 line.height_mm = mm;
-                                recalc_line_from_mm(line, &hdr);
+                                recalc_line_from_mm_for_side(line, &hdr, side);
                             } else {
                                 line.rows = mm_to_rows(mm, &hdr).max(0);
-                                recalc_line_from_stitches_and_rows(line, &hdr);
+                                recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
                             }
                             let is_closing = is_last_row
                                 && line.rows == 0
@@ -3567,7 +3849,7 @@ fn commit_line_cell_edit(
                         let clamped = v.max(0.0);
                         if (clamped - line.height_mm).abs() >= 0.005 {
                             line.height_mm = clamped;
-                            recalc_line_from_mm(line, &hdr);
+                            recalc_line_from_mm_for_side(line, &hdr, side);
                             let is_closing = is_last_row
                                 && line.rows == 0
                                 && (line.default_widening == 1 || sum_x_others + line.stitches == 0);
@@ -3586,7 +3868,7 @@ fn commit_line_cell_edit(
                 let clamped = v.max(0);
                 if clamped != line.rows {
                     line.rows = clamped;
-                    recalc_line_from_stitches_and_rows(line, &hdr);
+                    recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
                     let is_closing = is_last_row
                         && line.rows == 0
                         && (line.default_widening == 1 || sum_x_others + line.stitches == 0);
@@ -3618,10 +3900,10 @@ fn commit_line_cell_edit(
                         if !same {
                             if is_mm {
                                 line.width_mm = mm;
-                                recalc_line_from_mm(line, &hdr);
+                                recalc_line_from_mm_for_side(line, &hdr, side);
                             } else {
                                 line.stitches = mm_to_stitches(mm, &hdr);
-                                recalc_line_from_stitches_and_rows(line, &hdr);
+                                recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
                             }
                             let is_closing = is_last_row
                                 && line.rows == 0
@@ -3643,7 +3925,7 @@ fn commit_line_cell_edit(
                         let new_w = v * (x_sign as f64);
                         if (new_w - line.width_mm).abs() >= 0.005 {
                             line.width_mm = new_w;
-                            recalc_line_from_mm(line, &hdr);
+                            recalc_line_from_mm_for_side(line, &hdr, side);
                             let is_closing = is_last_row
                                 && line.rows == 0
                                 && (line.default_widening == 1 || sum_x_others + line.stitches == 0);
@@ -3662,7 +3944,7 @@ fn commit_line_cell_edit(
                 let new_st = v * x_sign;
                 if new_st != line.stitches {
                     line.stitches = new_st;
-                    recalc_line_from_stitches_and_rows(line, &hdr);
+                    recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
                     let is_closing = is_last_row
                         && line.rows == 0
                         && (line.default_widening == 1 || sum_x_others + line.stitches == 0);

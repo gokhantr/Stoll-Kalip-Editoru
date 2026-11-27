@@ -456,6 +456,11 @@ impl FormatConvertDialogState {
                 .add_filter("Tüm Stoll Kalıpları (*.shp, *.shv)", &["shp", "shv"]);
 
             if let Some(path) = dialog.save_file() {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !stem.trim().is_empty() {
+                        doc.header.name = stem.to_string();
+                    }
+                }
                 match save_file(doc, &path) {
                     Ok(()) => {
                         doc.file_path = Some(path.clone());
@@ -488,10 +493,23 @@ impl FormatConvertDialogState {
                         );
                     }
                     Err(e) => {
+                        doc.dirty = true;
                         state.set_status(format!("Kaydetme hatası: {e}"), true);
                     }
                 }
             } else {
+                // Save As was cancelled: detach stale file_path if extension no longer matches target format
+                let ext_matches = doc
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.eq_ignore_ascii_case(default_ext))
+                    .unwrap_or(false);
+                if !ext_matches {
+                    doc.file_path = None;
+                }
+                doc.dirty = true;
                 state.set_status(
                     format!(
                         "Giriş formatı dönüştürüldü: {} (kayıt iptal edildi)",
@@ -501,6 +519,19 @@ impl FormatConvertDialogState {
                 );
             }
         } else {
+            let is_mm = self.target_format == InputFormat::Mm;
+            let expected_ext = if is_mm { "shv" } else { "shp" };
+            let ext_matches = doc
+                .file_path
+                .as_ref()
+                .and_then(|p| p.extension())
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case(expected_ext))
+                .unwrap_or(false);
+            if !ext_matches {
+                doc.file_path = None;
+            }
+            doc.dirty = true;
             state.set_status(
                 format!(
                     "Giriş formatı dönüştürüldü: {}",

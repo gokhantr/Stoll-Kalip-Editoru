@@ -5,7 +5,7 @@ use egui::{
 
 use stoll_kalip_editoru::math::{
     auto_detect_line_function_in_context, auto_sync_closing_line_for_side,
-    element_distance_from_top, mm_to_rows, mm_to_stitches, recalc_line_from_stitches_and_rows,
+    element_distance_from_top, mm_to_rows, mm_to_stitches,
     rows_to_mm, stitches_to_mm, sync_endline_element_y, sync_mirrored_right_lines,
     DocumentGeometry, SegmentSpan,
 };
@@ -333,7 +333,7 @@ impl CadCanvasState {
         } else if self.drag_state.is_none() && !shift_held {
             if let Some(hp) = hover_pos {
                 for (ei, eg) in geom.elements.iter().enumerate() {
-                    if eg.hidden {
+                    if eg.hidden || (!state.all_elements_selected && ei != state.selected_elem) {
                         continue;
                     }
                     let (ref l_pts, ref r_pts) = projected_elems[ei];
@@ -531,7 +531,8 @@ impl CadCanvasState {
             if self.dragging_crosshair {
                 if let Some(hp) = response.interact_pointer_pos() {
                     let w = screen_to_world_mm(hp);
-                    if compute_crosshair_spans(geom, w.0, w.1).is_some() {
+                    let only_elem = (!state.all_elements_selected).then_some(state.selected_elem);
+                    if compute_crosshair_spans(geom, w.0, w.1, only_elem).is_some() {
                         self.crosshair_world = Some(w);
                     }
                 }
@@ -598,7 +599,10 @@ impl CadCanvasState {
 
                     let mut pill_label = None;
                     let header_copy = doc.header.clone();
-                    if cur_st_rows != Some((new_stitches, new_rows)) {
+                    // Closing row's horizontal stitches are auto-computed; don't push a no-op undo when only stitches changed
+                    let effective_change = cur_st_rows != Some((new_stitches, new_rows))
+                        && !(is_orig_closing && new_rows == 0);
+                    if effective_change {
                         if !ds.undo_pushed {
                             undo.push("Nokta sürükle", doc);
                             ds.undo_pushed = true;
@@ -617,7 +621,11 @@ impl CadCanvasState {
                                 *line = ds.orig_line.clone();
                                 line.stitches = new_stitches;
                                 line.rows = new_rows;
-                                recalc_line_from_stitches_and_rows(line, &header_copy);
+                                stoll_kalip_editoru::math::recalc_line_from_stitches_and_rows_for_side(
+                                    line,
+                                    &header_copy,
+                                    effective_side,
+                                );
                                 auto_detect_line_function_in_context(
                                     line,
                                     ds.line_idx == 0,
@@ -956,7 +964,8 @@ impl CadCanvasState {
                     LineSide::Right => TableMode::RightLines,
                 };
                 state.select_single_row(t.line_idx);
-                state.focused_cell = Some((t.line_idx, 6));
+                state.focused_cell =
+                    Some((t.line_idx, if state.show_detail_columns { 11 } else { 6 }));
                 state.editing_cell = None;
 
                 if let Some(line) = doc
@@ -1022,7 +1031,14 @@ impl CadCanvasState {
                     });
                     if on_crosshair_center {
                         self.crosshair_world = None;
-                    } else if compute_crosshair_spans(geom, wx_mm, wy_mm).is_some() {
+                    } else if compute_crosshair_spans(
+                        geom,
+                        wx_mm,
+                        wy_mm,
+                        (!state.all_elements_selected).then_some(state.selected_elem),
+                    )
+                    .is_some()
+                    {
                         if self.crosshair_world.is_some() {
                             self.crosshair_world = None;
                         } else {
@@ -1075,6 +1091,7 @@ impl CadCanvasState {
                 geom,
                 cx_mm,
                 cy_mm,
+                (!state.all_elements_selected).then_some(state.selected_elem),
                 hover_crosshair_center || self.dragging_crosshair,
                 &world_to_screen,
                 rect,
@@ -1394,7 +1411,19 @@ fn compute_crosshair_spans(
     geom: &DocumentGeometry,
     cx_mm: f64,
     cy_mm: f64,
+    only_elem: Option<usize>,
 ) -> Option<((f64, f64), (f64, f64))> {
+    if let Some(ei) = only_elem {
+        let eg = geom.elements.get(ei).filter(|e| !e.hidden)?;
+        let poly = build_element_polygon_mm(eg);
+        if poly.len() >= 3 && point_in_poly_mm(cx_mm, cy_mm, &poly) {
+            let hx = horizontal_span_at_y(cx_mm, cy_mm, &poly)?;
+            let vy = vertical_span_at_x(cx_mm, cy_mm, &poly)?;
+            return Some((hx, vy));
+        }
+        return None;
+    }
+
     // 1. Check secondary elements first (innermost cutout wins)
     for eg in geom.elements.iter().skip(1) {
         if eg.hidden {
@@ -1450,11 +1479,14 @@ fn paint_inside_crosshair_ruler(
     geom: &DocumentGeometry,
     cx_mm: f64,
     cy_mm: f64,
+    only_elem: Option<usize>,
     center_hot: bool,
     world_to_screen: &impl Fn(f64, f64) -> Pos2,
     canvas_rect: Rect,
 ) {
-    let Some(((x_left, x_right), (y_bot, y_top))) = compute_crosshair_spans(geom, cx_mm, cy_mm) else {
+    let Some(((x_left, x_right), (y_bot, y_top))) =
+        compute_crosshair_spans(geom, cx_mm, cy_mm, only_elem)
+    else {
         return;
     };
 

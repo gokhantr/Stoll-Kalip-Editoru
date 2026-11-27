@@ -172,8 +172,15 @@ pub fn save_to_bytes_with_options(
         s.write_all(summary)?;
     }
 
-    // 4. Preserve any additional unknown streams verbatim
+    // 4. Preserve any additional unknown streams verbatim (creating parent storages if nested)
     for (sp, data) in &doc.ole.extra_streams {
+        let path_obj = std::path::Path::new(sp);
+        if let Some(parent) = path_obj.parent() {
+            let p_str = parent.to_string_lossy();
+            if !p_str.is_empty() && p_str != "/" && p_str != "\\" {
+                let _ = comp.create_storage_all(parent);
+            }
+        }
         let mut s = comp
             .create_stream(sp)
             .map_err(|e| IoError::Ole(e.to_string()))?;
@@ -466,12 +473,24 @@ pub fn parse_dxf_contour(text: &str, name: &str) -> Result<FormDocument, IoError
         }
     }
 
+    // Check whether the imported DXF contour is a full closed polygon vs a half-shape.
+    // A closed polygon (first == last vertex) must NOT be mirrored onto itself.
+    let is_closed_polygon = vertices.len() >= 4
+        && (vertices.first().unwrap().0 - vertices.last().unwrap().0).abs() < 1e-3
+        && (vertices.first().unwrap().1 - vertices.last().unwrap().1).abs() < 1e-3;
+
     let el = &mut doc.elements[0];
     el.left_lines = kantes;
     el.right_lines.clear();
-    el.mirrored = true;
-    el.renumber_lines(crate::model::LineSide::Left);
-    crate::math::operations::sync_mirrored_right_lines(&mut doc, 0);
+    if is_closed_polygon {
+        el.mirrored = false;
+        el.has_right_lines_section = false;
+        el.renumber_lines(crate::model::LineSide::Left);
+    } else {
+        el.mirrored = true;
+        el.renumber_lines(crate::model::LineSide::Left);
+        crate::math::operations::sync_mirrored_right_lines(&mut doc, 0);
+    }
     doc.dirty = true;
     Ok(doc)
 }

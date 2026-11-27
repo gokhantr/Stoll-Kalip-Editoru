@@ -51,12 +51,11 @@ impl UndoStack {
         self.redo.last().map(|(l, _)| l.as_str())
     }
 
-    /// Undo the last change, restoring `current` and moving its prior state to redo.
+    /// Undo the last change, restoring `current` (including its original `dirty` flag) and moving its prior state to redo.
     pub fn undo(&mut self, current: &mut FormDocument) -> bool {
-        if let Some((label, mut prev)) = self.undo.pop_back() {
+        if let Some((label, prev)) = self.undo.pop_back() {
             let cur_clone = current.clone();
             self.redo.push((label, cur_clone));
-            prev.dirty = true;
             *current = prev;
             true
         } else {
@@ -64,12 +63,11 @@ impl UndoStack {
         }
     }
 
-    /// Redo the last undone change.
+    /// Redo the last undone change, preserving the snapshot's `dirty` flag.
     pub fn redo(&mut self, current: &mut FormDocument) -> bool {
-        if let Some((label, mut next)) = self.redo.pop() {
+        if let Some((label, next)) = self.redo.pop() {
             let cur_clone = current.clone();
             self.undo.push_back((label, cur_clone));
-            next.dirty = true;
             *current = next;
             true
         } else {

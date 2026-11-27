@@ -761,17 +761,11 @@ pub fn win32_window(
 
     let mut close_clicked = false;
     win.show(ctx, |ui| {
-        // Custom 26px white Win32 titlebar
+        // Custom 26px white Win32 titlebar (Sense::hover lets egui::Window drag naturally)
         let title_h = 26.0_f32;
         let avail_w = ui.available_width();
-        let (bar_rect, bar_resp) =
-            ui.allocate_exact_size(Vec2::new(avail_w, title_h), egui::Sense::click_and_drag());
-
-        // Drag window by titlebar
-        if bar_resp.dragged() {
-            // egui::Window drags automatically when dragged on its background if title_bar(false),
-            // so we just keep bar_resp interactive.
-        }
+        let (bar_rect, _) =
+            ui.allocate_exact_size(Vec2::new(avail_w, title_h), egui::Sense::hover());
 
         let painter = ui.painter();
         painter.rect_filled(bar_rect, CornerRadius::ZERO, Color32::WHITE);

@@ -708,7 +708,11 @@ impl StollCatalog {
         for spec in roots {
             if spec.has_structure_slots {
                 let slot_dirs = read_dir_children_for_guid(root, spec.root_guid);
-                for (slot_idx, slot_dir_guid) in slot_dirs.into_iter().take(12).enumerate() {
+                for (slot_idx, slot_dir_guid) in slot_dirs
+                    .into_iter()
+                    .take(KNITTING_STRUCTURES.len())
+                    .enumerate()
+                {
                     let struct_id = Some(slot_idx as i32);
                     let items = read_dir_children_for_guid(root, &slot_dir_guid);
                     for item_guid in items {
@@ -1324,7 +1328,7 @@ fn builtin_stoll_presets() -> Vec<StandardPreset> {
             line.binding_off = Some(BindingOffProps {
                 modules: vec![ModuleAssignment {
                     module_art_id: 0,
-                    id: "{70037774-DA09-11D3-BE14-00A0C9D4B941}".to_string(),
+                    id: "{A372A90F-50DD-11D4-BE63-00A0C9ECEF97}".to_string(),
                     width: 1,
                     bind_off_limit: bo_lim,
                     narrowing_position: 4,

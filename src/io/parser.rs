@@ -25,6 +25,7 @@ enum ActiveSection {
     CurveStep,
     ConnectionPoints,
     ConnectPoint,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,7 +446,8 @@ pub fn parse_form_text(text: &str, ole: OlePreservedStreams) -> Result<FormDocum
                     }
                 }
                 _ => {
-                    // Unknown section header: record safely under current section raw entries if possible
+                    // Unknown section header: switch to Unknown so its keys never overwrite the previous section
+                    active = ActiveSection::Unknown;
                 }
             }
             continue;
@@ -772,7 +774,7 @@ pub fn parse_form_text(text: &str, ole: OlePreservedStreams) -> Result<FormDocum
                     }
                 }
             }
-            ActiveSection::None => {}
+            ActiveSection::None | ActiveSection::Unknown => {}
         }
     }
 

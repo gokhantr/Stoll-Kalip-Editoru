@@ -192,7 +192,7 @@ pub struct WideningProps {
 impl Default for WideningProps {
     fn default() -> Self {
         Self {
-            for_all_structures: 0,
+            for_all_structures: 2_147_483_647,
             execute_immediately: false,
             use_module_color: false,
             modules: Vec::new(),
@@ -217,7 +217,7 @@ pub struct BindingOffProps {
 impl Default for BindingOffProps {
     fn default() -> Self {
         Self {
-            for_all_structures: 0,
+            for_all_structures: 2_147_483_647,
             use_module_color: false,
             bind_off_type: None,
             modules: Vec::new(),

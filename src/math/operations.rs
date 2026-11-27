@@ -1,18 +1,70 @@
 use crate::math::curves::{
-    apply_curve_to_line, mirror_curve_steps_single_system, resolve_curve_module_widths,
-    generate_curve_steps, CourseParityMode, CurveGenParams,
+    apply_curve_to_line, detect_curve_formula_from_steps, generate_curve_steps,
+    mirror_curve_steps_single_system, resolve_curve_module_widths, CourseParityMode, CurveGenParams,
+    CurveStepDrive,
 };
 use crate::math::geometry::{
     snapshot_endline_distances, sync_all_endline_elements,
 };
 use crate::math::units::{
-    auto_detect_line_function_for_element, calculate_and_set_stufung, recalc_line_from_mm,
-    recalc_line_from_stitches_and_rows, round2, rows_to_mm,
+    auto_detect_line_function_for_element, auto_detect_line_function_in_context,
+    calculate_and_set_stufung, recalc_line_from_mm, recalc_line_from_stitches_and_rows, round2,
+    rows_to_mm,
 };
 use crate::model::{
     CurveForm, ElementType, FormDocument, FormHeader, InputFormat, KanteChildSlot, LineFunction,
     LineSegment, LineSide, ModuleAssignment, PointEntry, PointOffset, ShapeElement, YReferenceLine,
 };
+
+/// Returns `true` only for element types whose Row 1 (`index 0`) is a locked `Temel` (`BaseLine`).
+#[inline]
+pub fn element_has_base_line(elem_type: ElementType) -> bool {
+    elem_type == ElementType::BasicShape
+}
+
+/// Returns `true` if lines in `elem_type` participate in automatic `Reglan`/`Artırma` edge shaping detection.
+/// `Tiktak` (`Gore`) and `*Marking` elements default lines to `LineFunction::None` unless user explicitly sets one.
+#[inline]
+pub fn element_auto_detects_shaping(elem_type: ElementType) -> bool {
+    !matches!(
+        elem_type,
+        ElementType::Gore
+            | ElementType::NecklineMarking
+            | ElementType::HoleMarking
+            | ElementType::OpeningMarking
+    )
+}
+
+/// Re-evaluate automatic `LineFunction` (`user_set_function == false`) across all lines of `el`.
+pub fn recalc_all_auto_line_functions(el: &mut ShapeElement) {
+    let elem_type = el.element_type();
+    if elem_type != ElementType::BasicShape {
+        for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
+            if l.function == LineFunction::BaseLine {
+                l.function = LineFunction::None;
+                l.user_set_function = false;
+            }
+        }
+    }
+    let sides = [LineSide::Left, LineSide::Right];
+    for side in sides {
+        let count = el.lines(side).len();
+        if count == 0 {
+            continue;
+        }
+        let closing = closing_line_index(el, side);
+        let lines = el.lines_mut(side);
+        for (i, line) in lines.iter_mut().enumerate() {
+            auto_detect_line_function_in_context(
+                line,
+                i == 0,
+                closing == Some(i),
+                side == LineSide::Left,
+                elem_type,
+            );
+        }
+    }
+}
 
 /// Insert a new empty line segment BEFORE `row_idx` (`Yeni Çizgiyi Öne Ekle`, `Insert`, `50574`).
 pub fn insert_line_before(
@@ -26,13 +78,10 @@ pub fn insert_line_before(
     let hdr = doc.header.clone();
     let tag_id = doc.next_line_tag_id();
     let el = doc.elements.get_mut(elem_idx)?;
-    let is_cutout = matches!(
-        el.element_type(),
-        ElementType::Neckline | ElementType::Armhole | ElementType::Hole | ElementType::Opening
-    );
+    let has_base = element_has_base_line(el.element_type());
     let lines = el.lines_mut(side);
     let pos = row_idx.min(lines.len());
-    let default_func = if pos == 0 && !is_cutout {
+    let default_func = if pos == 0 && has_base {
         LineFunction::BaseLine
     } else {
         LineFunction::None
@@ -42,7 +91,7 @@ pub fn insert_line_before(
         function: default_func,
         ..LineSegment::default()
     };
-    if pos == 0 && !is_cutout {
+    if pos == 0 && has_base {
         new_line.rows = 0;
         new_line.stitches = if side == LineSide::Left { -80 } else { 80 };
         recalc_line_from_stitches_and_rows(&mut new_line, &hdr);
@@ -114,11 +163,14 @@ pub fn paste_line(
         return false;
     }
     let tag_id = doc.next_line_tag_id();
+    let mut cloned = source.clone();
+    for pt in &mut cloned.points {
+        pt.punkt_tag_id = doc.next_point_tag_id();
+    }
     let Some(el) = doc.elements.get_mut(elem_idx) else {
         return false;
     };
     let lines = el.lines_mut(side);
-    let mut cloned = source.clone();
     if row_idx > 0 && cloned.function == LineFunction::BaseLine {
         cloned.function = LineFunction::None;
     }
@@ -142,15 +194,15 @@ pub fn paste_insert_line(
 ) -> Option<usize> {
     let endline_dists = snapshot_endline_distances(doc);
     let tag_id = doc.next_line_tag_id();
+    let mut cloned = source.clone();
+    for pt in &mut cloned.points {
+        pt.punkt_tag_id = doc.next_point_tag_id();
+    }
     let el = doc.elements.get_mut(elem_idx)?;
-    let is_cutout = matches!(
-        el.element_type(),
-        ElementType::Neckline | ElementType::Armhole | ElementType::Hole | ElementType::Opening
-    );
+    let has_base = element_has_base_line(el.element_type());
     let lines = el.lines_mut(side);
     let pos = row_idx.min(lines.len());
-    let mut cloned = source.clone();
-    if (pos > 0 || is_cutout) && cloned.function == LineFunction::BaseLine {
+    if (pos > 0 || !has_base) && cloned.function == LineFunction::BaseLine {
         cloned.function = LineFunction::None;
     }
     cloned.tag_id = tag_id;
@@ -197,12 +249,21 @@ pub fn add_element(doc: &mut FormDocument, element_type: ElementType, name: Opti
         (0.0, 0.0)
     };
 
+    let init_start_width = if element_type == ElementType::Gore {
+        doc.basic_element()
+            .map(|e| e.start_width)
+            .filter(|&w| w > 0.0)
+            .unwrap_or(500.0)
+    } else {
+        0.0
+    };
+
     let mut el = ShapeElement {
         index: next_idx,
         name: el_name,
         art_tag_id: element_type.to_id(),
         mirrored: true,
-        start_width: 0.0,
+        start_width: init_start_width,
         offset_y_rows: init_y_rows,
         offset_y_mm: init_y_mm,
         y_ref_line: y_ref,
@@ -265,32 +326,72 @@ pub fn apply_standard_preset_to_line(target: &mut LineSegment, preset: &LineSegm
 }
 
 /// Apply guidelines ("Yönergeler -> devir al") across either the selected element or all elements.
-/// Normalizes even rows if `prefer_even_rows` is active and enforces `step_factor >= 1`.
+/// Normalizes even rows if `prefer_even_rows` is active, enforces `step_factor >= 1`,
+/// applies `min_width_stitches` / `max_narrowing_step` bounds when configured, and re-syncs mirrored sides.
 pub fn apply_guidelines(doc: &mut FormDocument, selected_elem_idx: usize) -> usize {
     let endline_dists = snapshot_endline_distances(doc);
     let g = doc.guidelines.clone();
     let hdr = doc.header.clone();
     let mut modified_count = 0usize;
+    let mut mirrored_to_sync: Vec<usize> = Vec::new();
 
     for (idx, el) in doc.elements.iter_mut().enumerate() {
         if !g.apply_to_all_elements && idx != selected_elem_idx {
             continue;
         }
-        for line in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-            let mut changed = false;
-            if line.step_factor < 1 {
-                line.step_factor = 1;
-                changed = true;
-            }
-            if g.prefer_even_rows && line.rows != 0 && line.rows % 2 != 0 {
-                line.rows += if line.rows > 0 { 1 } else { -1 };
-                recalc_line_from_stitches_and_rows(line, &hdr);
-                changed = true;
-            }
-            if changed {
-                modified_count += 1;
+        let mut elem_changed = false;
+        let sides: &[LineSide] = if el.mirrored {
+            &[LineSide::Left]
+        } else {
+            &[LineSide::Left, LineSide::Right]
+        };
+        for &side in sides {
+            for line in el.lines_mut(side).iter_mut() {
+                let mut changed = false;
+                if line.step_factor < 1 {
+                    line.step_factor = 1;
+                    changed = true;
+                }
+                if g.prefer_even_rows && line.rows != 0 && line.rows % 2 != 0 {
+                    line.rows += if line.rows > 0 { 1 } else { -1 };
+                    crate::math::units::recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
+                    changed = true;
+                }
+                if g.max_narrowing_step > 0
+                    && matches!(
+                        line.function,
+                        LineFunction::Narrowing | LineFunction::NarrowingMulti
+                    )
+                    && line.step_x.abs() > g.max_narrowing_step
+                    && !line.is_curve()
+                {
+                    let sign = line.step_x.signum();
+                    let new_sx = sign * g.max_narrowing_step;
+                    calculate_and_set_stufung(line, new_sx, line.step_y);
+                    changed = true;
+                }
+                if g.min_width_stitches > 0
+                    && line.function == LineFunction::BaseLine
+                    && line.stitches.abs() < g.min_width_stitches
+                {
+                    let sign = if line.stitches < 0 { -1 } else { 1 };
+                    line.stitches = sign * g.min_width_stitches;
+                    crate::math::units::recalc_line_from_stitches_and_rows_for_side(line, &hdr, side);
+                    changed = true;
+                }
+                if changed {
+                    modified_count += 1;
+                    elem_changed = true;
+                }
             }
         }
+        if elem_changed && el.mirrored {
+            mirrored_to_sync.push(idx);
+        }
+    }
+
+    for idx in mirrored_to_sync {
+        sync_mirrored_right_lines(doc, idx);
     }
 
     if modified_count > 0 {
@@ -357,6 +458,22 @@ pub fn sync_mirrored_right_lines(doc: &mut FormDocument, elem_idx: usize) {
         new_tag_ids.push(tag);
     }
 
+    let mut line_pt_tag_ids: Vec<Vec<i32>> = Vec::with_capacity(doc.elements[elem_idx].left_lines.len());
+    for i in 0..doc.elements[elem_idx].left_lines.len() {
+        let p_cnt = doc.elements[elem_idx].left_lines[i].points.len();
+        let mut ids = Vec::with_capacity(p_cnt);
+        for j in 0..p_cnt {
+            let existing = doc.elements[elem_idx]
+                .right_lines
+                .get(i)
+                .and_then(|rl| rl.points.get(j))
+                .map(|p| p.punkt_tag_id)
+                .filter(|&t| t > 0);
+            ids.push(existing.unwrap_or_else(|| doc.next_point_tag_id()));
+        }
+        line_pt_tag_ids.push(ids);
+    }
+
     let el = &mut doc.elements[elem_idx];
     let mut mirrored_right = Vec::with_capacity(el.left_lines.len());
     for (i, left) in el.left_lines.iter().enumerate() {
@@ -387,7 +504,10 @@ pub fn sync_mirrored_right_lines(doc: &mut FormDocument, elem_idx: usize) {
                 }
             }
         }
-        for pt in &mut r.points {
+        for (j, pt) in r.points.iter_mut().enumerate() {
+            if let Some(&tid) = line_pt_tag_ids.get(i).and_then(|v| v.get(j)) {
+                pt.punkt_tag_id = tid;
+            }
             for off in &mut pt.offsets {
                 off.x = -off.x;
             }
@@ -450,22 +570,35 @@ pub fn swap_left_right(doc: &mut FormDocument, elem_idx: usize) -> bool {
     std::mem::swap(&mut el.left_lines, &mut el.right_lines);
     std::mem::swap(&mut el.left_points, &mut el.right_points);
 
-    for l in el.left_lines.iter_mut().chain(el.right_lines.iter_mut()) {
-        l.stitches = -l.stitches;
-        l.width_mm = -l.width_mm;
-        l.step_x = -l.step_x;
-        l.rest_x = -l.rest_x;
-        if let Some(ref mut c) = l.curve {
-            for s in &mut c.steps {
-                s.step_width = -s.step_width;
+    let flip_side = |lines: &mut [LineSegment], target_right_even: bool| {
+        for l in lines.iter_mut() {
+            l.stitches = -l.stitches;
+            l.width_mm = -l.width_mm;
+            l.step_x = -l.step_x;
+            l.rest_x = -l.rest_x;
+            if let Some(ref mut c) = l.curve {
+                if l.single_system_curve && !c.steps.is_empty() {
+                    c.steps = mirror_curve_steps_single_system(&c.steps, target_right_even);
+                    for (idx, s) in c.steps.iter_mut().enumerate() {
+                        s.index = (idx + 1) as i32;
+                        s.tag_id = s.index;
+                        s.raw.original_header = Some(format!("[KurvenLinie] = {}", s.index));
+                    }
+                } else {
+                    for s in &mut c.steps {
+                        s.step_width = -s.step_width;
+                    }
+                }
+            }
+            for pt in &mut l.points {
+                for off in &mut pt.offsets {
+                    off.x = -off.x;
+                }
             }
         }
-        for pt in &mut l.points {
-            for off in &mut pt.offsets {
-                off.x = -off.x;
-            }
-        }
-    }
+    };
+    flip_side(&mut el.left_lines, false);
+    flip_side(&mut el.right_lines, true);
 
     for pt in el.left_points.iter_mut().chain(el.right_points.iter_mut()) {
         for off in &mut pt.offsets {
@@ -542,9 +675,11 @@ pub fn apply_directives_to_lines(
             };
             if let Some(ref c) = line.curve {
                 if !c.steps.is_empty() {
-                    let form = CurveForm::from_id(c.function);
+                    let stored_form = CurveForm::from_id(c.function);
+                    let detected = detect_curve_formula_from_steps(c, side, line.single_system_curve);
+                    let eff_form = detected.map(|d| d.form).unwrap_or(stored_form);
                     if matches!(
-                        form,
+                        eff_form,
                         CurveForm::Line | CurveForm::Step | CurveForm::JCurve | CurveForm::SCurve
                     ) {
                         let step_mag = match line.function {
@@ -552,7 +687,7 @@ pub fn apply_directives_to_lines(
                                 directive_narrowing.abs().max(1)
                             }
                             LineFunction::Widening => directive_widening.abs().max(1),
-                            _ => 1,
+                            _ => detected.map(|d| d.step_x_mag).unwrap_or(1),
                         };
                         let (nw, ww, fw) =
                             resolve_curve_module_widths(line, std_nw, std_ww, std_fw);
@@ -561,11 +696,27 @@ pub fn apply_directives_to_lines(
                                 LineSide::Left => CourseParityMode::SingleSystemLeftOdd,
                                 LineSide::Right => CourseParityMode::SingleSystemRightEven,
                             }
+                        } else if detected.is_some_and(|d| d.even_courses) {
+                            CourseParityMode::EvenCourses
                         } else {
                             CourseParityMode::Any
                         };
+                        let reverse_j = detected.is_some_and(|d| d.reverse_j);
+                        let min_h = detected.map(|d| d.min_step_height).unwrap_or(0);
+                        let drive = detected
+                            .map(|d| d.step_drive)
+                            .unwrap_or(CurveStepDrive::ByWidth);
+                        let sy = if drive == CurveStepDrive::ByHeight {
+                            if directive_height > 0 {
+                                directive_height.abs()
+                            } else {
+                                detected.map(|d| d.step_y_mag).unwrap_or(1)
+                            }
+                        } else {
+                            directive_height.max(0)
+                        };
                         let steps = generate_curve_steps(&CurveGenParams {
-                            curve_form: form,
+                            curve_form: eff_form,
                             total_dx: line.stitches,
                             total_dy: line.rows,
                             step_x: if line.stitches < 0 {
@@ -573,14 +724,22 @@ pub fn apply_directives_to_lines(
                             } else {
                                 step_mag
                             },
-                            step_y: directive_height.max(0),
+                            step_y: sy,
                             narrowing_width: nw,
                             widening_width: ww,
                             fade_out_width: fw,
                             parity_mode,
-                            ..Default::default()
+                            step_drive: drive,
+                            reverse_j,
+                            min_step_height: min_h,
                         });
-                        apply_curve_to_line(line, &hdr, form, steps);
+                        let custom = reverse_j
+                            || parity_mode != CourseParityMode::Any
+                            || min_h > 0
+                            || drive == CurveStepDrive::ByHeight
+                            || step_mag != 1;
+                        let save_form = if custom { CurveForm::UserCurve } else { eff_form };
+                        apply_curve_to_line(line, &hdr, save_form, steps);
                         modified += 1;
                     }
                     continue;
@@ -933,9 +1092,10 @@ pub fn update_or_append_closing_line(
             line.rows = 0;
             line.last_line = 0;
             line.default_widening = 1;
-            line.default_used = 0;
-            line.function = LineFunction::None;
-            line.user_set_function = false;
+            if !line.user_set_function {
+                line.default_used = 0;
+                line.function = LineFunction::None;
+            }
             recalc_line_from_stitches_and_rows(line, &hdr);
         }
         idx
@@ -1029,22 +1189,39 @@ pub fn auto_sync_closing_line_for_side(
             }
         }
         if let Some(c_idx) = existing_closing {
-            let sum_others: i32 = lines[..c_idx].iter().map(|l| l.stitches).sum();
-            let target_stitches = -sum_others;
+            let use_mm = hdr.input_format == InputFormat::Mm;
+            let sum_others_st: i32 = lines[..c_idx].iter().map(|l| l.stitches).sum();
+            let sum_others_mm: f64 = lines[..c_idx].iter().map(|l| l.width_mm).sum();
+            let target_stitches = -sum_others_st;
+            let target_width_mm = crate::math::units::round2(-sum_others_mm);
             if let Some(line) = lines.get_mut(c_idx) {
-                if line.stitches != target_stitches
-                    || line.rows != 0
-                    || line.last_line != 0
-                    || line.default_widening != 1
-                {
-                    line.stitches = target_stitches;
-                    line.rows = 0;
+                let needs_update = if use_mm {
+                    (line.width_mm - target_width_mm).abs() > 1e-3
+                        || line.height_mm.abs() > 1e-3
+                        || line.rows != 0
+                        || line.last_line != 0
+                        || line.default_widening != 1
+                } else {
+                    line.stitches != target_stitches
+                        || line.rows != 0
+                        || line.last_line != 0
+                        || line.default_widening != 1
+                };
+                if needs_update {
                     line.last_line = 0;
                     line.default_widening = 1;
                     if !line.user_set_function && line.function == LineFunction::None {
                         line.default_used = 0;
                     }
-                    recalc_line_from_stitches_and_rows(line, &hdr);
+                    if use_mm {
+                        line.width_mm = target_width_mm;
+                        line.height_mm = 0.0;
+                        crate::math::units::recalc_line_from_mm(line, &hdr);
+                    } else {
+                        line.stitches = target_stitches;
+                        line.rows = 0;
+                        recalc_line_from_stitches_and_rows(line, &hdr);
+                    }
                     changed = true;
                 }
             }
@@ -1072,7 +1249,8 @@ pub fn ensure_closing_line_for_side(
         return true;
     }
     let hdr = doc.header.clone();
-    let (existing_closing, has_height, sum_x, is_mirrored) = {
+    let use_mm = hdr.input_format == InputFormat::Mm;
+    let (existing_closing, has_height, sum_x, sum_mm, is_mirrored) = {
         let Some(el) = doc.elements.get(elem_idx) else {
             return false;
         };
@@ -1081,11 +1259,13 @@ pub fn ensure_closing_line_for_side(
             return false;
         }
         let closing = closing_line_index(el, side);
-        let has_h = lines.iter().any(|l| l.rows != 0);
+        let has_h = lines.iter().any(|l| l.rows != 0 || l.height_mm.abs() > 1e-3);
         let sx: i32 = lines.iter().map(|l| l.stitches).sum();
-        (closing, has_h, sx, el.mirrored)
+        let smm: f64 = lines.iter().map(|l| l.width_mm).sum();
+        (closing, has_h, sx, smm, el.mirrored)
     };
-    if existing_closing.is_some() || !has_height || sum_x == 0 {
+    let is_open = if use_mm { sum_mm.abs() > 1e-3 } else { sum_x != 0 };
+    if existing_closing.is_some() || !has_height || !is_open {
         return false;
     }
     let tag_id = doc.next_line_tag_id();
@@ -1101,7 +1281,9 @@ pub fn ensure_closing_line_for_side(
         index: (pos + 1) as i32,
         tag_id,
         stitches: -sum_x,
+        width_mm: crate::math::units::round2(-sum_mm),
         rows: 0,
+        height_mm: 0.0,
         function: LineFunction::None,
         user_set_function: false,
         last_line: 0,
@@ -1111,7 +1293,11 @@ pub fn ensure_closing_line_for_side(
         child_order: Vec::new(),
         ..LineSegment::default()
     };
-    recalc_line_from_stitches_and_rows(&mut closing, &hdr);
+    if use_mm {
+        crate::math::units::recalc_line_from_mm(&mut closing, &hdr);
+    } else {
+        recalc_line_from_stitches_and_rows(&mut closing, &hdr);
+    }
     lines.push(closing);
     if side == LineSide::Right {
         el.has_right_lines_section = true;
@@ -1276,5 +1462,49 @@ pub fn apply_standard_widths_to_all(
         doc.dirty = true;
     }
     modified_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::geometry::set_element_distance_from_bottom;
+
+    #[test]
+    fn test_gore_and_marking_elements_have_no_baseline_or_auto_raglan() {
+        let mut doc = FormDocument::new_default_template();
+        let hdr = doc.header.clone();
+        // Basic element with height 260 rows
+        let b0 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+        assert_eq!(doc.elements[0].left_lines[b0].function, LineFunction::BaseLine);
+        let b1 = append_line(&mut doc, 0, LineSide::Left).unwrap();
+        doc.elements[0].left_lines[b1].rows = 260;
+        recalc_line_from_stitches_and_rows(&mut doc.elements[0].left_lines[b1], &hdr);
+
+        // Add Tiktak (Gore = 5) and append a line (40, 16)
+        let gore_idx = add_element(&mut doc, ElementType::Gore, None);
+        assert!((doc.elements[gore_idx].start_width - 500.0).abs() < 1e-6);
+        let g0 = append_line(&mut doc, gore_idx, LineSide::Left).unwrap();
+        assert_ne!(doc.elements[gore_idx].left_lines[g0].function, LineFunction::BaseLine);
+        assert_eq!(doc.elements[gore_idx].left_lines[g0].rows, 0);
+
+        doc.elements[gore_idx].left_lines[g0].stitches = 40;
+        doc.elements[gore_idx].left_lines[g0].rows = 16;
+        recalc_line_from_stitches_and_rows(&mut doc.elements[gore_idx].left_lines[g0], &hdr);
+        auto_detect_line_function_in_context(
+            &mut doc.elements[gore_idx].left_lines[g0],
+            true,
+            false,
+            true,
+            ElementType::Gore,
+        );
+        assert_eq!(doc.elements[gore_idx].left_lines[g0].function, LineFunction::None);
+
+        // Setting Y offset from bottom updates offset_y_rows (keeping offset_y_mm untouched in Stitches mode, matching Stoll BUG-02)
+        // and updates offset_y_mm when in Mm mode.
+        set_element_distance_from_bottom(&mut doc, gore_idx, 200.0, false).unwrap();
+        assert_eq!(doc.elements[gore_idx].offset_y_rows, 200.0);
+        set_element_distance_from_bottom(&mut doc, gore_idx, 100.0, true).unwrap();
+        assert!((doc.elements[gore_idx].offset_y_mm - 100.0).abs() < 0.02);
+    }
 }
 

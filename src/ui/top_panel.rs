@@ -11,8 +11,8 @@ use crate::ui::theme::{
     win32_radio,
 };
 use crate::ui::{
-    shape_cut_type_label_tr, show_modal_backdrop, show_studio_modal_window, AppAction, UiState,
-    SHAPE_CUT_TYPES,
+    shape_cut_type_label_tr, show_modal_backdrop, show_studio_modal_window, AppAction, SignMode,
+    UiState, SHAPE_CUT_TYPES,
 };
 
 /// Compact `Boy (May)` (LEFT) and `En (İğne)` (RIGHT) summary strip at the top of the Right Pane.
@@ -32,6 +32,11 @@ pub fn show_summary_strip(
         LineSide::Left
     } else {
         state.active_table_side
+    };
+    let x_sign = if matches!((state.sign_mode, side), (SignMode::Knitting, LineSide::Left)) {
+        -1
+    } else {
+        1
     };
 
     enum SummaryData {
@@ -169,8 +174,8 @@ pub fn show_summary_strip(
                         count: rows.len(),
                         dy_s: sum_dy.to_string(),
                         dy_cm: format!("{:.1}", sum_dy_mm / 10.0),
-                        dx_s: sum_dx.to_string(),
-                        dx_cm: format!("{:.1}", sum_dx_mm / 10.0),
+                        dx_s: (sum_dx * x_sign).to_string(),
+                        dx_cm: format!("{:.1}", (sum_dx_mm * (x_sign as f64)) / 10.0),
                     })
                 } else {
                     let r = rows[0];
@@ -179,6 +184,8 @@ pub fn show_summary_strip(
                     let ex = seg.end_mm.x / 10.0;
                     let sy = seg.start_mm.y / 10.0;
                     let ey = seg.end_mm.y / 10.0;
+                    let dx_st_disp = seg.delta_st.0 * x_sign;
+                    let dx_cm_disp = (ex - sx) * (x_sign as f64);
                     Some(SummaryData::Single {
                         no_lbl: format!("#{}", r + 1),
                         sy_s: seg.start_st.1.to_string(),
@@ -189,10 +196,10 @@ pub fn show_summary_strip(
                         dy_cm: format!("{:.1}", ey - sy),
                         sx_s: seg.start_st.0.to_string(),
                         ex_s: seg.end_st.0.to_string(),
-                        dx_s: seg.delta_st.0.to_string(),
+                        dx_s: dx_st_disp.to_string(),
                         sx_cm: format!("{sx:.1}"),
                         ex_cm: format!("{ex:.1}"),
-                        dx_cm: format!("{:.1}", ex - sx),
+                        dx_cm: format!("{dx_cm_disp:.1}"),
                     })
                 }
             })

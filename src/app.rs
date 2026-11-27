@@ -12,12 +12,12 @@ use stoll_kalip_editoru::io::{import_dxf_file, load_file, save_file};
 use stoll_kalip_editoru::math::{
     add_element, append_line, apply_standard_preset_to_line, auto_sync_closing_lines,
     convert_input_format, copy_line, copy_markers, delete_element, delete_line,
-    ensure_all_closing_lines, ensure_closing_line_for_side, evaluate_document_geometry,
-    import_external_table_lines, insert_line_before, paste_insert_line, paste_insert_markers,
-    paste_line, paste_replace_markers, recalc_document_for_density_change,
-    recalc_line_from_stitches_and_rows, renumber_points, snapshot_endline_distances,
-    swap_left_right, sync_all_endline_elements, sync_all_mirrored_elements,
-    sync_mirrored_right_lines, validate_document, DocumentGeometry,
+    element_auto_detects_shaping, element_has_base_line, ensure_all_closing_lines,
+    ensure_closing_line_for_side, evaluate_document_geometry, import_external_table_lines,
+    insert_line_before, paste_insert_line, paste_insert_markers, paste_line, paste_replace_markers,
+    recalc_document_for_density_change, recalc_line_from_stitches_and_rows, renumber_points,
+    snapshot_endline_distances, swap_left_right, sync_all_endline_elements,
+    sync_all_mirrored_elements, sync_mirrored_right_lines, validate_document, DocumentGeometry,
 };
 use stoll_kalip_editoru::model::{
     ElementType, FormDocument, FormHeader, InputFormat, LineFunction, LineSide, PointEntry,
@@ -527,27 +527,17 @@ impl KalipEditorApp {
                     }
                 }
                 AppAction::OpenShpx => {
-                    self.prompt_open_dialog("Stoll Kalıp (*.shp, *.shv)", &["shp", "shv"]);
+                    if self.doc.dirty {
+                        self.state.pending_dirty_action = Some(PendingDirtyAction::OpenShpx);
+                    } else {
+                        self.prompt_open_dialog("Stoll Kalıp (*.shp, *.shv)", &["shp", "shv"]);
+                    }
                 }
                 AppAction::ImportDxf => {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("DXF 2D Kontur (*.dxf)", &["dxf"])
-                        .pick_file()
-                    {
-                        match import_dxf_file(&p) {
-                            Ok(loaded) => {
-                                self.doc = loaded;
-                                self.undo.clear();
-                                self.reset_document_ui_state();
-                                self.state.set_status(
-                                    format!("DXF içe aktarıldı: {}", p.display()),
-                                    false,
-                                );
-                            }
-                            Err(e) => {
-                                self.state.set_status(format!("DXF hatası: {e}"), true);
-                            }
-                        }
+                    if self.doc.dirty {
+                        self.state.pending_dirty_action = Some(PendingDirtyAction::ImportDxf);
+                    } else {
+                        self.prompt_import_dxf();
                     }
                 }
                 AppAction::OpenPath(path) => {
@@ -772,12 +762,14 @@ impl KalipEditorApp {
                         .get(self.state.selected_elem)
                         .map(|e| e.lines(side).is_empty())
                         .unwrap_or(false);
-                    let is_basic = self
+                    let elem_type = self
                         .doc
                         .elements
                         .get(self.state.selected_elem)
-                        .map(|e| e.element_type() == ElementType::BasicShape)
-                        .unwrap_or(true);
+                        .map(|e| e.element_type())
+                        .unwrap_or(ElementType::BasicShape);
+                    let has_base = element_has_base_line(elem_type);
+                    let auto_shaping = element_auto_detects_shaping(elem_type);
                     self.push_undo("Çizgi ekle");
                     if let Some(pos) = append_line(&mut self.doc, self.state.selected_elem, side) {
                         if was_empty && pos == 0 {
@@ -796,34 +788,36 @@ impl KalipEditorApp {
                                     line.stitches = if side == LineSide::Left { -80 } else { 80 };
                                     recalc_line_from_stitches_and_rows(line, &hdr);
                                 }
-                            } else if !is_basic {
+                            } else if !has_base && auto_shaping {
                                 self.maybe_apply_default_template_to_line(side, pos);
                             }
-                        } else if pos > 0 {
+                        } else if pos > 0 && auto_shaping {
                             self.maybe_apply_default_template_to_line(side, pos);
                         }
                         self.sync_current_if_mirrored();
                         auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
-                        self.state.focused_cell = Some((pos, if was_empty && is_basic { 3 } else { 2 }));
+                        self.state.focused_cell = Some((pos, if was_empty && has_base { 3 } else { 2 }));
                     }
                 }
                 AppAction::InsertLineBefore => {
                     self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
-                    let is_basic = self
+                    let elem_type = self
                         .doc
                         .elements
                         .get(self.state.selected_elem)
-                        .map(|e| e.element_type() == ElementType::BasicShape)
-                        .unwrap_or(true);
+                        .map(|e| e.element_type())
+                        .unwrap_or(ElementType::BasicShape);
+                    let has_base = element_has_base_line(elem_type);
+                    let auto_shaping = element_auto_detects_shaping(elem_type);
                     let was_empty = self
                         .doc
                         .elements
                         .get(self.state.selected_elem)
                         .map(|e| e.lines(side).is_empty())
                         .unwrap_or(false);
-                    let row = if is_basic {
+                    let row = if has_base {
                         self.state.primary_row().unwrap_or(1).max(1)
                     } else {
                         self.state.primary_row().unwrap_or(0)
@@ -848,29 +842,39 @@ impl KalipEditorApp {
                                     line.stitches = if side == LineSide::Left { -80 } else { 80 };
                                     recalc_line_from_stitches_and_rows(line, &hdr);
                                 }
-                            } else if !is_basic {
+                            } else if !has_base && auto_shaping {
                                 self.maybe_apply_default_template_to_line(side, pos);
                             }
-                        } else if pos > 0 || !is_basic {
+                        } else if (pos > 0 || !has_base) && auto_shaping {
                             self.maybe_apply_default_template_to_line(side, pos);
                         }
                         self.sync_current_if_mirrored();
                         auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
-                        self.state.focused_cell = Some((pos, if was_empty && is_basic { 3 } else { 2 }));
+                        self.state.focused_cell = Some((pos, if was_empty && has_base { 3 } else { 2 }));
                     }
                 }
                 AppAction::QuickStartTemel => {
                     self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
-                    self.push_undo("Temel çizgi ekle");
+                    let has_base = self
+                        .doc
+                        .elements
+                        .get(self.state.selected_elem)
+                        .map(|e| element_has_base_line(e.element_type()))
+                        .unwrap_or(false);
+                    self.push_undo(if has_base { "Temel çizgi ekle" } else { "Çizgi ekle" });
                     if let Some(pos) = append_line(&mut self.doc, self.state.selected_elem, side) {
                         let hdr = self.doc.header.clone();
                         if let Some(line) = self.doc.elements[self.state.selected_elem]
                             .lines_mut(side)
                             .get_mut(pos)
                         {
-                            line.function = LineFunction::BaseLine;
+                            line.function = if has_base {
+                                LineFunction::BaseLine
+                            } else {
+                                LineFunction::None
+                            };
                             line.rows = 0;
                             line.stitches = if side == LineSide::Left { -80 } else { 80 };
                             recalc_line_from_stitches_and_rows(line, &hdr);
@@ -879,18 +883,36 @@ impl KalipEditorApp {
                         auto_sync_closing_lines(&mut self.doc);
                         self.state.select_single_row(pos);
                         self.state.focused_cell = Some((pos, 3));
-                        self.state.set_status("Temel çizgi eklendi.", false);
+                        self.state.set_status(
+                            if has_base {
+                                "Temel çizgi eklendi."
+                            } else {
+                                "Başlangıç çizgisi eklendi."
+                            },
+                            false,
+                        );
                     }
                 }
                 AppAction::QuickStartRectangle => {
                     self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
+                    let has_base = self
+                        .doc
+                        .elements
+                        .get(self.state.selected_elem)
+                        .map(|e| element_has_base_line(e.element_type()))
+                        .unwrap_or(false);
                     self.push_undo("Dikdörtgen kalıp taslağı");
                     let endline_dists = snapshot_endline_distances(&self.doc);
                     let hdr = self.doc.header.clone();
                     let base_dx = if side == LineSide::Left { -80 } else { 80 };
+                    let first_fn = if has_base {
+                        LineFunction::BaseLine
+                    } else {
+                        LineFunction::None
+                    };
                     let spec = [
-                        (LineFunction::BaseLine, 0, base_dx, false),
+                        (first_fn, 0, base_dx, false),
                         (LineFunction::None, 120, 0, false),
                         (LineFunction::None, 0, -base_dx, true),
                     ];
@@ -1243,8 +1265,9 @@ impl KalipEditorApp {
                 AppAction::AddClosingLine => {
                     self.state.editing_cell = None;
                     let side = self.state.table_mode.side();
-                    self.push_undo("Bitiş çizgisi");
+                    let snap = self.doc.clone();
                     if ensure_closing_line_for_side(&mut self.doc, self.state.selected_elem, side) {
+                        self.undo.push("Bitiş çizgisi", &snap);
                         self.sync_current_if_mirrored();
                         if let Some(el) = self.doc.elements.get(self.state.selected_elem) {
                             let last = el.lines(side).len().saturating_sub(1);
@@ -1260,27 +1283,52 @@ impl KalipEditorApp {
                     let presets = self.catalog.presets(self.state.preset_is_user);
                     if let Some(preset) = presets.get(self.state.selected_preset_idx).cloned() {
                         let side = self.state.table_mode.side();
-                        let rows = self.state.selected_rows.clone();
                         let copy_comment = self.state.preset_name_as_comment;
-                        self.push_undo("Standart özellikler devir al");
-                        if let Some(el) = self.doc.elements.get_mut(self.state.selected_elem) {
-                            let lines = el.lines_mut(side);
-                            for r in rows {
-                                if let Some(target) = lines.get_mut(r) {
-                                    apply_standard_preset_to_line(target, &preset.template_line);
-                                    if copy_comment && !preset.template_line.comment.is_empty() {
-                                        target.comment = preset.template_line.comment.clone();
+                        let target_rows: Vec<usize> = self
+                            .doc
+                            .elements
+                            .get(self.state.selected_elem)
+                            .map(|el| {
+                                let closing_idx =
+                                    stoll_kalip_editoru::math::closing_line_index(el, side);
+                                self.state
+                                    .selected_rows
+                                    .iter()
+                                    .copied()
+                                    .filter(|&r| {
+                                        r < el.lines(side).len()
+                                            && !el.is_base_line_row(side, r)
+                                            && closing_idx != Some(r)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if target_rows.is_empty() {
+                            self.state.set_status(
+                                "Şablon uygulamak için temel/bitiş dışında en az bir satır seçin.",
+                                true,
+                            );
+                        } else {
+                            self.push_undo("Standart özellikler devir al");
+                            if let Some(el) = self.doc.elements.get_mut(self.state.selected_elem) {
+                                let lines = el.lines_mut(side);
+                                for r in target_rows {
+                                    if let Some(target) = lines.get_mut(r) {
+                                        apply_standard_preset_to_line(target, &preset.template_line);
+                                        if copy_comment && !preset.template_line.comment.is_empty() {
+                                            target.comment = preset.template_line.comment.clone();
+                                        }
                                     }
                                 }
+                                self.doc.dirty = true;
                             }
-                            self.doc.dirty = true;
+                            self.sync_current_if_mirrored();
+                            auto_sync_closing_lines(&mut self.doc);
+                            self.state.set_status(
+                                format!("Standart özellik uygulandı: {}", preset.display_name),
+                                false,
+                            );
                         }
-                        self.sync_current_if_mirrored();
-                        auto_sync_closing_lines(&mut self.doc);
-                        self.state.set_status(
-                            format!("Standart özellik uygulandı: {}", preset.display_name),
-                            false,
-                        );
                     }
                 }
                 AppAction::MirrorToggled(new_val) => {
@@ -1508,6 +1556,9 @@ impl KalipEditorApp {
         };
         let copy_comment = self.state.preset_name_as_comment;
         if let Some(el) = self.doc.elements.get_mut(self.state.selected_elem) {
+            if !element_auto_detects_shaping(el.element_type()) {
+                return;
+            }
             if let Some(target) = el.lines_mut(side).get_mut(pos) {
                 let is_closing = target.rows == 0 && target.default_widening == 1;
                 if target.function != LineFunction::BaseLine && !is_closing {
@@ -1614,6 +1665,28 @@ impl KalipEditorApp {
         self.state.set_status("Yeni kalıp oluşturuldu.", false);
     }
 
+    fn prompt_import_dxf(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("DXF 2D Kontur (*.dxf)", &["dxf"])
+            .pick_file()
+        {
+            match import_dxf_file(&p) {
+                Ok(loaded) => {
+                    self.doc = loaded;
+                    self.undo.clear();
+                    self.reset_document_ui_state();
+                    self.state.set_status(
+                        format!("DXF içe aktarıldı: {}", p.display()),
+                        false,
+                    );
+                }
+                Err(e) => {
+                    self.state.set_status(format!("DXF hatası: {e}"), true);
+                }
+            }
+        }
+    }
+
     fn prompt_open_dialog(&mut self, filter_label: &str, exts: &[&str]) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(filter_label, exts)
@@ -1706,9 +1779,7 @@ impl KalipEditorApp {
         let tmp_path = std::env::temp_dir().join("kalipeditor_print.html");
         match std::fs::write(&tmp_path, html) {
             Ok(()) => {
-                let _ = std::process::Command::new("cmd")
-                    .args(["/C", "start", "", &tmp_path.to_string_lossy()])
-                    .spawn();
+                stoll_kalip_editoru::updater::open_local_file(&tmp_path);
                 self.state
                     .set_status(format!("Yazdırma raporu açıldı: {}", tmp_path.display()), false);
             }
@@ -1831,6 +1902,10 @@ impl KalipEditorApp {
                         PendingDirtyAction::OpenShp => {
                             self.prompt_open_dialog("Stoll İlmek Kalıbı (*.shp)", &["shp", "shv"]);
                         }
+                        PendingDirtyAction::OpenShpx => {
+                            self.prompt_open_dialog("Stoll Kalıp (*.shp, *.shv)", &["shp", "shv"]);
+                        }
+                        PendingDirtyAction::ImportDxf => self.prompt_import_dxf(),
                         PendingDirtyAction::OpenPath(p) => self.open_file_from_path(p),
                         PendingDirtyAction::OpenPresetPath { path, is_user } => {
                             self.open_preset_path(path, is_user);
@@ -2496,8 +2571,15 @@ impl eframe::App for KalipEditorApp {
             self.track_window_geometry(ctx);
         }
 
-        // Intercept OS window close when document has unsaved edits
+        // Intercept OS window close when document has unsaved edits (flush active grid edit first!)
         let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested && !self.allow_close {
+            crate::ui::grid_table::flush_active_grid_edit(
+                &mut self.doc,
+                &mut self.undo,
+                &mut self.state,
+            );
+        }
         if close_requested && self.doc.dirty && !self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.state.pending_dirty_action = Some(PendingDirtyAction::Exit);
@@ -2531,8 +2613,7 @@ impl eframe::App for KalipEditorApp {
                 show_menu_bar(
                     ui,
                     &mut self.doc,
-                    self.undo.can_undo(),
-                    self.undo.can_redo(),
+                    &mut self.undo,
                     &mut self.state,
                     &mut actions,
                 );
@@ -2552,8 +2633,7 @@ impl eframe::App for KalipEditorApp {
                 show_toolbar(
                     ui,
                     &mut self.doc,
-                    self.undo.can_undo(),
-                    self.undo.can_redo(),
+                    &mut self.undo,
                     &mut self.state,
                     available_update_tag.as_deref(),
                     &mut actions,

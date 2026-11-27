@@ -475,10 +475,22 @@ impl PointMultiplyDialogState {
                 }
             }
             MultiplyDirection::Symmetric => {
-                let half = (n as i32) / 2;
-                for i in 0..n {
-                    let offset_k = (i as i32) - half;
-                    out.push((base_x + dx * offset_k, base_y + dy * offset_k));
+                if self.keep_source {
+                    let half = (n as i32) / 2;
+                    for i in 0..n {
+                        let offset_k = (i as i32) - half;
+                        out.push((base_x + dx * offset_k, base_y + dy * offset_k));
+                    }
+                } else {
+                    // Omit offset 0 (source point) when keep_source is unchecked
+                    let left_cnt = n / 2;
+                    for k in (1..=left_cnt).rev() {
+                        out.push((base_x - dx * (k as i32), base_y - dy * (k as i32)));
+                    }
+                    let right_cnt = n - left_cnt;
+                    for k in 1..=right_cnt {
+                        out.push((base_x + dx * (k as i32), base_y + dy * (k as i32)));
+                    }
                 }
             }
         }
@@ -521,6 +533,12 @@ impl PointMultiplyDialogState {
         };
 
         let base_template = template.unwrap_or_default();
+        let orig_tag_id = base_template.punkt_tag_id;
+        let sym_orig_idx = if self.keep_source && self.direction == MultiplyDirection::Symmetric {
+            Some(coords.len() / 2)
+        } else {
+            None
+        };
         let insert_at = if req.marker_idx < pts.len() {
             if self.keep_source && self.direction != MultiplyDirection::Symmetric {
                 // Update source group if requested, insert generated copies right after
@@ -546,9 +564,13 @@ impl PointMultiplyDialogState {
         };
 
         let mut new_entries = Vec::with_capacity(slice.len());
-        for &(x, y) in slice {
+        for (i, &(x, y)) in slice.iter().enumerate() {
             let mut entry = base_template.clone();
-            entry.punkt_tag_id = doc.next_point_tag_id();
+            if sym_orig_idx == Some(i) && orig_tag_id > 0 {
+                entry.punkt_tag_id = orig_tag_id;
+            } else {
+                entry.punkt_tag_id = doc.next_point_tag_id();
+            }
             if self.group_generated {
                 entry.gruppe_tag_id = next_group_id;
             }

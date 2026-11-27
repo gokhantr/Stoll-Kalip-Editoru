@@ -185,15 +185,9 @@ impl LinePropsDialogState {
                 self.original = line.clone();
                 self.working = line.clone();
                 self.active_req = Some(req);
-                let new_func = line.function;
                 let prev_tab_enabled = match prev_tab {
                     0 | 4 | 5 | 6 => true,
-                    1 => matches!(new_func, LineFunction::Narrowing | LineFunction::NarrowingMulti),
-                    2 => new_func == LineFunction::Widening,
-                    3 => matches!(
-                        new_func,
-                        LineFunction::BindOff | LineFunction::NarrowingMulti
-                    ),
+                    1 | 2 | 3 => !is_base_line,
                     7 => is_kw,
                     _ => false,
                 };
@@ -317,7 +311,7 @@ impl LinePropsDialogState {
                     .inner_margin(Margin::same(8))
                     .show(ui, |ui| {
                         // ── 1. Classic Win32 8-Tab Strip (`222026.png` – `222125.png`) ──
-                        self.show_tab_strip(ui, is_kw);
+                        self.show_tab_strip(ui, is_kw, is_base_line);
 
                         // ── 2. Active Tab Body inside classic raised white/light tab pane ─
                         Frame::NONE
@@ -343,8 +337,8 @@ impl LinePropsDialogState {
                                         is_kw,
                                         elem_art_id,
                                     ),
-                                    2 => self.show_tab_artirma(ui, ctx, catalog, &doc_ext_modules),
-                                    3 => self.show_tab_remayozleme(ui, ctx, catalog, &doc_ext_modules),
+                                    2 => self.show_tab_artirma(ui, ctx, catalog, &doc_ext_modules, is_kw),
+                                    3 => self.show_tab_remayozleme(ui, ctx, catalog, &doc_ext_modules, is_kw),
                                     4 => self.show_tab_kenar_duzeltme(ui, ctx, catalog, &doc_ext_modules),
                                     5 => self.show_tab_point(
                                         ui,
@@ -440,6 +434,12 @@ impl LinePropsDialogState {
         if do_apply {
             if self.working != self.original {
                 undo.push("Çizgi özellikleri", doc);
+                // Ensure any newly created line-attached `[Punkt]` gets a unique `PunktTagId`
+                for pt in &mut self.working.points {
+                    if pt.punkt_tag_id <= 0 {
+                        pt.punkt_tag_id = doc.next_point_tag_id();
+                    }
+                }
                 if let Some(el) = doc.elements.get_mut(req.elem_idx) {
                     if let Some(target) = el.lines_mut(req.side).get_mut(req.line_idx) {
                         *target = self.working.clone();
@@ -467,30 +467,129 @@ impl LinePropsDialogState {
 
     /// Determine whether a tab is enabled/active for the current `working.function`,
     /// and whether it shows the Stoll active-function checkmark `✓` (`formtable.dll` `0x1007dc38..0x1007dd11`, `0x1007ce60`).
-    fn tab_visual_state(&self, tab_idx: usize, is_kw: bool) -> (bool, bool) {
+    fn tab_visual_state(&self, tab_idx: usize, is_kw: bool, is_base_line: bool) -> (bool, bool) {
         let f = self.working.function;
         match tab_idx {
             0 | 4 | 5 | 6 => (true, false),
-            1 => {
-                let active = f == LineFunction::Narrowing;
-                (active, active)
-            }
-            2 => {
-                let active = f == LineFunction::Widening;
-                (active, active)
-            }
-            3 => {
-                let active = matches!(f, LineFunction::BindOff | LineFunction::NarrowingMulti);
-                // Enabled when Remayözleme / K&W Tiktak (`9`) is active OR when jumped to from Reglan
-                let enabled = active || self.active_tab == 3;
-                (enabled, active)
-            }
+            1 => (
+                !is_base_line,
+                matches!(f, LineFunction::Narrowing | LineFunction::NarrowingMulti),
+            ),
+            2 => (!is_base_line, f == LineFunction::Widening),
+            3 => (!is_base_line, f == LineFunction::BindOff),
             7 => (is_kw, false),
             _ => (true, false),
         }
     }
 
-    fn show_tab_strip(&mut self, ui: &mut Ui, is_kw: bool) {
+    fn switch_to_tab(&mut self, idx: usize, is_base_line: bool) {
+        self.active_tab = idx;
+        if is_base_line {
+            return;
+        }
+        match idx {
+            1 => {
+                if !matches!(
+                    self.working.function,
+                    LineFunction::Narrowing | LineFunction::NarrowingMulti
+                ) {
+                    self.working.function = LineFunction::Narrowing;
+                    self.working.user_set_function = true;
+                }
+                self.working.narrowing.get_or_insert_with(Default::default);
+                self.working.ensure_child_slot(KanteChildSlot::Narrowing);
+            }
+            2 => {
+                if self.working.function != LineFunction::Widening {
+                    self.working.function = LineFunction::Widening;
+                    self.working.user_set_function = true;
+                }
+                self.working.widening.get_or_insert_with(Default::default);
+                self.working.ensure_child_slot(KanteChildSlot::Widening);
+            }
+            3 => {
+                let keep_narrowing_bindoff = matches!(
+                    self.working.function,
+                    LineFunction::Narrowing | LineFunction::NarrowingMulti
+                ) && self.working.with_bind_off == Some(1);
+                if !keep_narrowing_bindoff && self.working.function != LineFunction::BindOff {
+                    self.working.function = LineFunction::BindOff;
+                    self.working.user_set_function = true;
+                }
+                self.working.binding_off.get_or_insert_with(Default::default);
+                self.working.ensure_child_slot(KanteChildSlot::BindingOff);
+            }
+            _ => {}
+        }
+    }
+
+    fn show_function_selector(
+        &mut self,
+        ui: &mut Ui,
+        id_salt: &str,
+        width: f32,
+        is_kw: bool,
+        is_base_line: bool,
+    ) {
+        let cur_lbl = self.working.function.label_tr();
+        ui.add_enabled_ui(!is_base_line, |ui| {
+            win32_combo_scope(ui, |ui| {
+                egui::ComboBox::from_id_salt(id_salt)
+                    .width(width)
+                    .selected_text(if cur_lbl.is_empty() { "(Yok)" } else { cur_lbl })
+                    .show_ui(ui, |ui| {
+                        let mut funcs: Vec<(LineFunction, &str)> = vec![
+                            (LineFunction::None, "(Yok)"),
+                            (LineFunction::Narrowing, "Reglan"),
+                            (LineFunction::Widening, "Artırma"),
+                            (LineFunction::BindOff, "Remayözleme"),
+                            (LineFunction::FadeOut, "Kenar düzeltimi"),
+                        ];
+                        if is_kw {
+                            funcs.push((LineFunction::NarrowingMulti, "Reglan M"));
+                        }
+                        for (func, lbl) in funcs {
+                            if ui
+                                .selectable_value(&mut self.working.function, func, lbl)
+                                .changed()
+                            {
+                                self.working.user_set_function = true;
+                                match func {
+                                    LineFunction::Narrowing | LineFunction::NarrowingMulti => {
+                                        self.working.narrowing.get_or_insert_with(Default::default);
+                                        self.working.ensure_child_slot(KanteChildSlot::Narrowing);
+                                    }
+                                    LineFunction::Widening => {
+                                        self.working.widening.get_or_insert_with(Default::default);
+                                        self.working.ensure_child_slot(KanteChildSlot::Widening);
+                                    }
+                                    LineFunction::BindOff => {
+                                        self.working.binding_off.get_or_insert_with(Default::default);
+                                        self.working.ensure_child_slot(KanteChildSlot::BindingOff);
+                                    }
+                                    LineFunction::FadeOut => {
+                                        self.working.fade_out.get_or_insert_with(Default::default);
+                                        self.working.ensure_child_slot(KanteChildSlot::FadeOut);
+                                    }
+                                    _ => {}
+                                }
+                                if (1..=3).contains(&self.active_tab) {
+                                    self.active_tab = match func {
+                                        LineFunction::Narrowing | LineFunction::NarrowingMulti => 1,
+                                        LineFunction::Widening => 2,
+                                        LineFunction::BindOff => 3,
+                                        LineFunction::FadeOut => 4,
+                                        _ => 0,
+                                    };
+                                }
+                            }
+                        }
+                    });
+            });
+        });
+    }
+
+    fn show_tab_strip(&mut self, ui: &mut Ui, is_kw: bool, is_base_line: bool) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
             for (idx, &default_label) in TAB_LABELS.iter().enumerate() {
@@ -500,7 +599,8 @@ impl LinePropsDialogState {
                     default_label
                 };
                 let is_selected = self.active_tab == idx;
-                let (is_enabled_visual, has_check) = self.tab_visual_state(idx, is_kw);
+                let (is_enabled_visual, has_check) =
+                    self.tab_visual_state(idx, is_kw, is_base_line);
 
                 let text_galley = ui.painter().layout_no_wrap(
                     label.to_owned(),
@@ -579,7 +679,7 @@ impl LinePropsDialogState {
                 );
 
                 if resp.clicked() && is_enabled_visual {
-                    self.active_tab = idx;
+                    self.switch_to_tab(idx, is_base_line);
                 }
             }
         });
@@ -591,36 +691,7 @@ impl LinePropsDialogState {
         ui.horizontal(|ui| {
             ui.label("Fonksiyon:");
             ui.add_space(34.0);
-            let cur_lbl = match self.working.function {
-                LineFunction::NarrowingMulti => "Tiktak",
-                other => other.label_tr(),
-            };
-            ui.add_enabled_ui(!is_base_line, |ui| {
-                win32_combo_scope(ui, |ui| {
-                    egui::ComboBox::from_id_salt("lp_genel_func")
-                        .width(136.0)
-                        .selected_text(if cur_lbl.is_empty() { " " } else { cur_lbl })
-                        .show_ui(ui, |ui| {
-                            let mut funcs: Vec<(LineFunction, &str)> = vec![
-                                (LineFunction::None, "(Yok)"),
-                                (LineFunction::Narrowing, "Reglan"),
-                                (LineFunction::Widening, "Artırma"),
-                                (LineFunction::BindOff, "Remayözleme"),
-                            ];
-                            if is_kw {
-                                funcs.push((LineFunction::NarrowingMulti, "Tiktak"));
-                            }
-                            for (func, lbl) in funcs {
-                                if ui
-                                    .selectable_value(&mut self.working.function, func, lbl)
-                                    .changed()
-                                {
-                                    self.working.user_set_function = true;
-                                }
-                            }
-                        });
-                });
-            });
+            self.show_function_selector(ui, "lp_genel_func", 136.0, is_kw, is_base_line);
         });
 
         ui.add_space(16.0);
@@ -796,6 +867,7 @@ impl LinePropsDialogState {
                 if win32_int_edit(ui, "lp_reglan_bo_limit", &mut bo_limit, 40.0, 0..=999) {
                     let m = get_or_insert_module(&mut props.modules, struct_id);
                     m.bind_off_limit = bo_limit;
+                    self.working.with_bind_off = Some(if bo_limit > 0 { 1 } else { 0 });
                 }
                 ui.add_space(6.0);
                 if win32_button(ui, "Remayözleme >>", vec2(96.0, 21.0), true).clicked() {
@@ -895,6 +967,11 @@ impl LinePropsDialogState {
                     ui.separator();
                     ui.add_space(3.0);
                     win32_checkbox(ui, &mut props.use_module_color, "Modül rengi kullan");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Fonksiyon:");
+                        self.show_function_selector(ui, "lp_reglan_fn", 110.0, is_kw, false);
+                    });
                 });
             });
             // Crisp vertical divider matching `222038.png`
@@ -1084,6 +1161,7 @@ impl LinePropsDialogState {
         ctx: &egui::Context,
         catalog: &StollCatalog,
         choices: &[(String, String)],
+        is_kw: bool,
     ) {
         let mut props = self.working.widening.clone().unwrap_or_default();
         let before_props = props.clone();
@@ -1127,6 +1205,11 @@ impl LinePropsDialogState {
                 ui.vertical(|ui| {
                     ui.set_width(half_w - 6.0);
                     win32_checkbox(ui, &mut props.execute_immediately, "Artırmayı hemen uygula");
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Fonksiyon:");
+                        self.show_function_selector(ui, "lp_artirma_fn", 110.0, is_kw, false);
+                    });
                 });
                 div_x = ui.cursor().left() + 2.0;
                 ui.add_space(10.0);
@@ -1213,12 +1296,18 @@ impl LinePropsDialogState {
         ctx: &egui::Context,
         catalog: &StollCatalog,
         choices: &[(String, String)],
+        is_kw: bool,
     ) {
         let mut props = self.working.binding_off.clone().unwrap_or_default();
         let before_props = props.clone();
 
         win32_group_box_on(ui, "Genel", TAB_PANE_BG, |ui| {
-            win32_checkbox(ui, &mut props.use_module_color, "Modül rengi kullan");
+            ui.horizontal(|ui| {
+                win32_checkbox(ui, &mut props.use_module_color, "Modül rengi kullan");
+                ui.add_space(28.0);
+                ui.label("Fonksiyon:");
+                self.show_function_selector(ui, "lp_remayoz_fn", 110.0, is_kw, false);
+            });
         });
 
         ui.add_space(6.0);
@@ -1299,13 +1388,13 @@ impl LinePropsDialogState {
         let mut cur_guid = active_mod.id.clone();
         let mut width_changed = false;
         let has_valid_module = !cur_guid.is_empty() && !cur_guid.eq_ignore_ascii_case(ZERO_GUID);
-        let fade_width_enabled = for_all_flag && has_valid_module;
+        let fade_width_enabled = has_valid_module;
 
         ui.horizontal(|ui| {
             ui.add_enabled_ui(fade_width_enabled, |ui| {
                 ui.label("Kenar düzeltme eni:");
                 ui.add_space(12.0);
-                if win32_int_edit(ui, "lp_kenar_width", &mut width, 42.0, 1..=999) {
+                if win32_int_edit(ui, "lp_kenar_width", &mut width, 42.0, 0..=999) {
                     get_or_insert_module(&mut props.modules, active_id).width = width;
                     width_changed = true;
                 }
@@ -1428,19 +1517,30 @@ impl LinePropsDialogState {
         // Stoll `DIALOG 4271` / `4272`: only Normal (0), üst sol yaka kesimi (1), Delik (3) — never Alt kol kesimi (2).
         // On Tab 6 (`Bitiş`, 4272), disable `15727` when element is `Yaka Kesimi` (2) or `Kesim Yaka açıklığı` (7).
         let pt_func_enabled = !(point_slot == 1 && (elem_art_id == 2 || elem_art_id == 7));
+        let is_neckline_start = point_slot == 0 && (elem_art_id == 2 || elem_art_id == 7);
         win32_group_box_on(ui, "Fonksiyon", TAB_PANE_BG, |ui| {
             let cur_kind = PointKind::from_id(pt_copy.punkt_art_tag_id);
+            let cur_label = if is_neckline_start && pt_copy.punkt_art_tag_id == 3 {
+                "Yaka kesimi alt orta"
+            } else {
+                cur_kind.label_tr()
+            };
             ui.add_enabled_ui(pt_func_enabled, |ui| {
                 win32_combo_scope(ui, |ui| {
                     egui::ComboBox::from_id_salt(format!("lp_pt_func_{point_slot}"))
                         .width(210.0)
-                        .selected_text(cur_kind.label_tr())
+                        .selected_text(cur_label)
                         .show_ui(ui, |ui| {
                             for k in [PointKind::Normal, PointKind::TopLeftNeck, PointKind::Hole] {
+                                let lbl = if is_neckline_start && k == PointKind::Hole {
+                                    "Yaka kesimi alt orta"
+                                } else {
+                                    k.label_tr()
+                                };
                                 ui.selectable_value(
                                     &mut pt_copy.punkt_art_tag_id,
                                     k.to_id(),
-                                    k.label_tr(),
+                                    lbl,
                                 );
                             }
                         });
@@ -1464,7 +1564,8 @@ impl LinePropsDialogState {
 
         let id_tag = if point_slot == 0 { "baslama" } else { "bitis" };
         let effective_category = if point_slot == 0
-            && pt_copy.punkt_art_tag_id == PointKind::TopLeftNeck.to_id()
+            && (pt_copy.punkt_art_tag_id == PointKind::TopLeftNeck.to_id()
+                || (is_neckline_start && pt_copy.punkt_art_tag_id == 3))
         {
             PreviewCategory::PointStartVneck
         } else {
@@ -1501,12 +1602,20 @@ impl LinePropsDialogState {
         }
 
         let final_id = cur_struct as i32;
-        if guid_changed {
-            get_or_insert_module(&mut pt_copy.modules, final_id).id = cur_guid;
+        if guid_changed
+            || (for_all_flag && !pt_copy.modules.iter().any(|m| m.module_art_id == final_id))
+        {
+            let m = get_or_insert_module(&mut pt_copy.modules, final_id);
+            if guid_changed {
+                m.id = cur_guid;
+            }
         }
 
         // Only write back / materialize into `self.working.points` if user actually changed something!
         if pt_copy != before_copy {
+            if pt_copy.offsets.is_empty() {
+                pt_copy.offsets.push(PointOffset::default());
+            }
             if let Some(pos) = existing_pos {
                 self.working.points[pos] = pt_copy;
             } else {
@@ -3100,7 +3209,13 @@ impl NecklinePropsDialogState {
             if !has_line0 {
                 state.set_status("Yaka kesiminde henüz başlangıç çizgisi yok.", true);
             } else if self.working_point != self.orig_point {
+                if self.working_point.offsets.is_empty() {
+                    self.working_point.offsets.push(PointOffset::default());
+                }
                 undo.push("Yaka kesim özellikleri", doc);
+                if self.working_point.punkt_tag_id <= 0 {
+                    self.working_point.punkt_tag_id = doc.next_point_tag_id();
+                }
                 let mut mirrored = false;
                 if let Some(el) = doc.elements.get_mut(elem_idx) {
                     mirrored = el.mirrored;
@@ -3308,15 +3423,23 @@ impl RefLineSelectDialogState {
                 } else {
                     state.selected_rows.clone()
                 };
-                let max_len = doc
+                let effective_targets: Vec<usize> = doc
                     .elements
                     .get(elem_idx)
-                    .map(|e| e.lines(side).len())
-                    .unwrap_or(0);
-                let effective_targets: Vec<usize> = target_rows
-                    .into_iter()
-                    .filter(|&r| r != self.selected_source_idx && r < max_len)
-                    .collect();
+                    .map(|el| {
+                        let closing_idx = stoll_kalip_editoru::math::closing_line_index(el, side);
+                        let max_len = el.lines(side).len();
+                        target_rows
+                            .into_iter()
+                            .filter(|&r| {
+                                r != self.selected_source_idx
+                                    && r < max_len
+                                    && !el.is_base_line_row(side, r)
+                                    && closing_idx != Some(r)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 if !effective_targets.is_empty() {
                     undo.push("Referans çizgi özelliklerini al", doc);
                     if let Some(el) = doc.elements.get_mut(elem_idx) {

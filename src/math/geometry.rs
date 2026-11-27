@@ -156,14 +156,15 @@ fn evaluate_element_geometry(
     };
     let _ = (basic_height_rows, basic_height_mm);
 
-    let half_gap_st = el.distance_halves / 2;
+    let left_half_gap_st = el.distance_halves / 2;
+    let right_half_gap_st = el.distance_halves - left_half_gap_st;
     let half_gap_mm = if hdr.density_x.abs() > 1e-9 {
         ((el.distance_halves as f64) * 0.5) * hdr.density_base_mm / hdr.density_x
     } else {
         0.0
     };
 
-    let left_start_st = (base_x_st - axis_x_st - half_gap_st, origin_y_st);
+    let left_start_st = (base_x_st - axis_x_st - left_half_gap_st, origin_y_st);
     let left_start_mm = Vec2::new(base_x_mm - axis_x_mm - half_gap_mm, origin_y_mm);
 
     let (left_segments, left_polyline) =
@@ -203,7 +204,7 @@ fn evaluate_element_geometry(
             .collect();
         (r_segs, r_poly)
     } else if !el.right_lines.is_empty() {
-        let right_start_st = (base_x_st + axis_x_st + half_gap_st, origin_y_st);
+        let right_start_st = (base_x_st + axis_x_st + right_half_gap_st, origin_y_st);
         let right_start_mm = Vec2::new(base_x_mm + axis_x_mm + half_gap_mm, origin_y_mm);
         trace_side(doc, &el.right_lines, LineSide::Right, right_start_st, right_start_mm)
     } else {
@@ -425,17 +426,22 @@ pub fn validate_document(doc: &FormDocument) -> ValidationReport {
                 });
             }
         } else if !el.left_lines.is_empty() && !el.right_lines.is_empty() {
-            if sum_x_left + sum_x_right != 0 {
+            // Left starts at (-axis_x - left_gap) and ends at (-axis_x - left_gap + sum_x_left).
+            // Right starts at (+axis_x + right_gap) and ends at (+axis_x + right_gap + sum_x_right).
+            // Top closure requires left_end_x == right_end_x.
+            let axis_x = el.offset_x_stitches.round() as i32;
+            let left_gap = el.distance_halves / 2;
+            let right_gap = el.distance_halves - left_gap;
+            let left_end_x = -axis_x - left_gap + sum_x_left;
+            let right_end_x = axis_x + right_gap + sum_x_right;
+            let gap = right_end_x - left_end_x;
+            if gap != 0 {
                 report.issues.push(ValidationIssue {
                     severity: ValidationSeverity::Error,
                     element_index: ei,
                     message: format!(
-                        "Eleman {} ({}): Yatay poligon açık (Sol dX={} + Sağ dX={} = {})",
-                        el.index,
-                        el.name,
-                        sum_x_left,
-                        sum_x_right,
-                        sum_x_left + sum_x_right
+                        "Eleman {} ({}): Yatay poligon açık (Sol uç X={}, Sağ uç X={}, Fark={})",
+                        el.index, el.name, left_end_x, right_end_x, gap
                     ),
                 });
             }

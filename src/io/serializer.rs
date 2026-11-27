@@ -209,11 +209,35 @@ fn write_form_header(out: &mut String, h: &FormHeader) {
         return;
     }
 
-    // Preserve original raw key order & exact duplicate GuidExterneLokaleModule / NameExterneLokaleModule handling
+    // Preserve original raw key order & keep GuidExterneLokaleModule / NameExterneLokaleModule count in sync
     let mut ext_guid_idx = 0usize;
     let mut ext_name_idx = 0usize;
+    let has_raw_ext_count = h.raw.get_raw("AnzExterneLokaleModule").is_some();
+    let raw_guid_count = h
+        .raw
+        .raw_entries
+        .iter()
+        .filter(|(k, _)| k == "GuidExterneLokaleModule")
+        .count();
     for (k, orig_v) in &h.raw.raw_entries {
         if k == "Kommentar" && h.comment.is_empty() && !orig_v.is_empty() {
+            continue;
+        }
+        if k == "GuidExterneLokaleModule" {
+            if let Some(m) = h.external_local_modules.get(ext_guid_idx) {
+                push_kv(out, k, &m.guid);
+                ext_guid_idx += 1;
+            }
+            continue;
+        }
+        if k == "NameExterneLokaleModule" {
+            if h.external_local_modules.is_empty() && raw_guid_count == 0 {
+                // Preserve Stoll orphan `NameExterneLokaleModule = N` when no GUID pairs existed
+                push_kv(out, k, orig_v);
+            } else if let Some(m) = h.external_local_modules.get(ext_name_idx) {
+                push_kv(out, k, &m.name);
+                ext_name_idx += 1;
+            }
             continue;
         }
         let v = match k.as_str() {
@@ -243,31 +267,7 @@ fn write_form_header(out: &mut String, h: &FormHeader) {
                 .gks_xml_file_schema
                 .map(fmt_f2)
                 .unwrap_or_else(|| orig_v.clone()),
-            "AnzExterneLokaleModule" => {
-                if h.external_local_modules.is_empty() {
-                    orig_v.clone()
-                } else {
-                    h.external_local_modules.len().to_string()
-                }
-            }
-            "GuidExterneLokaleModule" => {
-                let s = h
-                    .external_local_modules
-                    .get(ext_guid_idx)
-                    .map(|m| m.guid.clone())
-                    .unwrap_or_else(|| orig_v.clone());
-                ext_guid_idx += 1;
-                s
-            }
-            "NameExterneLokaleModule" => {
-                let s = h
-                    .external_local_modules
-                    .get(ext_name_idx)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| orig_v.clone());
-                ext_name_idx += 1;
-                s
-            }
+            "AnzExterneLokaleModule" => h.external_local_modules.len().to_string(),
             "Feinheit" => h
                 .gauge
                 .map(|x| x.to_string())
@@ -291,6 +291,19 @@ fn write_form_header(out: &mut String, h: &FormHeader) {
             _ => orig_v.clone(),
         };
         push_kv(out, k, &v);
+    }
+    // Emit any newly added external local modules beyond what existed in raw_entries
+    if !h.external_local_modules.is_empty() && !has_raw_ext_count {
+        push_kv(
+            out,
+            "AnzExterneLokaleModule",
+            &h.external_local_modules.len().to_string(),
+        );
+    }
+    let emitted = ext_guid_idx.min(ext_name_idx);
+    for m in h.external_local_modules.iter().skip(emitted) {
+        push_kv(out, "GuidExterneLokaleModule", &m.guid);
+        push_kv(out, "NameExterneLokaleModule", &m.name);
     }
     for (key, opt_val) in [
         ("Kommentar", (!h.comment.is_empty()).then(|| h.comment.clone())),
